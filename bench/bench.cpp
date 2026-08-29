@@ -1,4 +1,5 @@
 #include <pergrep/pergrep.hpp>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -7,7 +8,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
 using namespace pergrep;
 
 // Synthetic deterministic corpus generator (~1 MB total corpus)
@@ -73,14 +73,15 @@ int main() {
     auto index = Index::from_documents(docs, opt);
     Searcher searcher(index);
 
-    // Reference whole-corpus brute force searcher
+    // Reference whole-corpus brute force searcher: single chunk per file.
+    // Must respect IndexOptions bounds (chunk_overlap <= chunk_bytes/2, block <= 1MiB).
     IndexOptions ref_opt;
-    ref_opt.chunk_bytes = total_corpus_bytes + 1024;
-    ref_opt.chunk_overlap = total_corpus_bytes + 1024;
-    ref_opt.positional_block_bytes = total_corpus_bytes + 1024;
+    ref_opt.chunk_bytes = std::min<uint64_t>(uint64_t(1) << 20, total_corpus_bytes + 1024);
+    if (ref_opt.chunk_bytes < 64) ref_opt.chunk_bytes = 64;
+    ref_opt.chunk_overlap = ref_opt.chunk_bytes / 2;
+    ref_opt.positional_block_bytes = 256;
     auto ref_index = Index::from_documents(docs, ref_opt);
     Searcher ref_searcher(ref_index);
-
     std::vector<BenchCase> cases = {
         // Flavor 1: Multi-literal alternation (Disjunctions)
         {"alt_common", "error|warning|fatal|critical|alert|panic", {}, {}},

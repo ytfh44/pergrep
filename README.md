@@ -89,6 +89,8 @@ The compatibility frontend implements the ripgrep 15.2.0 public flag surface, in
 
 Persistent indexes are stored under `$PERGREP_CACHE_DIR`, `$XDG_CACHE_HOME/pergrep`, or `~/.cache/pergrep`. Filesystem fingerprints invalidate stale indexes. Inputs transformed by encoding conversion, `--pre`, or archive decompression are indexed ephemerally after transformation.
 
+> **Scope note:** the on-disk index currently persists the q-gram/positional filter structures and file metadata; `Index::load()` still re-reads each source file into `I->loaded` so the corpus remains memory-resident during search (filter rebuild is saved, not a Lucene-style fully indexed store). `Index::fresh()` re-traverses the tree and compares path/size/mtime per file — cheap on stable trees, proportional to churn on high-churn trees. The in-tree `bench/bench.cpp` benchmark is a ~1 MiB synthetic corpus used to compare indexed vs. brute-force reference within pergrep, not a rigorous `rg`/`ugrep` cross-tool benchmark.
+
 ## Search architecture
 
 The default index uses:
