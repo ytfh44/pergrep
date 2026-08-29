@@ -57,6 +57,8 @@ inline size_t utf8_char_len(unsigned char c) noexcept {
 
 // fnmatch(3) subset with FNM_PATHNAME semantics: '*' stops at '/',
 // '?' advances by UTF-8 code point and stops at '/', '[...]' character classes.
+// '**' (double star) matches any sequence including '/' – with "**/" matching
+// zero or more directory levels (so "**/*.txt" matches "a.txt" at depth 0).
 inline bool fnmatch(const std::string& pat, const std::string& text) {
     const std::size_t P = pat.size(), T = text.size();
     std::vector<signed char> memo((P + 1) * (T + 1), -1);
@@ -67,12 +69,27 @@ inline bool fnmatch(const std::string& pat, const std::string& text) {
         if (i == P) {
             ok = (j == T);
         } else if (pat[i] == '*') {
-            if (self(self, i + 1, j)) ok = true;
-            for (std::size_t k = j; !ok && k < T && text[k] != '/' && text[k] != '\\'; ) {
-                std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
-                if (k + clen > T) clen = 1;
-                k += clen;
-                if (self(self, i + 1, k)) ok = true;
+            bool dbl = (i + 1 < P && pat[i + 1] == '*');
+            std::size_t ni = i + (dbl ? 2 : 1);
+            if (dbl && ni < P && (pat[ni] == '/' || pat[ni] == '\\')) {
+                // "**/" – matches zero or more directories (including zero)
+                if (self(self, ni + 1, j)) ok = true;
+                for (std::size_t k = j; !ok && k < T; ) {
+                    if (text[k] == '/' || text[k] == '\\') {
+                        if (self(self, ni + 1, k + 1)) ok = true;
+                    }
+                    std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
+                    if (k + clen > T) clen = 1;
+                    k += clen;
+                }
+            } else {
+                if (self(self, ni, j)) ok = true;
+                for (std::size_t k = j; !ok && k < T && (dbl || (text[k] != '/' && text[k] != '\\')); ) {
+                    std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
+                    if (k + clen > T) clen = 1;
+                    k += clen;
+                    if (self(self, ni, k)) ok = true;
+                }
             }
         } else if (pat[i] == '?') {
             if (j < T && text[j] != '/' && text[j] != '\\') {

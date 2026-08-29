@@ -684,5 +684,37 @@ int main(){
     assert(s.find(ph).empty()); // no hello in corpus
   }
 #endif
+
+  // BF-1 audit corners: regex property edge cases (spaces, case, aliases, errors)
+  {
+    // \p{sc = Greek} with spaces around = and inside braces
+    auto idx = corpus("Ωmega αb\n");
+    Searcher s(idx);
+    auto p_spaced = Pattern::compile(R"(\p{sc = Greek}+)");
+    auto m_spaced = s.find(p_spaced);
+    assert(!m_spaced.empty());
+    // \p{Any} vs \p{any} case-insensitive property name
+    auto p_any_up = Pattern::compile(R"(\p{Any}+)");
+    auto p_any_lo = Pattern::compile(R"(\p{any}+)");
+    assert(!s.find(p_any_up).empty());
+    assert(!s.find(p_any_lo).empty());
+    // \p{gc = Lu} with spaces
+    auto idx2 = corpus("AbC Δ\n");
+    Searcher s2(idx2);
+    auto p_gc = Pattern::compile(R"(\p{gc = Lu}+)");
+    assert(!s2.find(p_gc).empty());
+    // \p{Invalid} should throw
+    assert(throws_compile(R"(\p{Invalid})"));
+    // \p{gc=Lu} without spaces also works
+    auto p_gc2 = Pattern::compile(R"(\p{gc=Lu}+)");
+    assert(!s2.find(p_gc2).empty());
+    // \p{scx=Han} and \p{ScriptExtensions=Han} aliases
+    auto idx3 = corpus("漢字 hello\n");
+    Searcher s3(idx3);
+    auto p_scx = Pattern::compile(R"(\p{scx=Han}+)");
+    assert(!s3.find(p_scx).empty());
+    auto p_sce = Pattern::compile(R"(\p{ScriptExtensions=Han}+)");
+    assert(!s3.find(p_sce).empty());
+  }
   return 0;
 }

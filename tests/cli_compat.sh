@@ -492,3 +492,42 @@ if matches:
 PY
   fi
 fi
+
+# BF-1 audit: iglob Unicode and double-star glob
+mkdir -p "$T/bf1_iglob"
+printf 'hello
+' > "$T/bf1_iglob/café.txt"
+printf 'hello
+' > "$T/bf1_iglob/other.txt"
+out="$($PG --iglob '*café*' hello "$T/bf1_iglob" 2>&1 | sort)"
+contains "$out" 'café.txt:hello' bf1-iglob-lower
+out="$($PG --iglob '*CAFÉ*' hello "$T/bf1_iglob" 2>&1 | sort)"
+contains "$out" 'café.txt:hello' bf1-iglob-upper-unicode
+mkdir -p "$T/bf1_q"
+printf 'x
+' > "$T/bf1_q/ab"
+printf 'x
+' > "$T/bf1_q/aé"
+out="$($PG -g 'a?' x "$T/bf1_q" 2>&1 | sort)"
+contains "$out" 'ab:x' bf1-glob-q-ascii
+contains "$out" 'aé:x' bf1-glob-q-multibyte
+mkdir -p "$T/bf1_star/a/b/c"
+printf 'needle
+' > "$T/bf1_star/a/b/c/file.txt"
+printf 'needle
+' > "$T/bf1_star/a/file.txt"
+printf 'needle
+' > "$T/bf1_star/file.txt"
+out="$($PG -g '**/*.txt' needle "$T/bf1_star" 2>&1 | sort)"
+contains "$out" 'a/b/c/file.txt:needle' bf1-double-star-deep
+contains "$out" 'a/file.txt:needle' bf1-double-star-mid
+contains "$out" 'file.txt:needle' bf1-double-star-zero
+out="$($PG -g 'a/**/*.txt' needle "$T/bf1_star" 2>&1 | sort)"
+contains "$out" 'a/b/c/file.txt:needle' bf1-double-star-prefix
+# a/**/*.txt must not match top-level file.txt (only under a/). Check that no line starts with file.txt:
+if printf '%s' "$out" | grep -q '^file\.txt:needle'; then fail "bf1-double-star-prefix-exact: top-level file.txt should not match a/**/*.txt, got <$out>"; fi
+# \p{sc = Greek} with spaces via CLI
+printf 'Ω
+' > "$T/bf1_greek.txt"
+out="$($PG '\p{sc = Greek}' "$T/bf1_greek.txt" 2>&1)"
+contains "$out" 'Ω' bf1-regex-sc-spaced

@@ -23,6 +23,8 @@
 #include <sys/stat.h>
 #include <archive.h>
 #include <archive_entry.h>
+#include <unicode/uchar.h>
+#include <unicode/utf8.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -104,15 +106,26 @@ TypeMap effective_type_map(const Args& a) {
 
 bool globmatch(std::string pat,std::string path,bool ci){
     if(ci){
-        auto fold_ascii_lower = [](std::string s){
-            for(char &c : s){
-                unsigned char uc = static_cast<unsigned char>(c);
-                if(uc >= 'A' && uc <= 'Z') c = static_cast<char>(uc + ('a' - 'A'));
+        // Case-insensitive glob should fold Unicode, not just ASCII.
+        // Use ICU case folding per code point so 'É' matches 'é'.
+        auto fold_utf8 = [](std::string s){
+            std::string out; out.reserve(s.size());
+            std::size_t i = 0;
+            while (i < s.size()) {
+                int32_t pos = static_cast<int32_t>(i);
+                int32_t n = static_cast<int32_t>(s.size());
+                UChar32 cp; U8_NEXT(s.data(), pos, n, cp);
+                if (cp < 0) { out.push_back(s[i]); ++i; continue; }
+                UChar32 folded = u_foldCase(cp, U_FOLD_CASE_DEFAULT);
+                char buf[U8_MAX_LENGTH]; int32_t bi = 0;
+                U8_APPEND_UNSAFE(buf, bi, folded);
+                out.append(buf, bi);
+                i = static_cast<std::size_t>(pos);
             }
-            return s;
+            return out;
         };
-        pat = fold_ascii_lower(pat);
-        path = fold_ascii_lower(path);
+        pat = fold_utf8(pat);
+        path = fold_utf8(path);
     }
     return pergrep_cli::platform::fnmatch(pat,path)||pergrep_cli::platform::fnmatch(pat,to_path(path).filename().string());
 }
@@ -300,7 +313,14 @@ struct PathSelector { std::string rel; bool directory=false; };
 bool wildcard_path_match(std::string_view pat,std::string_view text,bool ci){
     auto eq=[&](char a,char b){if(ci){a=char(std::tolower((unsigned char)a));b=char(std::tolower((unsigned char)b));}return a==b;};
     const std::size_t W=text.size()+1;std::vector<signed char>memo((pat.size()+1)*W,-1);
-    std::function<bool(std::size_t,std::size_t)> go=[&](std::size_t i,std::size_t j)->bool{auto&mm=memo[i*W+j];if(mm!=-1)return mm;bool ok=false;if(i==pat.size())ok=j==text.size();else if(pat[i]=='*'){bool dbl=i+1<pat.size()&&pat[i+1]=='*';std::size_t ni=i+(dbl?2:1);if(dbl&&ni<pat.size()&&pat[ni]=='/'){if(go(ni+1,j))ok=true;for(std::size_t k=j;!ok&&k<text.size();++k)if(text[k]=='/'&&go(ni+1,k+1))ok=true;}else{if(go(ni,j))ok=true;for(std::size_t k=j;!ok&&k<text.size()&&(dbl||text[k]!='/');++k)if(go(ni,k+1))ok=true;}}else if(pat[i]=='?'){ok=j<text.size()&&text[j]!='/'&&go(i+1,j+1);}else if(pat[i]=='['){std::size_t e=pat.find(']',i+1);if(e==std::string_view::npos){ok=j<text.size()&&eq('[',text[j])&&go(i+1,j+1);}else if(j<text.size()&&text[j]!='/'){bool neg=i+1<e&&(pat[i+1]=='!'||pat[i+1]=='^');std::size_t k=i+1+(neg?1:0);bool hit=false;while(k<e){if(k+2<e&&pat[k+1]=='-'){char a=pat[k],b=pat[k+2],c=text[j];if(ci){a=char(std::tolower((unsigned char)a));b=char(std::tolower((unsigned char)b));c=char(std::tolower((unsigned char)c));}if(c>=a&&c<=b)hit=true;k+=3;}else{if(eq(pat[k],text[j]))hit=true;++k;}}if(neg)hit=!hit;ok=hit&&go(e+1,j+1);}}else ok=j<text.size()&&eq(pat[i],text[j])&&go(i+1,j+1);mm=ok?1:0;return ok;};return go(0,0);
+    std::function<bool(std::size_t,std::size_t)> go=[&](std::size_t i,std::size_t j)->bool{auto&mm=memo[i*W+j];if(mm!=-1)return mm;bool ok=false;if(i==pat.size())ok=j==text.size();else if(pat[i]=='*'){bool dbl=i+1<pat.size()&&pat[i+1]=='*';std::size_t ni=i+(dbl?2:1);if(dbl&&ni<pat.size()&&pat[ni]=='/'){if(go(ni+1,j))ok=true;for(std::size_t k=j;!ok&&k<text.size();++k)if(text[k]=='/'&&go(ni+1,k+1))ok=true;}else{if(go(ni,j))ok=true;for(std::size_t k=j;!ok&&k<text.size()&&(dbl||text[k]!='/');++k)if(go(ni,k+1))ok=true;}}else if(pat[i]=='?'){
+        // '?' must consume one UTF-8 code point, not one byte, and must not be '/'.
+        if(j<text.size() && text[j]!='/'){
+            std::size_t clen = pergrep_cli::platform::utf8_char_len(static_cast<unsigned char>(text[j]));
+            if(j + clen > text.size()) clen = 1;
+            ok = go(i+1, j+clen);
+        }
+    }else if(pat[i]=='['){std::size_t e=pat.find(']',i+1);if(e==std::string_view::npos){ok=j<text.size()&&eq('[',text[j])&&go(i+1,j+1);}else if(j<text.size()&&text[j]!='/'){bool neg=i+1<e&&(pat[i+1]=='!'||pat[i+1]=='^');std::size_t k=i+1+(neg?1:0);bool hit=false;while(k<e){if(k+2<e&&pat[k+1]=='-'){char a=pat[k],b=pat[k+2],c=text[j];if(ci){a=char(std::tolower((unsigned char)a));b=char(std::tolower((unsigned char)b));c=char(std::tolower((unsigned char)c));}if(c>=a&&c<=b)hit=true;k+=3;}else{if(eq(pat[k],text[j]))hit=true;++k;}}if(neg)hit=!hit;ok=hit&&go(e+1,j+1);}}else ok=j<text.size()&&eq(pat[i],text[j])&&go(i+1,j+1);mm=ok?1:0;return ok;};return go(0,0);
 }
 bool gitignore_rule_match(const IgnoreRule&r,std::string local){
     std::string pat=r.pat;bool anchored=!pat.empty()&&pat[0]=='/';if(anchored)pat.erase(pat.begin());
