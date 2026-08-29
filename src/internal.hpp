@@ -51,8 +51,7 @@ struct Chunk {
 struct LoadedFile { FileInfo info; std::string data; };
 
 struct UnicodeProperty {
-    enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit };
-    Kind kind = Kind::Binary;
+    enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit, AsciiDigit, AsciiWord, AsciiSpace };
     std::int32_t value = 0;
     bool negated = false;
 };
@@ -62,7 +61,7 @@ struct CharClassSpec {
     bool negated = false;
 };
 struct RegexNode {
-    enum class Kind { Empty, Literal, Dot, Class, Begin, End, WordBoundary, WordStartHalf, WordEndHalf, Concat, Alt, Repeat, Group, BackRef, LookAhead, LookBehind };
+    enum class Kind { Empty, Literal, Dot, Class, Begin, End, AbsBegin, AbsEnd, EndNewline, WordBoundary, WordStartHalf, WordEndHalf, Concat, Alt, Repeat, Group, BackRef, LookAhead, LookBehind };
     Kind kind = Kind::Empty;
     std::string literal;
     CharClassSpec char_class;
@@ -81,7 +80,7 @@ struct RegexNode {
     std::vector<std::shared_ptr<RegexNode>> children;
 };
 struct NfaInst {
-    enum class Op : std::uint8_t { Rune, Any, Class, Split, Jmp, SaveStart, SaveEnd, AssertBegin, AssertEnd, AssertWord, AssertWordStartHalf, AssertWordEndHalf, Match };
+    enum class Op : std::uint8_t { Rune, Any, Class, Split, Jmp, SaveStart, SaveEnd, AssertBegin, AssertEnd, AssertAbsBegin, AssertAbsEnd, AssertEndNewline, AssertWord, AssertWordStartHalf, AssertWordEndHalf, Match };
     Op op = Op::Match;
     std::uint32_t rune = 0;
     std::shared_ptr<const CharClassSpec> char_class;

@@ -27,22 +27,102 @@ Rune rune_before(std::string_view s, std::size_t pos) {
 UChar32 fold(UChar32 cp) { return u_foldCase(cp, U_FOLD_CASE_DEFAULT); }
 bool cp_eq(UChar32 a, UChar32 b, bool icase) { return icase ? fold(a) == fold(b) : a == b; }
 bool unicode_word(UChar32 cp) {
-    return cp == '_' || u_isalnum(cp) || u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
-           u_charType(cp) == U_NON_SPACING_MARK || u_charType(cp) == U_COMBINING_SPACING_MARK;
+    return u_isalnum(cp) ||
+           u_charType(cp) == U_CONNECTOR_PUNCTUATION ||
+           u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
+           u_charType(cp) == U_NON_SPACING_MARK ||
+           u_charType(cp) == U_COMBINING_SPACING_MARK ||
+           u_charType(cp) == U_ENCLOSING_MARK;
 }
 bool ascii_word(unsigned char c) { return std::isalnum(c) || c == '_'; }
 
 UnicodeProperty property_from_name(std::string name, bool negated) {
     UnicodeProperty p; p.negated = negated;
-    std::string low = name; std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    if (low == "any") { p.kind = UnicodeProperty::Kind::Binary; p.value = -1; return p; }
-    if (low == "alphabetic" || low == "alpha") { p.kind = UnicodeProperty::Kind::Alphabetic; return p; }
-    if (low == "whitespace" || low == "white_space" || low == "space") { p.kind = UnicodeProperty::Kind::WhiteSpace; return p; }
-    if (low == "word") { p.kind = UnicodeProperty::Kind::Word; return p; }
-    if (low == "decimalnumber" || low == "decimal_number" || low == "nd" || low == "digit") { p.kind = UnicodeProperty::Kind::DecimalDigit; return p; }
-    if (low == "l" || low == "letter") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_L_MASK; return p; }
-    if (low == "n" || low == "number") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_N_MASK; return p; }
-    if (low == "z" || low == "separator") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_Z_MASK; return p; }
+    std::string norm;
+    for (char c : name) {
+        if (c != '_' && c != '-' && c != ' ') {
+            norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    if (norm == "any") { p.kind = UnicodeProperty::Kind::Binary; p.value = -1; return p; }
+    if (norm == "ascii") { p.kind = UnicodeProperty::Kind::Binary; p.value = -2; return p; }
+    if (norm == "assigned") { p.kind = UnicodeProperty::Kind::Binary; p.value = -3; return p; }
+    if (norm == "word") { p.kind = UnicodeProperty::Kind::Word; return p; }
+
+    if (norm == "l" || norm == "letter") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_L_MASK; return p; }
+    if (norm == "m" || norm == "mark" || norm == "combiningmark") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_M_MASK; return p; }
+    if (norm == "n" || norm == "number") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_N_MASK; return p; }
+    if (norm == "p" || norm == "punctuation" || norm == "punct") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_P_MASK; return p; }
+    if (norm == "s" || norm == "symbol") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_S_MASK; return p; }
+    if (norm == "z" || norm == "separator") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_Z_MASK; return p; }
+    if (norm == "c" || norm == "other") { p.kind = UnicodeProperty::Kind::GeneralGroup; p.value = U_GC_C_MASK; return p; }
+
+    if (norm == "lu" || norm == "uppercaseletter") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_UPPERCASE_LETTER; return p; }
+    if (norm == "ll" || norm == "lowercaseletter") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_LOWERCASE_LETTER; return p; }
+    if (norm == "lt" || norm == "titlecaseletter") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_TITLECASE_LETTER; return p; }
+    if (norm == "lm" || norm == "modifierletter") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_MODIFIER_LETTER; return p; }
+    if (norm == "lo" || norm == "otherletter") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_OTHER_LETTER; return p; }
+    if (norm == "mn" || norm == "nonspacingmark") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_NON_SPACING_MARK; return p; }
+    if (norm == "mc" || norm == "spacingmark" || norm == "combiningspacingmark") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_COMBINING_SPACING_MARK; return p; }
+    if (norm == "me" || norm == "enclosingmark") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_ENCLOSING_MARK; return p; }
+    if (norm == "nd" || norm == "decimalnumber" || norm == "digit" || norm == "decimaldigit") { p.kind = UnicodeProperty::Kind::DecimalDigit; return p; }
+    if (norm == "nl" || norm == "letternumber") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_LETTER_NUMBER; return p; }
+    if (norm == "no" || norm == "othernumber") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_OTHER_NUMBER; return p; }
+    if (norm == "pc" || norm == "connectorpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_CONNECTOR_PUNCTUATION; return p; }
+    if (norm == "pd" || norm == "dashpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_DASH_PUNCTUATION; return p; }
+    if (norm == "ps" || norm == "openpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_START_PUNCTUATION; return p; }
+    if (norm == "pe" || norm == "closepunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_END_PUNCTUATION; return p; }
+    if (norm == "pi" || norm == "initialpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_INITIAL_PUNCTUATION; return p; }
+    if (norm == "pf" || norm == "finalpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_FINAL_PUNCTUATION; return p; }
+    if (norm == "po" || norm == "otherpunctuation") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_OTHER_PUNCTUATION; return p; }
+    if (norm == "sm" || norm == "mathsymbol") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_MATH_SYMBOL; return p; }
+    if (norm == "sc" || norm == "currencysymbol") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_CURRENCY_SYMBOL; return p; }
+    if (norm == "sk" || norm == "modifiersymbol") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_MODIFIER_SYMBOL; return p; }
+    if (norm == "so" || norm == "othersymbol") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_OTHER_SYMBOL; return p; }
+    if (norm == "zs" || norm == "spaceseparator") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_SPACE_SEPARATOR; return p; }
+    if (norm == "zl" || norm == "lineseparator") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_LINE_SEPARATOR; return p; }
+    if (norm == "zp" || norm == "paragraphseparator") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_PARAGRAPH_SEPARATOR; return p; }
+    if (norm == "cc" || norm == "control" || norm == "cntrl") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_CONTROL_CHAR; return p; }
+    if (norm == "cf" || norm == "format") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_FORMAT_CHAR; return p; }
+    if (norm == "cs" || norm == "surrogate") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_SURROGATE; return p; }
+    if (norm == "co" || norm == "privateuse") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_PRIVATE_USE_CHAR; return p; }
+    if (norm == "cn" || norm == "unassigned") { p.kind = UnicodeProperty::Kind::GeneralCategory; p.value = U_UNASSIGNED; return p; }
+
+    if (norm == "alphabetic" || norm == "alpha") { p.kind = UnicodeProperty::Kind::Alphabetic; return p; }
+    if (norm == "whitespace" || norm == "space") { p.kind = UnicodeProperty::Kind::WhiteSpace; return p; }
+    if (norm == "asciihexdigit" || norm == "ahex") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_ASCII_HEX_DIGIT; return p; }
+    if (norm == "hexdigit" || norm == "hex") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_HEX_DIGIT; return p; }
+    if (norm == "bidicontrol") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_BIDI_CONTROL; return p; }
+    if (norm == "cased") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CASED; return p; }
+    if (norm == "caseignorable") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CASE_IGNORABLE; return p; }
+    if (norm == "changeswhencasefolded") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CHANGES_WHEN_CASEFOLDED; return p; }
+    if (norm == "changeswhencasemapped") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CHANGES_WHEN_CASEMAPPED; return p; }
+    if (norm == "changeswhenlowercased") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CHANGES_WHEN_LOWERCASED; return p; }
+    if (norm == "changeswhentitlecased") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CHANGES_WHEN_TITLECASED; return p; }
+    if (norm == "changeswhenuppercased") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_CHANGES_WHEN_UPPERCASED; return p; }
+    if (norm == "defaultignorablecodepoint") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_DEFAULT_IGNORABLE_CODE_POINT; return p; }
+    if (norm == "deprecated") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_DEPRECATED; return p; }
+    if (norm == "diacritic") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_DIACRITIC; return p; }
+    if (norm == "extender") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_EXTENDER; return p; }
+    if (norm == "graphemebase") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_GRAPHEME_BASE; return p; }
+    if (norm == "graphemeextend") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_GRAPHEME_EXTEND; return p; }
+    if (norm == "idcontinue" || norm == "idc") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_ID_CONTINUE; return p; }
+    if (norm == "idstart" || norm == "ids") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_ID_START; return p; }
+    if (norm == "ideographic" || norm == "ideo") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_IDEOGRAPHIC; return p; }
+    if (norm == "joincontrol") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_JOIN_CONTROL; return p; }
+    if (norm == "logicalorderexception") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_LOGICAL_ORDER_EXCEPTION; return p; }
+    if (norm == "lowercase" || norm == "lower") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_LOWERCASE; return p; }
+    if (norm == "math") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_MATH; return p; }
+    if (norm == "noncharactercodepoint") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_NONCHARACTER_CODE_POINT; return p; }
+    if (norm == "quotationmark" || norm == "qmark") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_QUOTATION_MARK; return p; }
+    if (norm == "radical") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_RADICAL; return p; }
+    if (norm == "softdotted") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_SOFT_DOTTED; return p; }
+    if (norm == "terminalpunctuation") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_TERMINAL_PUNCTUATION; return p; }
+    if (norm == "unifiedideograph") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_UNIFIED_IDEOGRAPH; return p; }
+    if (norm == "uppercase" || norm == "upper") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_UPPERCASE; return p; }
+    if (norm == "xidcontinue" || norm == "xidc") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_XID_CONTINUE; return p; }
+    if (norm == "xidstart" || norm == "xids") { p.kind = UnicodeProperty::Kind::Binary; p.value = UCHAR_XID_START; return p; }
+
     UErrorCode ec = U_ZERO_ERROR; UScriptCode codes[8]; int32_t count = uscript_getCode(name.c_str(), codes, 8, &ec);
     if (U_SUCCESS(ec) && count > 0) { p.kind = UnicodeProperty::Kind::Script; p.value = static_cast<std::int32_t>(codes[0]); return p; }
     throw std::runtime_error("pergrep regex: unknown Unicode property: " + name);
@@ -50,11 +130,19 @@ UnicodeProperty property_from_name(std::string name, bool negated) {
 bool property_match(const UnicodeProperty& p, UChar32 cp) {
     bool hit = false;
     switch (p.kind) {
-        case UnicodeProperty::Kind::Binary: hit = p.value == -1; break;
+        case UnicodeProperty::Kind::Binary:
+            if (p.value == -1) hit = true;
+            else if (p.value == -2) hit = (cp >= 0 && cp <= 127);
+            else if (p.value == -3) hit = (u_charType(cp) != U_UNASSIGNED);
+            else hit = u_hasBinaryProperty(cp, static_cast<UProperty>(p.value));
+            break;
         case UnicodeProperty::Kind::Alphabetic: hit = u_hasBinaryProperty(cp, UCHAR_ALPHABETIC); break;
         case UnicodeProperty::Kind::WhiteSpace: hit = u_isUWhiteSpace(cp); break;
         case UnicodeProperty::Kind::Word: hit = unicode_word(cp); break;
         case UnicodeProperty::Kind::DecimalDigit: hit = u_charType(cp) == U_DECIMAL_DIGIT_NUMBER; break;
+        case UnicodeProperty::Kind::AsciiDigit: hit = (cp >= '0' && cp <= '9'); break;
+        case UnicodeProperty::Kind::AsciiWord: hit = (cp < 128 && ascii_word(static_cast<unsigned char>(cp))); break;
+        case UnicodeProperty::Kind::AsciiSpace: hit = (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v'); break;
         case UnicodeProperty::Kind::GeneralGroup: hit = (U_GET_GC_MASK(cp) & p.value) != 0; break;
         case UnicodeProperty::Kind::GeneralCategory: hit = u_charType(cp) == p.value; break;
         case UnicodeProperty::Kind::Script: { UErrorCode ec = U_ZERO_ERROR; hit = uscript_getScript(cp, &ec) == p.value && U_SUCCESS(ec); break; }
@@ -62,13 +150,33 @@ bool property_match(const UnicodeProperty& p, UChar32 cp) {
     return p.negated ? !hit : hit;
 }
 bool class_match(const CharClassSpec& cls, UChar32 cp, bool icase) {
-    auto one = [&](UChar32 x) {
-        bool hit = false;
-        for (auto [a,b] : cls.ranges) if (x >= static_cast<UChar32>(a) && x <= static_cast<UChar32>(b)) { hit = true; break; }
-        if (!hit) for (const auto& p : cls.properties) if (property_match(p, x)) { hit = true; break; }
-        return hit;
+    auto match_raw = [&](UChar32 x) {
+        for (auto [a,b] : cls.ranges) {
+            if (x >= static_cast<UChar32>(a) && x <= static_cast<UChar32>(b)) return true;
+            if (icase) {
+                UChar32 fa = fold(static_cast<UChar32>(a)), fb = fold(static_cast<UChar32>(b));
+                UChar32 fx = fold(x);
+                if (fa <= fb && fx >= fa && fx <= fb) return true;
+                UChar32 la = u_tolower(static_cast<UChar32>(a)), lb = u_tolower(static_cast<UChar32>(b));
+                UChar32 lx = u_tolower(x);
+                if (la <= lb && lx >= la && lx <= lb) return true;
+                UChar32 ua = u_toupper(static_cast<UChar32>(a)), ub = u_toupper(static_cast<UChar32>(b));
+                UChar32 ux = u_toupper(x);
+                if (ua <= ub && ux >= ua && ux <= ub) return true;
+            }
+        }
+        for (const auto& p : cls.properties) {
+            if (property_match(p, x)) return true;
+        }
+        return false;
     };
-    bool hit = one(cp); if (icase) hit = hit || one(fold(cp));
+    bool hit = match_raw(cp);
+    if (icase && !hit) {
+        UChar32 variants[] = { fold(cp), u_tolower(cp), u_toupper(cp), u_totitle(cp) };
+        for (UChar32 v : variants) {
+            if (v != cp && match_raw(v)) { hit = true; break; }
+        }
+    }
     return cls.negated ? !hit : hit;
 }
 
@@ -159,11 +267,50 @@ private:
         if(c>='1'&&c<='9'){extended_=true;auto n=node(RegexNode::Kind::BackRef);n->group=c-'0';return n;}
         if(c=='b') return node(RegexNode::Kind::WordBoundary);
         if(c=='B'){auto n=node(RegexNode::Kind::WordBoundary);n->negative=true;return n;}
-        if(c=='A'){auto n=node(RegexNode::Kind::Begin);n->multiline=false;return n;}
-        if(c=='z'||c=='Z'){auto n=node(RegexNode::Kind::End);n->multiline=false;return n;}
+        if(c=='A') return node(RegexNode::Kind::AbsBegin);
+        if(c=='z') return node(RegexNode::Kind::AbsEnd);
+        if(c=='Z') return node(RegexNode::Kind::EndNewline);
         if(c=='p'||c=='P'){ std::string name; if(eat('{')){while(i_<s_.size()&&s_[i_]!='}')name.push_back(s_[i_++]);if(!eat('}'))fail("unclosed Unicode property");}else{if(i_>=s_.size())fail("missing Unicode property");name.push_back(get());} auto n=node(RegexNode::Kind::Class);n->char_class.properties.push_back(property_from_name(name,c=='P'));return n; }
-        if(c=='d'||c=='D'||c=='w'||c=='W'||c=='s'||c=='S'){auto n=node(RegexNode::Kind::Class);bool neg=(c=='D'||c=='W'||c=='S');char lc=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));UnicodeProperty p;if(lc=='d')p.kind=UnicodeProperty::Kind::DecimalDigit;else if(lc=='w')p.kind=UnicodeProperty::Kind::Word;else p.kind=UnicodeProperty::Kind::WhiteSpace;p.negated=neg;n->char_class.properties.push_back(p);return n;}
-        char out=c;if(c=='n')out='\n';else if(c=='r')out='\r';else if(c=='t')out='\t';else if(c=='f')out='\f';else if(c=='v')out='\v';else if(c=='x'){auto hex=[](char h)->int{if(h>='0'&&h<='9')return h-'0';if(h>='a'&&h<='f')return h-'a'+10;if(h>='A'&&h<='F')return h-'A'+10;return -1;};if(i_+2>s_.size())fail("short hex escape");int a=hex(s_[i_++]),b=hex(s_[i_++]);if(a<0||b<0)fail("bad hex escape");out=static_cast<char>((a<<4)|b);}auto n=node(RegexNode::Kind::Literal);n->literal.push_back(out);return n;
+        if(c=='d'||c=='D'||c=='w'||c=='W'||c=='s'||c=='S'){
+            auto n=node(RegexNode::Kind::Class);
+            bool neg=(c=='D'||c=='W'||c=='S');
+            char lc=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            UnicodeProperty p;
+            if(!opt_.unicode){
+                if(lc=='d')p.kind=UnicodeProperty::Kind::AsciiDigit;
+                else if(lc=='w')p.kind=UnicodeProperty::Kind::AsciiWord;
+                else p.kind=UnicodeProperty::Kind::AsciiSpace;
+            } else {
+                if(lc=='d')p.kind=UnicodeProperty::Kind::DecimalDigit;
+                else if(lc=='w')p.kind=UnicodeProperty::Kind::Word;
+                else p.kind=UnicodeProperty::Kind::WhiteSpace;
+            }
+            p.negated=neg;
+            n->char_class.properties.push_back(p);
+            return n;
+        }
+        char out=c;if(c=='n')out='\n';else if(c=='r')out='\r';else if(c=='t')out='\t';else if(c=='f')out='\f';else if(c=='v')out='\v';else if(c=='a')out='\a';else if(c=='e')out=27;else if(c=='x'){auto hex=[](char h)->int{if(h>='0'&&h<='9')return h-'0';if(h>='a'&&h<='f')return h-'a'+10;if(h>='A'&&h<='F')return h-'A'+10;return -1;};if(i_+2>s_.size())fail("short hex escape");int a=hex(s_[i_++]),b=hex(s_[i_++]);if(a<0||b<0)fail("bad hex escape");out=static_cast<char>((a<<4)|b);}auto n=node(RegexNode::Kind::Literal);n->literal.push_back(out);return n;
+    }
+    UChar32 class_rune() {
+        if(eat('\\')){
+            char e=get();
+            if(e=='n')return '\n';
+            if(e=='r')return '\r';
+            if(e=='t')return '\t';
+            if(e=='f')return '\f';
+            if(e=='v')return '\v';
+            if(e=='a')return '\a';
+            if(e=='e')return 27;
+            if(e=='x'){
+                auto hex=[](char h)->int{if(h>='0'&&h<='9')return h-'0';if(h>='a'&&h<='f')return h-'a'+10;if(h>='A'&&h<='F')return h-'A'+10;return -1;};
+                if(i_+2>s_.size())fail("short hex escape");
+                int a=hex(s_[i_++]),b=hex(s_[i_++]);
+                if(a<0||b<0)fail("bad hex escape");
+                return static_cast<unsigned char>((a<<4)|b);
+            }
+            return static_cast<unsigned char>(e);
+        }
+        return pattern_rune();
     }
     std::shared_ptr<RegexNode> char_class() {
         auto n=node(RegexNode::Kind::Class);if(eat('^'))n->char_class.negated=true;bool first=true;std::optional<UChar32> prev;
@@ -172,16 +319,33 @@ private:
             if(s_[i_]=='\\'&&i_+1<s_.size()){
                 char e=s_[i_+1];
                 if(e=='p'||e=='P'){i_+=2;std::string name;if(eat('{')){while(i_<s_.size()&&s_[i_]!='}')name.push_back(s_[i_++]);if(!eat('}'))fail("unclosed Unicode property");}else{if(i_>=s_.size())fail("missing Unicode property");name.push_back(get());}n->char_class.properties.push_back(property_from_name(name,e=='P'));prev.reset();continue;}
-                if(e=='d'||e=='D'||e=='w'||e=='W'||e=='s'||e=='S'){i_+=2;UnicodeProperty p;char lc=static_cast<char>(std::tolower(static_cast<unsigned char>(e)));if(lc=='d')p.kind=UnicodeProperty::Kind::DecimalDigit;else if(lc=='w')p.kind=UnicodeProperty::Kind::Word;else p.kind=UnicodeProperty::Kind::WhiteSpace;p.negated=(e=='D'||e=='W'||e=='S');n->char_class.properties.push_back(p);prev.reset();continue;}
+                if(e=='d'||e=='D'||e=='w'||e=='W'||e=='s'||e=='S'){
+                    i_+=2;UnicodeProperty p;char lc=static_cast<char>(std::tolower(static_cast<unsigned char>(e)));
+                    if(!opt_.unicode){
+                        if(lc=='d')p.kind=UnicodeProperty::Kind::AsciiDigit;
+                        else if(lc=='w')p.kind=UnicodeProperty::Kind::AsciiWord;
+                        else p.kind=UnicodeProperty::Kind::AsciiSpace;
+                    } else {
+                        if(lc=='d')p.kind=UnicodeProperty::Kind::DecimalDigit;
+                        else if(lc=='w')p.kind=UnicodeProperty::Kind::Word;
+                        else p.kind=UnicodeProperty::Kind::WhiteSpace;
+                    }
+                    p.negated=(e=='D'||e=='W'||e=='S');n->char_class.properties.push_back(p);prev.reset();continue;
+                }
             }
-            UChar32 cp;if(eat('\\')){char e=get();if(e=='n')cp='\n';else if(e=='r')cp='\r';else if(e=='t')cp='\t';else cp=static_cast<unsigned char>(e);}else cp=pattern_rune();
-            if(cp=='-'&&prev&&i_<s_.size()&&s_[i_]!=']'){UChar32 end;if(eat('\\'))end=static_cast<unsigned char>(get());else end=pattern_rune();if(end<*prev)fail("descending class range");n->char_class.ranges.back().second=static_cast<uint32_t>(end);prev.reset();continue;}
+            if(s_[i_]=='-'&&prev&&i_+1<s_.size()&&s_[i_+1]!=']'){++i_;UChar32 end=class_rune();if(end<*prev)fail("descending class range");n->char_class.ranges.back().second=static_cast<uint32_t>(end);prev.reset();continue;}
+            UChar32 cp=class_rune();
             n->char_class.ranges.push_back({static_cast<uint32_t>(cp),static_cast<uint32_t>(cp)});prev=cp;
         }
         fail("unclosed character class");
     }
     static std::vector<std::string> mandatory(const std::shared_ptr<RegexNode>& n) {
-        using K=RegexNode::Kind;if(!n)return{};if(n->kind==K::Literal)return(n->literal.empty()||n->icase)?std::vector<std::string>{}:std::vector<std::string>{n->literal};if(n->kind==K::Group||n->kind==K::LookAhead||n->kind==K::LookBehind)return mandatory(n->children[0]);if(n->kind==K::Repeat){if(n->min==0)return{};return mandatory(n->children[0]);}if(n->kind==K::Concat){std::vector<std::string>out;std::string run;for(auto&c:n->children){if(c->kind==K::Literal&&!c->icase)run+=c->literal;else{if(!run.empty()){out.push_back(run);run.clear();}auto m=mandatory(c);out.insert(out.end(),m.begin(),m.end());}}if(!run.empty())out.push_back(run);return out;}if(n->kind==K::Alt){if(n->children.empty())return{};auto acc=mandatory(n->children[0]);for(size_t i=1;i<n->children.size();++i){auto cur=mandatory(n->children[i]);std::vector<std::string>next;for(auto&a:acc)if(std::find(cur.begin(),cur.end(),a)!=cur.end())next.push_back(a);acc.swap(next);}return acc;}return{};
+        using K=RegexNode::Kind;if(!n)return{};if(n->kind==K::Literal)return(n->literal.empty()||n->icase)?std::vector<std::string>{}:std::vector<std::string>{n->literal};
+        if(n->kind==K::Group)return mandatory(n->children[0]);
+        if(n->kind==K::LookAhead||n->kind==K::LookBehind){if(!n->negative)return mandatory(n->children[0]);else return{};}
+        if(n->kind==K::Repeat){if(n->min==0)return{};return mandatory(n->children[0]);}
+        if(n->kind==K::Concat){std::vector<std::string>out;std::string run;for(auto&c:n->children){if(c->kind==K::Literal&&!c->icase)run+=c->literal;else{if(!run.empty()){out.push_back(run);run.clear();}auto m=mandatory(c);out.insert(out.end(),m.begin(),m.end());}}if(!run.empty())out.push_back(run);return out;}
+        if(n->kind==K::Alt){if(n->children.empty())return{};auto acc=mandatory(n->children[0]);for(size_t i=1;i<n->children.size();++i){auto cur=mandatory(n->children[i]);std::vector<std::string>next;for(auto&a:acc)if(std::find(cur.begin(),cur.end(),a)!=cur.end())next.push_back(a);acc.swap(next);}return acc;}return{};
     }
 };
 
@@ -219,14 +383,21 @@ private:
             if(n->greedy){p_.nfa[pc].x=c.start;patch(c.out,pc);patch(res.out,pc);return{res.start,{{pc,true}}};}
             p_.nfa[pc].y=c.start;patch(c.out,pc);patch(res.out,pc);return{res.start,{{pc,false}}};
         }
+        std::vector<PatchRef> all_exits;
         for(std::size_t k=n->min;k<n->max;++k){
             auto c=build(child);NfaInst sp=base(*n,NfaInst::Op::Split);int pc=emit(std::move(sp));
-            PatchRef exit;
-            if(n->greedy){p_.nfa[pc].x=c.start;exit={pc,true};}
-            else{p_.nfa[pc].y=c.start;exit={pc,false};}
-            patch(res.out,pc);auto outs=c.out;outs.push_back(exit);res.out=std::move(outs);
+            if(n->greedy){
+                p_.nfa[pc].x=c.start;
+                all_exits.push_back({pc,true});
+            } else {
+                p_.nfa[pc].y=c.start;
+                all_exits.push_back({pc,false});
+            }
+            patch(res.out,pc);
+            res.out=std::move(c.out);
         }
-        return res;
+        all_exits.insert(all_exits.end(),res.out.begin(),res.out.end());
+        return{res.start,std::move(all_exits)};
     }
     Frag build(const std::shared_ptr<RegexNode>&n){
         using K=RegexNode::Kind;
@@ -237,6 +408,9 @@ private:
             case K::Class:{auto i=base(*n,NfaInst::Op::Class);i.char_class=std::make_shared<CharClassSpec>(n->char_class);return one(std::move(i));}
             case K::Begin:return one(base(*n,NfaInst::Op::AssertBegin));
             case K::End:return one(base(*n,NfaInst::Op::AssertEnd));
+            case K::AbsBegin:return one(base(*n,NfaInst::Op::AssertAbsBegin));
+            case K::AbsEnd:return one(base(*n,NfaInst::Op::AssertAbsEnd));
+            case K::EndNewline:return one(base(*n,NfaInst::Op::AssertEndNewline));
             case K::WordBoundary:{auto i=base(*n,NfaInst::Op::AssertWord);i.negative=n->negative;return one(std::move(i));}
             case K::WordStartHalf:return one(base(*n,NfaInst::Op::AssertWordStartHalf));
             case K::WordEndHalf:return one(base(*n,NfaInst::Op::AssertWordEndHalf));
@@ -261,8 +435,20 @@ struct NfaThread { int pc=-1; std::size_t start=0; std::vector<std::pair<std::si
 
 bool assert_begin(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){return pos==0||(i.multiline&&pos>0&&static_cast<unsigned char>(t[pos-1])==sep);}
 bool assert_end(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){
-    bool ok=pos==t.size()||(i.multiline&&pos<t.size()&&static_cast<unsigned char>(t[pos])==sep);
-    if(!ok&&i.crlf&&sep=='\n'&&pos<t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+    if(i.multiline){
+        bool ok=pos==t.size()||(pos<t.size()&&static_cast<unsigned char>(t[pos])==sep);
+        if(!ok&&i.crlf&&sep=='\n'&&pos+1<t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+        return ok;
+    }
+    bool ok=pos==t.size()||(pos+1==t.size()&&static_cast<unsigned char>(t[pos])==sep);
+    if(!ok&&i.crlf&&sep=='\n'&&pos+2==t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+    return ok;
+}
+bool assert_abs_begin(const NfaInst&,std::string_view,std::size_t pos){return pos==0;}
+bool assert_abs_end(const NfaInst&,std::string_view t,std::size_t pos){return pos==t.size();}
+bool assert_end_newline(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){
+    bool ok=pos==t.size()||(pos+1==t.size()&&static_cast<unsigned char>(t[pos])==sep);
+    if(!ok&&i.crlf&&sep=='\n'&&pos+2==t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
     return ok;
 }
 bool is_word_at(const NfaInst&i,const Rune&r){return r.ok&&(i.unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));}
@@ -282,6 +468,9 @@ void add_nfa_thread(const RegexProgram&p,std::string_view text,const PatternOpti
             case NfaInst::Op::SaveEnd:if(i.group>=0&&static_cast<std::size_t>(i.group)<t.caps.size())t.caps[i.group].second=pos;push(i.x,std::move(t));break;
             case NfaInst::Op::AssertBegin:if(assert_begin(i,text,pos,sep))push(i.x,std::move(t));break;
             case NfaInst::Op::AssertEnd:if(assert_end(i,text,pos,sep))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertAbsBegin:if(assert_abs_begin(i,text,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertAbsEnd:if(assert_abs_end(i,text,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertEndNewline:if(assert_end_newline(i,text,pos,sep))push(i.x,std::move(t));break;
             case NfaInst::Op::AssertWord:if(assert_word(i,text,pos))push(i.x,std::move(t));break;
             case NfaInst::Op::AssertWordStartHalf:if(assert_word_start_half(i,text,pos))push(i.x,std::move(t));break;
             case NfaInst::Op::AssertWordEndHalf:if(assert_word_end_half(i,text,pos))push(i.x,std::move(t));break;
@@ -290,10 +479,10 @@ void add_nfa_thread(const RegexProgram&p,std::string_view text,const PatternOpti
     }
 }
 
-bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptions&o){
-    bool icase=i.icase||o.case_mode==CaseMode::Insensitive;
+bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptions&){
+    bool icase=i.icase;
     if(i.op==NfaInst::Op::Rune)return cp_eq(cp,static_cast<UChar32>(i.rune),icase);
-    if(i.op==NfaInst::Op::Any)return i.dotall||o.dotall||cp!=sep;
+    if(i.op==NfaInst::Op::Any)return i.dotall||cp!=sep;
     if(i.op==NfaInst::Op::Class)return i.char_class&&class_match(*i.char_class,cp,icase);
     return false;
 }
@@ -323,25 +512,81 @@ bool literal_at(std::string_view text,std::size_t pos,std::string_view lit,bool 
 }
 
 std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,const PatternOptions&o,unsigned char sep,const State&s,int depth=0) {
-    if(depth>256) return {};
-    using K=RegexNode::Kind;std::vector<State>out;bool icase=n->icase||o.case_mode==CaseMode::Insensitive;
+    if(depth>10000) throw std::runtime_error("pergrep regex: recursion depth exceeded");
+    using K=RegexNode::Kind;std::vector<State>out;bool icase=n->icase;
     switch(n->kind){
         case K::Empty:out.push_back(s);break;
         case K::Literal:{std::size_t e;if(literal_at(t,s.pos,n->literal,icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
-        case K::Dot:{auto r=rune_at(t,s.pos);if(r.ok&&(o.dotall||!(r.cp==sep))){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
+        case K::Dot:{auto r=rune_at(t,s.pos);if(r.ok&&(n->dotall||r.cp!=sep)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
         case K::Class:{auto r=rune_at(t,s.pos);if(r.ok&&class_match(n->char_class,r.cp,icase)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
-        case K::Begin:{bool ok=s.pos==0||(o.multiline&&s.pos>0&&static_cast<unsigned char>(t[s.pos-1])==sep);if(ok)out.push_back(s);break;}
-        case K::End:{bool ok=s.pos==t.size()||(o.multiline&&s.pos<t.size()&&static_cast<unsigned char>(t[s.pos])==sep);if(!ok&&o.crlf&&sep=='\n'&&s.pos<t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;if(ok)out.push_back(s);break;}
-        case K::WordBoundary:{auto l=rune_before(t,s.pos),r=rune_at(t,s.pos);bool lw=l.ok&&(o.unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));bool rw=r.ok&&(o.unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));bool ok=lw!=rw;if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
-        case K::WordStartHalf:{auto l=rune_before(t,s.pos);bool lw=l.ok&&(o.unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
-        case K::WordEndHalf:{auto r=rune_at(t,s.pos);bool rw=r.ok&&(o.unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
-        case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(next.size()>200000)break;}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
+        case K::Begin:{bool ok=s.pos==0||(n->multiline&&s.pos>0&&static_cast<unsigned char>(t[s.pos-1])==sep);if(ok)out.push_back(s);break;}
+        case K::End:{
+            bool ok=false;
+            if(n->multiline){
+                ok=s.pos==t.size()||(s.pos<t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
+                if(!ok&&n->crlf&&sep=='\n'&&s.pos+1<t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
+            } else {
+                ok=s.pos==t.size()||(s.pos+1==t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
+                if(!ok&&n->crlf&&sep=='\n'&&s.pos+2==t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
+            }
+            if(ok)out.push_back(s);
+            break;
+        }
+        case K::AbsBegin:{if(s.pos==0)out.push_back(s);break;}
+        case K::AbsEnd:{if(s.pos==t.size())out.push_back(s);break;}
+        case K::EndNewline:{
+            bool ok=s.pos==t.size()||(s.pos+1==t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
+            if(!ok&&n->crlf&&sep=='\n'&&s.pos+2==t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
+            if(ok)out.push_back(s);
+            break;
+        }
+        case K::WordBoundary:{auto l=rune_before(t,s.pos),r=rune_at(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));bool ok=lw!=rw;if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
+        case K::WordStartHalf:{auto l=rune_before(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
+        case K::WordEndHalf:{auto r=rune_at(t,s.pos);bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
+        case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
         case K::Alt:for(auto&c:n->children){auto v=eval(c,t,o,sep,s,depth+1);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));}break;
         case K::Group:{auto base=s;auto v=eval(n->children[0],t,o,sep,s,depth+1);for(auto&z:v){if(static_cast<int>(z.caps.g.size())<=n->group)z.caps.g.resize(n->group+1,{SIZE_MAX,SIZE_MAX});z.caps.g[n->group]={base.pos,z.pos};}out=std::move(v);break;}
-        case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a)break;std::size_t e;if(literal_at(t,s.pos,t.substr(a,b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
-        case K::LookAhead:{auto v=eval(n->children[0],t,o,sep,s,depth+1);bool ok=!v.empty();if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
-        case K::LookBehind:{bool ok=false;std::size_t lo=s.pos>4096?s.pos-4096:0;for(std::size_t p=lo;p<=s.pos&&!ok;){State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);for(auto&z:v)if(z.pos==s.pos){ok=true;break;}if(p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;}if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
-        case K::Repeat:{std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};std::size_t hard=t.size()+1;std::size_t limit=n->max==SIZE_MAX?std::min<std::size_t>(hard,n->min+4096):std::min(n->max,hard);for(std::size_t k=1;k<=limit;++k){std::vector<State>next;for(auto&st:levels){auto v=eval(n->children[0],t,o,sep,st,depth+1);for(auto&z:v)if(z.pos!=st.pos)next.push_back(std::move(z));}if(next.empty())break;if(next.size()>200000)next.resize(200000);all.push_back(next);levels=std::move(next);}if(n->greedy){for(std::size_t k=all.size();k-->n->min;)out.insert(out.end(),all[k].begin(),all[k].end());}else{for(std::size_t k=n->min;k<all.size();++k)out.insert(out.end(),all[k].begin(),all[k].end());}break;}
+        case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a||b>t.size())break;std::size_t e;if(literal_at(t,s.pos,t.substr(a,b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
+        case K::LookAhead:{
+            auto v=eval(n->children[0],t,o,sep,s,depth+1);
+            if(n->negative){if(v.empty())out.push_back(s);}
+            else{for(auto&z:v){State r=z;r.pos=s.pos;out.push_back(std::move(r));}}
+            break;
+        }
+        case K::LookBehind:{
+            if(n->negative){
+                bool ok=false;
+                for(std::size_t p=0;p<=s.pos;){
+                    State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
+                    for(auto&z:v)if(z.pos==s.pos){ok=true;break;}
+                    if(ok||p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
+                }
+                if(!ok)out.push_back(s);
+            } else {
+                for(std::size_t p=0;p<=s.pos;){
+                    State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
+                    for(auto&z:v)if(z.pos==s.pos){State r=z;r.pos=s.pos;out.push_back(std::move(r));}
+                    if(p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
+                }
+            }
+            break;
+        }
+        case K::Repeat:{
+            std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};
+            std::size_t limit=n->max==SIZE_MAX?(t.size()-s.pos+1):n->max;
+            for(std::size_t k=1;k<=limit;++k){
+                std::vector<State>next;
+                for(auto&st:levels){
+                    auto v=eval(n->children[0],t,o,sep,st,depth+1);
+                    for(auto&z:v)if(z.pos!=st.pos)next.push_back(std::move(z));
+                }
+                if(next.empty())break;
+                all.push_back(next);levels=std::move(next);
+            }
+            if(n->greedy){for(std::size_t k=all.size();k-->n->min;)out.insert(out.end(),all[k].begin(),all[k].end());}
+            else{for(std::size_t k=n->min;k<all.size();++k)out.insert(out.end(),all[k].begin(),all[k].end());}
+            break;
+        }
     }
     return out;
 }
