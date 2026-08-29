@@ -211,12 +211,14 @@ public:
     Parser(std::string_view s, PatternOptions o): s_(s), opt_(o) {}
     RegexProgram parse() {
         auto n = alt(); if (i_ != s_.size()) fail("unexpected trailing input");
-        RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_; p.mandatory = mandatory(p.ast);
-        std::sort(p.mandatory.begin(), p.mandatory.end()); p.mandatory.erase(std::unique(p.mandatory.begin(), p.mandatory.end()), p.mandatory.end());
-        std::sort(p.mandatory.begin(), p.mandatory.end(), [](const auto&a,const auto&b){ return a.size() > b.size(); });
-        p.prefixes = extract_prefixes(p.ast);
-        p.branch_mandatory = extract_branch_mandatory(p.ast);
-        p.is_pure_literal = check_pure_literal(p.ast, p.exact_literal);
+        RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_;
+        // Build QueryIR via pure helpers and mirror into RegexProgram for compatibility.
+        auto ir = analyze_query(p.ast, p.extended);
+        p.mandatory = ir.mandatory;
+        p.prefixes = ir.prefixes;
+        p.branch_mandatory = ir.branch_mandatory;
+        p.is_pure_literal = ir.is_pure_literal;
+        p.exact_literal = ir.exact_literal;
         return p;
     }
 private:
@@ -406,11 +408,17 @@ private:
         if(n->kind==K::Concat){std::vector<std::string>out;std::string run;for(auto&c:n->children){if(c->kind==K::Literal&&!c->icase)run+=c->literal;else{if(!run.empty()){out.push_back(run);run.clear();}auto m=mandatory(c);out.insert(out.end(),m.begin(),m.end());}}if(!run.empty())out.push_back(run);return out;}
         if(n->kind==K::Alt){if(n->children.empty())return{};auto acc=mandatory(n->children[0]);for(size_t i=1;i<n->children.size();++i){auto cur=mandatory(n->children[i]);std::vector<std::string>next;for(auto&a:acc)if(std::find(cur.begin(),cur.end(),a)!=cur.end())next.push_back(a);acc.swap(next);}return acc;}return{};
     }
+    // Prefix extraction: per-branch literal prefix when known. Unwraps Group and Repeat(min>0).
     static std::vector<std::string> extract_prefixes(const std::shared_ptr<RegexNode>& n) {
         using K = RegexNode::Kind;
         if (!n) return {};
         if (n->kind == K::Literal) {
             if (!n->literal.empty() && !n->icase) return {n->literal};
+            return {};
+        }
+        if (n->kind == K::Group) return extract_prefixes(n->children[0]);
+        if (n->kind == K::Repeat) {
+            if (n->min > 0) return extract_prefixes(n->children[0]);
             return {};
         }
         if (n->kind == K::Concat) {
@@ -430,30 +438,30 @@ private:
         }
         return {};
     }
+    // Branch mandatory: per-branch lists for union pruning. Unwraps outer Group.
     static std::vector<std::vector<std::string>> extract_branch_mandatory(const std::shared_ptr<RegexNode>& n) {
         using K = RegexNode::Kind;
         if (!n) return {};
-        if (n->kind == K::Alt) {
-            std::vector<std::vector<std::string>> out;
-            for (const auto& c : n->children) {
-                auto m = mandatory(c);
-                if (m.empty()) return {};
-                out.push_back(std::move(m));
-            }
-            return out;
+        const RegexNode* cur = n.get();
+        std::shared_ptr<RegexNode> cur_sp = n;
+        while (cur && cur->kind == K::Group) { cur_sp = cur->children[0]; cur = cur_sp.get(); }
+        if (!cur || cur->kind != K::Alt) return {};
+        std::vector<std::vector<std::string>> out;
+        for (const auto& c : cur_sp->children) {
+            auto m = mandatory(c);
+            if (m.empty()) return {};
+            out.push_back(std::move(m));
         }
-        return {};
+        return out;
     }
     static bool check_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& lit) {
         using K = RegexNode::Kind;
         if (!n) return false;
         if (n->kind == K::Literal) {
-            if (!n->icase) {
-                lit = n->literal;
-                return true;
-            }
+            if (!n->icase) { lit = n->literal; return true; }
             return false;
         }
+        if (n->kind == K::Group) return check_pure_literal(n->children[0], lit);
         if (n->kind == K::Concat) {
             std::string run;
             for (const auto& c : n->children) {
@@ -757,6 +765,123 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
 }
 
 } // namespace
+
+// Pure QueryIR helpers — also used by Parser statics above.
+std::vector<std::string> query_mandatory(const std::shared_ptr<RegexNode>& n) {
+    using K = RegexNode::Kind;
+    if (!n) return {};
+    if (n->kind == K::Literal) return (n->literal.empty() || n->icase) ? std::vector<std::string>{} : std::vector<std::string>{n->literal};
+    if (n->kind == K::Group) return query_mandatory(n->children[0]);
+    if (n->kind == K::LookAhead || n->kind == K::LookBehind) {
+        if (!n->negative) return query_mandatory(n->children[0]);
+        return {};
+    }
+    if (n->kind == K::Repeat) {
+        if (n->min == 0) return {};
+        return query_mandatory(n->children[0]);
+    }
+    if (n->kind == K::Concat) {
+        std::vector<std::string> out; std::string run;
+        for (auto& c : n->children) {
+            if (c->kind == K::Literal && !c->icase) run += c->literal;
+            else { if (!run.empty()) { out.push_back(run); run.clear(); } auto m = query_mandatory(c); out.insert(out.end(), m.begin(), m.end()); }
+        }
+        if (!run.empty()) out.push_back(run);
+        return out;
+    }
+    if (n->kind == K::Alt) {
+        if (n->children.empty()) return {};
+        auto acc = query_mandatory(n->children[0]);
+        for (size_t i = 1; i < n->children.size(); ++i) {
+            auto cur = query_mandatory(n->children[i]);
+            std::vector<std::string> nxt;
+            for (auto& a : acc) if (std::find(cur.begin(), cur.end(), a) != cur.end()) nxt.push_back(a);
+            acc.swap(nxt);
+        }
+        return acc;
+    }
+    return {};
+}
+std::vector<std::string> query_prefixes(const std::shared_ptr<RegexNode>& n) {
+    using K = RegexNode::Kind;
+    if (!n) return {};
+    if (n->kind == K::Literal) {
+        if (!n->literal.empty() && !n->icase) return {n->literal};
+        return {};
+    }
+    if (n->kind == K::Group) return query_prefixes(n->children[0]);
+    if (n->kind == K::Repeat) {
+        if (n->min > 0) return query_prefixes(n->children[0]);
+        return {};
+    }
+    if (n->kind == K::Concat) {
+        if (!n->children.empty()) return query_prefixes(n->children.front());
+        return {};
+    }
+    if (n->kind == K::Alt) {
+        std::vector<std::string> out;
+        for (const auto& c : n->children) {
+            auto p = query_prefixes(c);
+            if (p.empty()) return {};
+            out.insert(out.end(), p.begin(), p.end());
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+    return {};
+}
+std::vector<std::vector<std::string>> query_branch_mandatory(const std::shared_ptr<RegexNode>& n) {
+    using K = RegexNode::Kind;
+    if (!n) return {};
+    const RegexNode* cur = n.get();
+    std::shared_ptr<RegexNode> cur_sp = n;
+    while (cur && cur->kind == K::Group) { cur_sp = cur->children[0]; cur = cur_sp.get(); }
+    if (!cur || cur->kind != K::Alt) return {};
+    std::vector<std::vector<std::string>> out;
+    for (const auto& c : cur_sp->children) {
+        auto m = query_mandatory(c);
+        if (m.empty()) return {};
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+bool query_is_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& out) {
+    using K = RegexNode::Kind;
+    if (!n) return false;
+    if (n->kind == K::Literal) {
+        if (!n->icase) { out = n->literal; return true; }
+        return false;
+    }
+    if (n->kind == K::Group) return query_is_pure_literal(n->children[0], out);
+    if (n->kind == K::Concat) {
+        std::string run;
+        for (const auto& c : n->children) {
+            std::string sub;
+            if (!query_is_pure_literal(c, sub)) return false;
+            run += sub;
+        }
+        out = run;
+        return true;
+    }
+    return false;
+}
+QueryIR analyze_query(const std::shared_ptr<RegexNode>& ast, bool extended) {
+    QueryIR ir;
+    ir.mandatory = query_mandatory(ast);
+    std::sort(ir.mandatory.begin(), ir.mandatory.end());
+    ir.mandatory.erase(std::unique(ir.mandatory.begin(), ir.mandatory.end()), ir.mandatory.end());
+    std::sort(ir.mandatory.begin(), ir.mandatory.end(), [](const auto& a, const auto& b){ return a.size() > b.size(); });
+    ir.prefixes = query_prefixes(ast);
+    ir.branch_mandatory = query_branch_mandatory(ast);
+    std::string lit;
+    bool pure = query_is_pure_literal(ast, lit);
+    // Extended patterns (backref/lookaround) are never pure literals.
+    if (extended) pure = false;
+    ir.is_pure_literal = pure;
+    if (pure) ir.exact_literal = lit;
+    return ir;
+}
 
 RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     auto p=Parser(pattern,opt).parse();
