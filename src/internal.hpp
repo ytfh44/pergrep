@@ -93,16 +93,62 @@ struct NfaInst {
     bool unicode = true;
     bool crlf = false;
 };
+// QueryIR — optimizer-facing literal/branch view derived from the regex AST.
+// Formalizes the "query plan" extracted for candidate pruning / NFA fast-path.
+// Fields are conservative (zero false negatives): pruning may keep extra chunks
+// but must never discard a true match.
+struct QueryIR {
+    // mandatory: intersection of mandatory literals across all Alt branches.
+    // Used as the global chunk filter when branch_mandatory is not available.
+    // Example: `foo|foobar` -> intersection {foo}. Sorted longest-first.
+    std::vector<std::string> mandatory;
+    // branch_mandatory: per-branch mandatory lists for union pruning.
+    // Each entry is the mandatory() set for one Alt branch. Empty overall
+    // means conservative fallback (at least one branch has no mandatory
+    // literal, so union pruning is disabled and search falls back to
+    // the global `mandatory` intersection).
+    // Example: `foo|bar` -> [[foo],[bar]]; `foo|.*` -> [] (conservative).
+    // Only top-level Alt (after unwrapping outer Group nodes) is
+    // decomposed; Concat containing Alt falls back to global mandatory.
+    // Documented limitation: deeper nesting is not split.
+    std::vector<std::vector<std::string>> branch_mandatory;
+    // prefixes: per-branch literal prefixes for NFA jump optimization.
+    // Used by nfa_search to skip to the next possible match offset.
+    // Only case-sensitive literals contribute; icase literals yield empty.
+    // Unwraps outer Group and Repeat with min>0 to reach the real prefix.
+    std::vector<std::string> prefixes;
+    // is_pure_literal + exact_literal: word/line-agnostic literal equivalence.
+    // True when the regex is equivalent to a single fixed string (Concat of
+    // case-sensitive Literals, optionally wrapped in a single Group).
+    // The search layer may dispatch such patterns to the fixed-string path
+    // provided `extended==false`, `case_mode` is sensitive, and word/line
+    // flags do not affect the literal check. `exact_literal` is valid only
+    // when `is_pure_literal` is true.
+    bool is_pure_literal = false;
+    std::string exact_literal;
+};
+
+// Pure extraction helpers (conservative, no false negatives). Exposed for
+// testing and for analyze_query(). Each operates on the AST subtree only.
+std::vector<std::string> query_mandatory(const std::shared_ptr<RegexNode>& n);
+std::vector<std::string> query_prefixes(const std::shared_ptr<RegexNode>& n);
+std::vector<std::vector<std::string>> query_branch_mandatory(const std::shared_ptr<RegexNode>& n);
+bool query_is_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& out);
+QueryIR analyze_query(const std::shared_ptr<RegexNode>& ast, bool extended);
+
 struct RegexProgram {
     std::shared_ptr<RegexNode> ast;
     int groups = 0;
     std::vector<std::string> group_names;
     bool extended = false;
-    std::vector<std::string> mandatory;
-    std::vector<std::string> prefixes;
-    std::vector<std::vector<std::string>> branch_mandatory;
-    bool is_pure_literal = false;
-    std::string exact_literal;
+    // QueryIR fields — kept as direct members for backward compatibility;
+    // semantics are defined on QueryIR above. New code should prefer
+    // `QueryIR ir = analyze_query(ast, extended)` and read ir.*.
+    std::vector<std::string> mandatory; // == QueryIR::mandatory
+    std::vector<std::string> prefixes;  // == QueryIR::prefixes
+    std::vector<std::vector<std::string>> branch_mandatory; // == QueryIR::branch_mandatory
+    bool is_pure_literal = false; // == QueryIR::is_pure_literal
+    std::string exact_literal;    // == QueryIR::exact_literal
     std::vector<NfaInst> nfa;
     std::int32_t nfa_start = -1;
 };

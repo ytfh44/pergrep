@@ -8,6 +8,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if __has_include("../src/internal.hpp")
+#include "../src/internal.hpp"
+#endif
 using namespace pergrep;
 
 static Index corpus(std::string s){ return Index::from_documents({{"a.txt",std::move(s)}}); }
@@ -559,5 +562,127 @@ int main(){
     assert(stats.candidate_chunks >= 1);
     assert(stats.verified_bytes > 0);
   }
+  // QO-1 Literal & Branch Analyzer
+#if __has_include("../src/internal.hpp")
+  {
+    using pergrep::detail::parse_regex;
+    auto check_prefixes = [&](std::string pat, PatternOptions opt, std::vector<std::string> expect) {
+      auto prog = parse_regex(pat, opt);
+      auto got = prog.prefixes;
+      std::sort(got.begin(), got.end());
+      std::sort(expect.begin(), expect.end());
+      if (got != expect) {
+        std::cerr << "PREFIX FAIL pat=" << pat << " got{";
+        for (auto &s: got) std::cerr << s << ",";
+        std::cerr << "} expect{";
+        for (auto &s: expect) std::cerr << s << ",";
+        std::cerr << "}\n";
+      }
+      assert(got == expect);
+    };
+    auto check_branch = [&](std::string pat, PatternOptions opt, std::vector<std::vector<std::string>> expect) {
+      auto prog = parse_regex(pat, opt);
+      auto got = prog.branch_mandatory;
+      auto norm = [](std::vector<std::vector<std::string>> v){
+        for (auto& inner : v) std::sort(inner.begin(), inner.end());
+        std::sort(v.begin(), v.end());
+        return v;
+      };
+      assert(norm(got) == norm(expect));
+    };
+    // extract_prefixes: foo|bar -> {foo,bar}
+    check_prefixes("foo|bar", {}, {"foo","bar"});
+    // case-insensitive -> empty (icase literals do not contribute)
+    {
+      PatternOptions o; o.case_mode = CaseMode::Insensitive;
+      check_prefixes("foo|bar", o, {});
+      check_prefixes("foo", o, {});
+    }
+    // (foo|bar) group unwrapping -> same as foo|bar
+    check_prefixes("(foo|bar)", {}, {"foo","bar"});
+    // foobar -> {foobar}
+    check_prefixes("foobar", {}, {"foobar"});
+    // a|b|c -> 3 prefixes
+    check_prefixes("a|b|c", {}, {"a","b","c"});
+    // Repeat with min>0 prefix of child
+    check_prefixes("foo+", {}, {"fo"}); // Concat ["fo", Repeat("o")] -> prefix of first child "fo"
+    check_prefixes("(foo)+", {}, {"foo"});
+    check_prefixes("(foo)*", {}, {}); // Repeat star on group -> empty
+    // branch_mandatory: foo|bar -> [[foo],[bar]]
+    check_branch("foo|bar", {}, {{"foo"},{"bar"}});
+    // foo|.* -> empty (conservative, one branch has no mandatory)
+    check_branch("foo|.*", {}, {});
+    // (foo|bar)qux fallback to global mandatory [qux] (branch_mandatory empty)
+    {
+      auto prog = parse_regex("(foo|bar)qux", {});
+      assert(prog.branch_mandatory.empty());
+      bool has_qux = std::find(prog.mandatory.begin(), prog.mandatory.end(), "qux") != prog.mandatory.end();
+      assert(has_qux);
+      auto idx = corpus("fooqux\nbarqux\nqux\nnomatch\n");
+      Searcher s(idx);
+      auto pat = Pattern::compile("(foo|bar)qux");
+      auto m = s.find(pat);
+      assert(m.size() == 2);
+    }
+    // Group(Alt) branch_mandatory unwrapping
+    check_branch("(foo|bar)", {}, {{"foo"},{"bar"}});
+    // is_pure_literal: hello pure
+    {
+      auto prog = parse_regex("hello", {});
+      assert(prog.is_pure_literal && prog.exact_literal == "hello");
+    }
+    // Group(foo) pure
+    {
+      auto prog = parse_regex("(foo)", {});
+      assert(prog.is_pure_literal && prog.exact_literal == "foo");
+    }
+    // Concat Group pure
+    {
+      auto prog = parse_regex("(foo)(bar)", {});
+      assert(prog.is_pure_literal && prog.exact_literal == "foobar");
+    }
+    // non-pure: foo.*, foo|bar
+    {
+      auto p1 = parse_regex("foo.*", {});
+      assert(!p1.is_pure_literal);
+      auto p2 = parse_regex("foo|bar", {});
+      assert(!p2.is_pure_literal);
+    }
+    // extended (ab)\1 -> false
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      auto prog = parse_regex(R"((ab)\1)", o);
+      assert(!prog.is_pure_literal);
+    }
+    // Negative lookaround isolation: (?!FORBIDDEN)needle not producing FORBIDDEN
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      auto prog = parse_regex(R"((?!FORBIDDEN)needle)", o);
+      for (auto& lit : prog.mandatory) assert(lit.find("FORBIDDEN") == std::string::npos);
+      assert(std::find(prog.mandatory.begin(), prog.mandatory.end(), "needle") != prog.mandatory.end());
+      for (auto& br : prog.branch_mandatory) for (auto& lit : br) assert(lit.find("FORBIDDEN") == std::string::npos);
+    }
+    // throws_compile for malformed escapes
+    assert(throws_compile(R"(\q)"));
+    assert(throws_compile(R"(\xZZ)"));
+  }
+#else
+  // Fallback when internal.hpp not reachable: validate via public API only.
+  {
+    // foo|bar mandatory intersection empty (no common literal) but search works
+    auto p = Pattern::compile("foo|bar");
+    // mandatory() returns intersection -> empty for foo|bar
+    assert(p.mandatory_literals().empty());
+    auto idx = corpus("foo bar baz\n");
+    Searcher s(idx);
+    assert(s.find(p).size() == 2);
+    // foobar prefixes indirectly validated via search correctness
+    auto p2 = Pattern::compile("foobar");
+    assert(!p2.mandatory_literals().empty());
+    // is_pure_literal fallback observable via search still correct
+    auto ph = Pattern::compile("hello");
+    assert(s.find(ph).empty()); // no hello in corpus
+  }
+#endif
   return 0;
 }
