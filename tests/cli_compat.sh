@@ -346,14 +346,12 @@ not_contains "$(cat "$T/stats2.err")" '1 matches' stats-not-stderr
 $PG --stats -l -F needle "$T/color.txt" > "$T/stats-mode.out"
 not_contains "$(cat "$T/stats-mode.out")" 'matches' stats-ignored-files-with
 
-# -o suppresses empty matches but the search still succeeds when an empty match exists.
+# -o preserves zero-length matches.
 printf 'abc\n' > "$T/zero.txt"
-set +e
-$PG -o '^' "$T/zero.txt" > "$T/zero.out"; zs=$?
-set -e
-eq "$zs" 0 zero-width-exit
-[[ ! -s "$T/zero.out" ]] || fail zero-width-only-matching-output
-
+out="$($PG -n -o '^' "$T/zero.txt")"
+eq "$out" '1:' zero-width-only-matching-line
+out="$($PG -o '^' "$T/zero.txt")"
+eq "$out" '' zero-width-only-matching-text
 # --files honors sorting and path separator formatting.
 mkdir -p "$T/filemode/sub"
 printf x > "$T/filemode/sub/b.txt"; printf x > "$T/filemode/a.txt"
@@ -432,3 +430,49 @@ $PG --color=always --colors=match:none --colors=line:none --colors=column:none -
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[0m\x1b[36m3\x1b[0m:' in b, b
 PY
+
+# --engine=invalid error exit code (2).
+set +e
+$PG --engine=invalid needle "$T/basic/a.txt" >/dev/null 2>&1; eng_status=$?
+set -e
+eq "$eng_status" 2 engine-invalid-exit
+
+# Multiline --replace.
+printf 'start\nfoo\nbar\nend\n' > "$T/multiline_repl.txt"
+out="$($PG -U -r 'REPLACED' 'foo\nbar' "$T/multiline_repl.txt")"
+eq "$out" $'start\nREPLACED\nend' multiline-replace
+
+printf 'SECTION\nkey = value\nENDSECTION\n' > "$T/multiline_repl2.txt"
+out="$($PG -U -r 'FOUND: $1' 'SECTION\n(.*)\nENDSECTION' "$T/multiline_repl2.txt")"
+eq "$out" 'FOUND: key = value' multiline-replace-capture
+
+# Non-UTF8 path and data in JSON output mode.
+"$PY" - "$T/nonutf8.txt" <<'PY'
+import sys
+open(sys.argv[1],'wb').write(b'\xff\xfe\xfd needle \xfe\xff\n')
+PY
+$PG --json -a needle "$T/nonutf8.txt" > "$T/nonutf8.out"
+"$PY" - "$T/nonutf8.out" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], 'rb').read().splitlines()]
+matches = [x for x in rows if x['type'] == 'match']
+assert len(matches) > 0, "no match records in JSON output"
+for m in matches:
+    assert 'path' in m['data'], "missing path in match data"
+    assert 'text' in m['data']['path'] or 'bytes' in m['data']['path'], "path must be formatted with json_data"
+PY
+
+if [ "$IS_WINDOWS" = "0" ]; then
+  bad_path="$(printf "$T/nonutf8_\xff_path.txt")"
+  printf 'needle\n' > "$bad_path"
+  $PG --json needle "$bad_path" > "$T/badpath.out" 2>/dev/null || true
+  if [ -s "$T/badpath.out" ]; then
+    "$PY" - "$T/badpath.out" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], 'rb').read().splitlines()]
+matches = [x for x in rows if x['type'] == 'match']
+if matches:
+    assert 'bytes' in matches[0]['data']['path'] or 'text' in matches[0]['data']['path']
+PY
+  fi
+fi
