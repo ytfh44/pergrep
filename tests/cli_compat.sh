@@ -461,6 +461,22 @@ for m in matches:
     assert 'path' in m['data'], "missing path in match data"
     assert 'text' in m['data']['path'] or 'bytes' in m['data']['path'], "path must be formatted with json_data"
 PY
+# Multipattern inverted search (-v -e A -e B excludes lines matching either A or B).
+printf 'foo\nbar\nbaz\nqux\n' > "$T/vmulti.txt"
+out="$($PG -v -e foo -e bar "$T/vmulti.txt")"
+eq "$out" $'baz\nqux' invert-match-multipattern
+
+# Smart case fixed string matching.
+printf 'Apple\napple\n' > "$T/smartcase.txt"
+out="$($PG -F -S apple "$T/smartcase.txt")"
+eq "$out" $'Apple\napple' smartcase-lowercase
+out="$($PG -F -S Apple "$T/smartcase.txt")"
+eq "$out" 'Apple' smartcase-uppercase
+
+# Max-count limits matches per file.
+printf 'one\ntwo\nthree\n' > "$T/maxcount.txt"
+out="$($PG -m 2 -e '.*' "$T/maxcount.txt")"
+eq "$out" $'one\ntwo' max-count-limit
 
 if [ "$IS_WINDOWS" = "0" ]; then
   bad_path="$(printf "$T/nonutf8_\xff_path.txt")"

@@ -135,6 +135,58 @@ int main(void){
         pg_index_free(idx);
     }
 
-    printf("ok\n");
+    // C API pattern option variations (case insensitive, word boundary, multiline)
+    {
+        char* err = NULL;
+        pg_index_options iopt = pg_index_options_default();
+        pg_index* idx = pg_index_build(".", &iopt, &err);
+        assert(idx != NULL);
+        pg_searcher* searcher = pg_searcher_new(idx, &err);
+        assert(searcher != NULL);
+
+        // Case insensitive fixed
+        pg_pattern_options po1 = pg_pattern_options_default();
+        po1.kind = PG_FIXED;
+        po1.case_mode = PG_CASE_INSENSITIVE;
+        pg_pattern* p1 = pg_pattern_compile("PERGREP", &po1, &err);
+        assert(p1 != NULL);
+        size_t c1 = 0;
+        pg_match* m1 = pg_search(searcher, p1, NULL, &c1, NULL, &err);
+        assert(m1 != NULL);
+        assert(c1 > 0);
+        pg_matches_free(m1);
+        pg_pattern_free(p1);
+
+        // Word boundary fixed
+        pg_pattern_options po2 = pg_pattern_options_default();
+        po2.kind = PG_FIXED;
+        po2.word = 1;
+        pg_pattern* p2 = pg_pattern_compile("pergrep", &po2, &err);
+        assert(p2 != NULL);
+        size_t c2 = 0;
+        pg_match* m2 = pg_search(searcher, p2, NULL, &c2, NULL, &err);
+        assert(m2 != NULL);
+        assert(c2 > 0);
+        pg_matches_free(m2);
+        pg_pattern_free(p2);
+
+        // Regex with Unicode property
+        pg_pattern_options po3 = pg_pattern_options_default();
+        pg_pattern* p3 = pg_pattern_compile("\\w+", &po3, &err);
+        assert(p3 != NULL);
+        size_t c3 = 0;
+        pg_search_options so3 = pg_search_options_default();
+        so3.max_matches = 10;
+        pg_match* m3 = pg_search(searcher, p3, &so3, &c3, NULL, &err);
+        assert(m3 != NULL);
+        assert(c3 == 10);
+        pg_matches_free(m3);
+        pg_pattern_free(p3);
+
+        pg_searcher_free(searcher);
+        pg_index_free(idx);
+    }
+
+    printf("All C API tests passed cleanly.\n");
     return 0;
 }

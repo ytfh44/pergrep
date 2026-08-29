@@ -421,5 +421,136 @@ int main(){
       assert(actual_files == expected_files);
     }
   }
-  std::cout<<"ok\n";
+  // Advanced test suite 1: Nested capturing groups with repetition and backreferences.
+  {
+    PatternOptions o; o.engine = Engine::Pcre2Compat;
+    auto idx = corpus("abc123def abc456def <tag>content</tag> <div id=\"main\">hello</div>\n");
+    Searcher s(idx);
+    // Nested groups: group 1 captures full word, group 2 captures inner digits
+    auto p1 = Pattern::compile(R"(abc(([0-9]+))def)", o);
+    auto m1 = s.find(p1);
+    assert(m1.size() == 2);
+    assert(m1[0].captures.size() == 3);
+    assert(m1[0].captures[1].start == 3 && m1[0].captures[1].end == 6);
+    assert(m1[0].captures[2].start == 3 && m1[0].captures[2].end == 6);
+    // Backreference matching XML tags
+    auto p_tag = Pattern::compile(R"(<([a-zA-Z0-9]+)>(.*?)</\1>)", o);
+    auto m_tag = s.find(p_tag);
+    assert(m_tag.size() == 1);
+    assert(m_tag[0].captures[1].start == 21 && m_tag[0].captures[1].end == 24);
+  }
+
+  // Advanced test suite 2: Unicode properties, scripts, and multi-byte character classes.
+  {
+    auto idx = corpus("Hello 1234 世界 🌍 12.34 русский язык 999\n");
+    Searcher s(idx);
+    // Han script
+    auto p_han = Pattern::compile(R"(\p{Han}+)");
+    auto m_han = s.find(p_han);
+    assert(m_han.size() == 1);
+    assert(idx.content(0).substr(m_han[0].start, m_han[0].end - m_han[0].start) == "世界");
+    // Cyrillic script
+    auto p_cyr = Pattern::compile(R"(\p{Cyrillic}+)");
+    auto m_cyr = s.find(p_cyr);
+    assert(m_cyr.size() == 2);
+    // Numbers via \p{Nd} or \p{DecimalDigit}
+    auto p_num = Pattern::compile(R"(\p{DecimalDigit}+)");
+    auto m_num = s.find(p_num);
+    assert(m_num.size() == 4); // 1234, 12, 34, 999
+    // Unicode word characters including underscores and alphanumerics
+    auto p_w = Pattern::compile(R"([\w]+)");
+    auto m_w = s.find(p_w);
+    assert(m_w.size() >= 7);
+  }
+
+  // Advanced test suite 3: Lookaround assertions (nested, chained, and combined).
+  {
+    PatternOptions o; o.engine = Engine::Pcre2Compat;
+    auto idx = corpus("cat mat bat rat car bar\n");
+    Searcher s(idx);
+    // Positive lookahead chained with negative lookahead: ends in 'at', but not 'bat' or 'rat'
+    auto p = Pattern::compile(R"((?!b|r)[a-z](?=at))", o);
+    auto m = s.find(p);
+    assert(m.size() == 2); // 'c' in cat, 'm' in mat
+    assert(idx.content(0).substr(m[0].start, 1) == "c");
+    assert(idx.content(0).substr(m[1].start, 1) == "m");
+    // Lookbehind: preceded by 'c' or 'b', matching 'ar'
+    auto p_lb = Pattern::compile(R"((?<=c|b)ar)", o);
+    auto m_lb = s.find(p_lb);
+    assert(m_lb.size() == 2);
+    // Negative lookbehind: 'ar' NOT preceded by 'c'
+    auto p_nlb = Pattern::compile(R"((?<!c)ar)", o);
+    auto m_nlb = s.find(p_nlb);
+    assert(m_nlb.size() == 1); // 'ar' in bar
+  }
+
+  // Advanced test suite 4: Word boundary and anchor matrix with CRLF and multiline.
+  {
+    auto idx = corpus("foo\r\nbar foo\r\nfoo\r\n");
+    Searcher s(idx);
+    PatternOptions o_crlf; o_crlf.crlf = true; o_crlf.multiline = true;
+    auto p_anchored = Pattern::compile(R"(^foo$)", o_crlf);
+    auto m_anchored = s.find(p_anchored);
+    assert(m_anchored.size() == 2); // line 1 and line 3
+    assert(m_anchored[0].start == 0 && m_anchored[0].end == 3);
+    // Word boundary at CRLF boundary
+    auto p_word = Pattern::compile(R"(\bfoo\b)", o_crlf);
+    auto m_word = s.find(p_word);
+    assert(m_word.size() == 3);
+  }
+
+  // Advanced test suite 5: Extreme IndexOptions configurations.
+  {
+    std::string text(100000, 'x');
+    for (size_t i = 50; i < text.size(); i += 50) text[i] = '\n';
+    text.replace(500, 10, "TARGET_001");
+    text.replace(50000, 10, "TARGET_002");
+    text.replace(95000, 10, "TARGET_003");
+
+    // Ultra-small chunk and block size
+    IndexOptions opt_small;
+    opt_small.chunk_bytes = 128;
+    opt_small.chunk_overlap = 64;
+    opt_small.positional_block_bytes = 16;
+    opt_small.positional_budget_ratio = 0.8;
+    auto idx_small = Index::from_documents({{"extreme.txt", text}}, opt_small);
+    Searcher s_small(idx_small);
+    auto p = Pattern::compile("TARGET_002", {.kind = PatternKind::Fixed});
+    auto m_small = s_small.find(p);
+    assert(m_small.size() == 1);
+    assert(m_small[0].start == 50000);
+
+    // High budget ratio and planned qgrams
+    IndexOptions opt_dense;
+    opt_dense.chunk_bytes = 16384;
+    opt_dense.chunk_overlap = 256;
+    opt_dense.positional_block_bytes = 64;
+    opt_dense.planned_qgrams = 16;
+    opt_dense.positional_budget_ratio = 0.9;
+    auto idx_dense = Index::from_documents({{"extreme2.txt", text}}, opt_dense);
+    Searcher s_dense(idx_dense);
+    auto m_dense = s_dense.find(p);
+    assert(m_dense.size() == 1);
+    assert(m_dense[0].start == 50000);
+  }
+
+  // Advanced test suite 6: SearchStats invariants.
+  {
+    auto idx = Index::from_documents({
+      {"f1.txt", "some common words without keyword\n"},
+      {"f2.txt", "this file has SPECIAL_STAT_KEYWORD inside\n"},
+      {"f3.txt", "another common file with nothing special\n"}
+    });
+    Searcher s(idx);
+    SearchStats stats{};
+    auto p = Pattern::compile("SPECIAL_STAT_KEYWORD", {.kind = PatternKind::Fixed});
+    auto m = s.find(p, {}, &stats);
+    assert(m.size() == 1);
+    assert(stats.matches == 1);
+    assert(stats.candidate_chunks >= 1);
+    assert(stats.verified_bytes > 0);
+  }
+
+  std::cout << "All pergrep tests passed cleanly.\n";
+  return 0;
 }
