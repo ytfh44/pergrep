@@ -44,6 +44,7 @@
 ### QO-5 — Corpus & Freshness Optimizer (orthogonal to persistent index)
 - **Scope**: `src/index.cpp` (`Index::save`/`load`/`fresh`), `src/cli.cpp` (cache path & rebuild policy)
 - **Deliverable**: True **on-disk index** prototype: decouple filter structures from corpus (`I->loaded` need not be fully re-read), incremental `fresh()` via `mtime`/`size` and `mmap` path; first clarify current scope ("filter persistence, corpus re-read") in `bench` and docs, then evolve
+- **Status (shipped)**: `IndexOptions::persist_corpus` (default `false` for backward compat) added as first step toward on-disk corpus. `false` = v5 filter-only persistence with `O(corpus)` re-read on `load` (current `std::ifstream` per file). `true` = v6 filter+corpus persistence (`loaded` sizes+data via `puts`/`gets` after `pos` vector) so `load` restores `content()`/`search` without filesystem. `fresh()` is `O(files)` using `error_code` overloads + `lexically_relative` (no `weakly_canonical` per file), with `skip_permission_denied`.
 - **Metrics**: `fresh()` traversal time, `load` peak memory
 - **Branch**: `autoresearch/qo-5-corpus`
 
