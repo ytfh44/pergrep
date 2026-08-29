@@ -1012,7 +1012,61 @@ int main(int argc, char** argv) {
 
         if (a.stats && !a.files_with && !a.files_without && !a.count && !a.count_matches && !a.files_mode) {
             auto dt=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-            std::uint64_t fsrch=0,fmatch=0,mlines=0,mcnt=0,bsearch=0,bprinted=0;for(std::size_t fid=0;fid<allowed.size();++fid)if(allowed[fid]){++fsrch;bsearch+=idx->files()[fid].size;if(!byfile[fid].empty()){++fmatch;mcnt+=byfile[fid].size();auto ls=split_lines(idx->content(fid),a.null_data?'\0':'\n');std::unordered_set<std::size_t>x;for(auto&m:byfile[fid]){auto li=line_for_offset(ls,m.start);if(x.insert(li).second){bprinted+=(ls[li].term_end-ls[li].begin);}}mlines+=x.size();}}
+            // BF-3 audit: stats must reflect the final selected lines after invert
+            // (OR-then-invert) and per-file max-count truncation, not the raw
+            // positive union in byfile. Ripgrep's --stats counts one "match"
+            // per selected line in invert mode, and per underlying Match in
+            // non-invert mode (filtered to selected lines, thus respecting
+            // --max-count). bytes_printed / matched_lines are always derived
+            // from selected lines; files_contained is selected_count!=0.
+            // CLI forces core_opt.invert_match=false and merges patterns with
+            // OR, then applies `selected = !matched` once — this is correct
+            // rg parity (NOT (A OR B)). Doubling inversion (library invert +
+            // CLI invert) is prevented. --max-count is per-file, matching rg;
+            // library SearchOptions::max_matches is global per find() call and
+            // is disabled here (core_opt.max_matches=0) so CLI enforces the
+            // per-file semantics explicitly.
+            std::uint64_t fsrch=0,fmatch=0,mlines=0,mcnt=0,bsearch=0,bprinted=0;
+            for (std::size_t fid=0; fid<allowed.size(); ++fid) if(allowed[fid]) {
+                ++fsrch; bsearch+=idx->files()[fid].size;
+                std::string data(idx->content(fid));
+                auto ls=split_lines(data, a.null_data?'\0':'\n');
+                auto& ms = byfile[fid];
+                auto line_matches = matches_by_line(ls, ms);
+                std::vector<std::uint8_t> selected(ls.size(), 0);
+                for (std::size_t i=0;i<ls.size();++i) {
+                    bool matched = !line_matches[i].empty();
+                    selected[i] = static_cast<std::uint8_t>(a.sopt.invert_match ? !matched : matched);
+                }
+                if (a.stop_on_nonmatch) {
+                    bool seen=false;
+                    for (std::size_t i=0;i<selected.size();++i) {
+                        if (selected[i]) { seen=true; continue; }
+                        if (seen) { std::fill(selected.begin()+static_cast<std::ptrdiff_t>(i), selected.end(), 0); break; }
+                    }
+                }
+                if (a.max_count_set) {
+                    std::uint64_t seen=0;
+                    for (auto& bit: selected) if(bit){ if(seen>=a.max_count) bit=0; else ++seen; }
+                }
+                std::uint64_t selected_count = std::count(selected.begin(), selected.end(), std::uint8_t{1});
+                if (selected_count==0) continue;
+                ++fmatch;
+                mlines += selected_count;
+                if (a.sopt.invert_match) {
+                    mcnt += selected_count;
+                    for (std::size_t i=0;i<ls.size();++i) if(selected[i]) bprinted += (ls[i].term_end - ls[i].begin);
+                } else {
+                    // Count only matches whose line survived max-count / stop-on-nonmatch filtering
+                    std::uint64_t file_matches=0;
+                    for (auto& m: ms) {
+                        auto li=line_for_offset(ls, m.start);
+                        if (li < selected.size() && selected[li]) ++file_matches;
+                    }
+                    mcnt += file_matches;
+                    for (std::size_t i=0;i<ls.size();++i) if(selected[i]) bprinted += (ls[i].term_end - ls[i].begin);
+                }
+            }
             std::cout << mcnt << " matches\n" << mlines << " matched lines\n" << fmatch << " files contained matches\n" << fsrch << " files searched\n" << bprinted << " bytes printed\n" << bsearch << " bytes searched\n" << std::fixed << std::setprecision(6) << dt << " seconds spent searching\n";
         }
         return any ? 0 : 1;
