@@ -273,6 +273,21 @@ std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_vie
     return h;
 }
 
+// Positional filter compiler — query-aware block Bloom.
+// Compiles a fixed literal query into positional constraints: chunk -> block Bloom row selection.
+// Safety invariants (zero false negatives):
+// - Positional blocks are ONLY used for case-sensitive fixed literals without word/line flags.
+//   Word/line boundaries are record-based (e.g., \\b, ^, $) and block boundaries do not align
+//   with record boundaries. Using block Bloom for word/line would be unsafe because a literal
+//   could be present in a block but fail the word/line check due to context outside the block,
+//   or vice versa. Therefore word/line/icase queries fall back to chunk-level candidate pruning
+//   (see `else if (icase||word||line)` branch in Searcher::find) which is conservative.
+// - Safe cross-chunk fallback: when literal length exceeds chunk_overlap, a match may straddle
+//   two chunks and would be missed by chunk-level pruning. The code detects `q.size() > chunk_overlap`
+//   and falls back to whole-file rare-byte scan over the union of candidate files (conservative
+//   files union). This guarantees no false negatives for long literals crossing 32 KiB boundaries.
+// - Block Bloom is conservative: each block's Bloom may have false positives but never false
+//   negatives; intersection of q-gram rows can only over-approximate candidate blocks.
 std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(const detail::IndexData& I, std::string_view q, SearchStats* st) {
     std::vector<std::pair<uint32_t, uint32_t>> out;
     auto cv = chunk_candidates(I, q);
@@ -399,6 +414,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         auto q = std::string_view(p.impl_->expr);
         bool icase = (p.impl_->opt.case_mode == CaseMode::Insensitive);
 
+        // Safe cross-chunk fallback: literals longer than chunk_overlap may straddle two chunks.
+        // Chunk-level pruning would miss such matches (no single chunk contains the full literal).
+        // We therefore fall back to whole-file scanning over the union of candidate files
+        // (conservative files union from chunk_candidates). The rare-byte anchor scan over the
+        // entire file guarantees no false negatives, even when the literal crosses the 32 KiB boundary.
         if (q.size() > I.opt.chunk_overlap) {
             auto cv = chunk_candidates(I, q);
             if (stats) stats->candidate_chunks += cv.size();
@@ -446,6 +466,16 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                 }
             }
+        // Positional blocks are NOT used for word/line/icase queries due to boundary unsafety.
+        // - icase: positional Bloom is case-sensitive (hash4 over raw bytes). Case-insensitive
+        //   matching requires case folding, which the Bloom does not encode. Using it would miss
+        //   matches with different casing (false negatives), so we fall back to chunk-level.
+        // - word/line: word boundaries (\\b, \\w) and line anchors (^, $) depend on context outside
+        //   the block (adjacent characters, record separators). A block Bloom only knows that the
+        //   literal's q-grams appear inside the block, not whether the surrounding characters satisfy
+        //   the word/line predicate. Block boundaries do not align with record boundaries, so
+        //   pruning at block granularity would be unsafe. Chunk-level pruning is conservative and
+        //   defers word/line checks to exact verification.
         } else if (icase || p.impl_->opt.word || p.impl_->opt.line) {
             auto cv = chunk_candidates(I, icase ? std::string_view{} : q);
             if (stats) stats->candidate_chunks += cv.size();
@@ -501,6 +531,13 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     }
                 }
             }
+        // Positional block filtering for short case-sensitive fixed literals.
+        // For q.size() <= 64 we use the positional Bloom to prune at block granularity:
+        // - planned_hashes selects the rarest q-grams of the query (adaptive k) to minimize false positives.
+        // - fixed_candidate_blocks intersects the corresponding Bloom rows per chunk, producing a small
+        //   set of (chunk, block) candidates. Each candidate is verified with an exact rare-byte scan
+        //   limited to the block's core range (+64 lookahead for q-gram overlap). This is conservative
+        //   (no false negatives) and typically reduces verified bytes by orders of magnitude for rare literals.
         } else if (q.size() <= 64) {
             auto blocks = fixed_candidate_blocks(I, q, stats);
             size_t a = choose_rare_byte(I, q);
@@ -534,6 +571,12 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                 }
             }
+        // Chunk-level fallback for longer literals (64 < q.size() <= chunk_overlap).
+        // For longer queries the number of distinct q-grams grows and the positional Bloom's
+        // selectivity diminishes (more rows to intersect, higher false-positive cost). The
+        // chunk-level q-gram index (Groups) already provides strong pruning for long literals,
+        // and verifying at chunk granularity avoids the per-block Bloom overhead. This path
+        // remains conservative (chunk candidate set is a superset of true matches).
         } else {
             auto cv = chunk_candidates(I, q);
             if (stats) stats->candidate_chunks += cv.size();

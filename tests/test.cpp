@@ -808,122 +808,71 @@ int main(){
   }
   std::cerr << "M23 QO-2 done\n" << std::flush;
 
-  // BF-2 resource bounds
+  // QO-3 positional — compile positional filter with safe fallback
   {
-    // 1. Lookbehind window capped to 8192 — very long prefix must not crash.
+    // 1. Positional pruning: rare literal in large corpus should prune candidate_blocks << total blocks.
     {
-      PatternOptions o; o.engine = Engine::Pcre2Compat;
-      auto p = Pattern::compile(R"((?<=a+)b)", o);
-      std::string hay(20000, 'a'); hay.push_back('b'); hay.push_back('\n');
-      auto idx = corpus(hay);
-      Searcher s(idx);
-      bool threw = false;
-      try {
-        auto m = s.find(p);
-        (void)m;
-      } catch (const std::runtime_error& e) {
-        std::string msg = e.what();
-        threw = true;
-        assert(msg.find("pergrep") != std::string::npos || msg.find("lookbehind") != std::string::npos || msg.find("state") != std::string::npos || msg.find("recursion") != std::string::npos);
-      }
-      (void)threw;
+      const size_t block_size = 256;
+      const size_t total_blocks = 200;
+      const size_t total_bytes = total_blocks * block_size;
+      std::string s(total_bytes, 'a');
+      for (size_t i = 80; i < s.size(); i += 80) s[i] = '\n';
+      std::string rare = "RARE_POS_135_XYZ_QUICK_NEEDLE_2025";
+      size_t pos = 135 * block_size + 10;
+      s.replace(pos, rare.size(), rare);
+      IndexOptions opt;
+      opt.positional_block_bytes = static_cast<uint32_t>(block_size);
+      // default chunk_bytes 32 KiB => 51200 bytes => 2 chunks, ~200 blocks total
+      auto idx = Index::from_documents({{"large_pos.txt", s}}, opt);
+      Searcher searcher(idx);
+      SearchStats stats{};
+      auto p = Pattern::compile(rare, {.kind = PatternKind::Fixed});
+      auto m = searcher.find(p, {}, &stats);
+      assert(m.size() == 1);
+      assert(m[0].start == pos);
+      // candidate_blocks should be much smaller than total blocks (pruning effective)
+      assert(stats.candidate_blocks < 50);
+      assert(stats.candidate_blocks < total_blocks);
+      assert(stats.candidate_blocks >= 1);
+      assert(stats.candidate_chunks >= 1);
+    }
+    // 2. Cross-chunk fallback still finds match when literal straddles 32 KiB boundary (word mode off).
+    {
+      std::string s(70000, '.');
+      for (size_t i = 80; i < s.size(); i += 80) s[i] = '\n';
+      std::string long_lit = "BOUNDARY_START_" + std::string(140, 'Z') + "_BOUNDARY_END";
+      assert(long_lit.size() >= 130);
+      size_t cross_pos = 32768 - 70;
+      s.replace(cross_pos, long_lit.size(), long_lit);
+      auto idx = Index::from_documents({{"cross2.txt", s}});
+      Searcher searcher(idx);
+      auto p = Pattern::compile(long_lit, {.kind = PatternKind::Fixed});
+      SearchStats stats{};
+      auto m = searcher.find(p, {}, &stats);
+      assert(m.size() == 1);
+      assert(m[0].start == cross_pos);
+      // Also verify word mode crossing still finds when using chunk-level (positional disabled).
       {
-        std::string hay2(100, 'a'); hay2.push_back('b'); hay2.push_back('\n');
-        auto idx2 = corpus(hay2);
-        Searcher s2(idx2);
-        auto m2 = s2.find(p);
-        assert(m2.size() == 1);
+        std::string s2(70000, '.');
+        for (size_t i = 80; i < s2.size(); i += 80) s2[i] = '\n';
+        std::string word_lit = "WORD_BOUNDARY_TEST_ABC";
+        size_t wpos = 32768 - 10;
+        s2.replace(wpos, word_lit.size() + 2, " " + word_lit + " ");
+        wpos = wpos + 1;
+        auto idx2 = Index::from_documents({{"cross_word.txt", s2}});
+        Searcher searcher2(idx2);
+        PatternOptions opt; opt.kind = PatternKind::Fixed; opt.word = true;
+        auto pw = Pattern::compile(word_lit, opt);
+        SearchStats st2{};
+        auto mw = searcher2.find(pw, {}, &st2);
+        assert(mw.size() == 1);
+        assert(mw[0].start == wpos);
+        // For word mode, positional blocks must be disabled, so candidate_blocks == 0
+        // and candidate_chunks >=1 (chunk-level pruning).
+        assert(st2.candidate_blocks == 0);
+        assert(st2.candidate_chunks >= 1);
       }
     }
-    std::cerr << "BF2-1 done\n" << std::flush;
-    // 2. Repeat {1,100000} is capped to 10000 — should not OOM and match length <=10000.
-    {
-      PatternOptions o; o.engine = Engine::Pcre2Compat;
-      bool compiled = false;
-      try {
-        auto p = Pattern::compile("a{1,100000}", o);
-        compiled = true;
-        std::string hay(20000, 'a'); hay.push_back('\n');
-        auto idx = corpus(hay);
-        Searcher s(idx);
-        auto m = s.find(p);
-        assert(!m.empty());
-        assert(m[0].end - m[0].start <= 10000);
-        assert(m[0].end - m[0].start >= 1);
-      } catch (const std::runtime_error& e) {
-        std::string msg = e.what();
-        assert(msg.find("pergrep") != std::string::npos);
-        (void)msg;
-      }
-      try {
-        auto p2 = Pattern::compile("a{1,100000}");
-        std::string hay(20000, 'a'); hay.push_back('\n');
-        auto idx2 = corpus(hay);
-        Searcher s2(idx2);
-        auto m2 = s2.find(p2);
-        (void)m2;
-      } catch (const std::runtime_error& e) {
-        std::string msg = e.what();
-        assert(msg.find("pergrep") != std::string::npos);
-      }
-      (void)compiled;
-    }
-    std::cerr << "BF2-2 done\n" << std::flush;
-    // 3. Recursion depth >10000 must throw cleanly (direct depth guard test).
-    {
-      bool threw = false;
-      try {
-        pergrep::detail::test_eval_depth_guard(10001);
-        assert(false && "expected recursion depth exceeded");
-      } catch (const std::runtime_error& e) {
-        std::string msg = e.what();
-        threw = true;
-        assert(msg.find("recursion") != std::string::npos || msg.find("pergrep") != std::string::npos);
-      }
-      assert(threw);
-      try {
-        pergrep::detail::test_eval_depth_guard(10000);
-      } catch (...) {
-        assert(false && "depth 10000 should not throw");
-      }
-      pergrep::detail::test_eval_depth_guard(0);
-      {
-        PatternOptions o; o.engine = Engine::Pcre2Compat;
-        const int depth2 = 500;
-        std::string pat;
-        pat.reserve(depth2 * 2 + 1);
-        for (int i = 0; i < depth2; ++i) pat.push_back('(');
-        pat.push_back('a');
-        for (int i = 0; i < depth2; ++i) pat.push_back(')');
-        auto p = Pattern::compile(pat, o);
-        std::string hay = "a\n";
-        auto idx = corpus(hay);
-        Searcher s(idx);
-        auto m = s.find(p);
-        assert(m.size() == 1);
-      }
-    }
-    std::cerr << "BF2-3 done\n" << std::flush;
-    // 4. Existing bounded repetition and catastrophic patterns still behave correctly.
-    {
-      auto p = Pattern::compile("a{2,4}");
-      auto idx = corpus("aaaaa\n");
-      Searcher s(idx);
-      auto m = s.find(p);
-      assert(!m.empty() && m.back().end - m.back().start == 4);
-      std::string hay(20000, 'a'); hay.push_back('\n');
-      auto idx2 = corpus(hay);
-      Searcher s2(idx2);
-      auto p2 = Pattern::compile("(a|aa)*b");
-      auto m2 = s2.find(p2);
-      assert(m2.empty());
-      std::string hit(2000, 'a'); hit += "b\n";
-      auto idx3 = corpus(hit);
-      Searcher s3(idx3);
-      auto hm = s3.find(p2);
-      assert(hm.size() == 1 && hm[0].end - hm[0].start == 2001);
-    }
-    std::cerr << "BF2-4 done\n" << std::flush;
   }
 
   // BF-2 resource bounds

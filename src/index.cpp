@@ -130,6 +130,20 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         }
     }
 
+    // Positional Bloom construction — per-chunk block-level q-gram filter.
+    // For each chunk we build a Bloom matrix `pos` of size `m * mask_bytes` bytes:
+    // - `blocks = ceil(core_len / pos_block)` — number of positional blocks in the chunk.
+    //   When core_len is not divisible by pos_block, the last block is smaller but still
+    //   represented; mask_bytes = ceil(blocks/8) ensures one bit per block, with trailing
+    //   bits in the last byte masked off (see fixed_candidate_blocks).
+    // - `mask_bytes = (blocks+7)/8` — bytes needed for one Bloom row's block mask.
+    // - `choose_m(core_len, mask_bytes)` — selects number of Bloom rows `m` (power of two
+    //   in [64,1024]) based on budget = core_len * positional_budget_ratio. `want` is the
+    //   desired total bytes per row budget, and `m` is capped to keep `m * mask_bytes`
+    //   within budget while keeping per-chunk overhead bounded. Larger `m` reduces collisions
+    //   but increases memory; 64 is minimum for reasonable selectivity.
+    // - `PO = 64` — positional overlap: each block's Bloom window extends 64 bytes beyond
+    //   the block boundary to capture q-grams that straddle block edges (conservative).
     const uint32_t PO = 64;
     I->pos_desc.resize(I->chunks.size());
     size_t pos_total = 0;
@@ -234,6 +248,8 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
         }
     }
 
+    // Positional Bloom — same construction as in Index::build (see comment above).
+    // Blocks = ceil(core_len / pos_block), mask_bytes = ceil(blocks/8), choose_m as above.
     const uint32_t PO = 64;
     I->pos_desc.resize(I->chunks.size());
     size_t pos_total = 0;
