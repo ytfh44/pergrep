@@ -385,6 +385,14 @@ inline bool is_reparse_point(const std::filesystem::path& p) {
     return ::lstat(p.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
 }
 
+inline size_t utf8_char_len(unsigned char c) noexcept {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
 inline bool fnmatch(const std::string& pat, const std::string& text) {
     return ::fnmatch(pat.c_str(), text.c_str(), FNM_PATHNAME) == 0;
 }

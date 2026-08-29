@@ -1,6 +1,7 @@
 {
   "name": "pergrep",
   "version-string": "0.1.0",
+  "builtin-baseline": "7ed6d1a07ef0d35aac5960fd67ed6686c7802bc7",
   "dependencies": [
     "icu",
     "libarchive"

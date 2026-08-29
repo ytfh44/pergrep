@@ -745,14 +745,16 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
                 for(std::size_t p=lo;p<=s.pos;){
                     State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
                     for(auto&z:v)if(z.pos==s.pos){ok=true;break;}
-                    if(ok||p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
+                    if(ok||p==s.pos) break;
+                    auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
                 }
                 if(!ok)out.push_back(s);
             } else {
                 for(std::size_t p=lo;p<=s.pos;){
                     State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
                     for(auto&z:v)if(z.pos==s.pos){State r=z;r.pos=s.pos;out.push_back(std::move(r));}
-                    if(p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
+                    if(p==s.pos) break;
+                    auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
                 }
             }
             break;
