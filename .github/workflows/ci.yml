@@ -32,10 +32,11 @@ jobs:
   windows-msvc:
     name: Windows MSVC (windows-vcpkg)
     runs-on: windows-latest
-    env:
-      VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set VCPKG_ROOT from VCPKG_INSTALLATION_ROOT
+        shell: pwsh
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Configure
         run: cmake --preset windows-vcpkg
@@ -49,6 +50,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set VCPKG_ROOT from VCPKG_INSTALLATION_ROOT
+        shell: pwsh
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Setup LLVM
         uses: KyleMayes/install-llvm-action@v2
@@ -56,8 +60,6 @@ jobs:
           version: "18"
           directory: ${{ runner.temp }}/llvm
       - name: Configure
-        env:
-          VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
         run: cmake --preset windows-clang
       - name: Build
         run: cmake --build --preset windows-clang -j
