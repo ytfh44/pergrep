@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 PG=${1:?pergrep path}
 # Every ripgrep 15.2.0 logical long flag (plus documented negations/legacy aliases)
 # must be accepted by the parser. --help makes this a side-effect-free parse test.

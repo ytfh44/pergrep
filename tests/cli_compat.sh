@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 PG="$1"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 eq(){ [[ "$1" == "$2" ]] || fail "$3: expected <$2>, got <$1>"; }

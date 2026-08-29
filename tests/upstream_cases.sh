@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 PG=${1:?pergrep path}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
