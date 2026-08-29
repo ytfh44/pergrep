@@ -99,6 +99,10 @@ struct RegexProgram {
     std::vector<std::string> group_names;
     bool extended = false;
     std::vector<std::string> mandatory;
+    std::vector<std::string> prefixes;
+    std::vector<std::vector<std::string>> branch_mandatory;
+    bool is_pure_literal = false;
+    std::string exact_literal;
     std::vector<NfaInst> nfa;
     std::int32_t nfa_start = -1;
 };

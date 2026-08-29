@@ -466,15 +466,36 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
         }
     } else {
-        // Regex: use the longest conservative mandatory literal for chunk pruning. Positional block pruning is only used when the whole regex is literal-equivalent; otherwise arbitrary prefix/suffix width makes block pruning unsafe.
-        std::string lit;
-        if (p.impl_->opt.case_mode != CaseMode::Insensitive) {
-            for (auto& m : p.impl_->re.mandatory) {
-                if (m.size() > lit.size()) lit = m;
-            }
+        if (p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended &&
+            (p.impl_->opt.multiline || p.impl_->re.exact_literal.find(static_cast<char>(opt.record_separator)) == std::string::npos)) {
+            PatternOptions fopt = p.impl_->opt;
+            fopt.kind = PatternKind::Fixed;
+            auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+            return find(fixed_pat, opt, stats);
         }
-        auto cv = chunk_candidates(I, lit);
-        if (stats) stats->candidate_chunks += cv.size();
+        std::string lit;
+        std::vector<uint32_t> cv;
+        if (p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.branch_mandatory.empty()) {
+            for (const auto& branch : p.impl_->re.branch_mandatory) {
+                std::string best_lit;
+                for (const auto& m : branch) {
+                    if (m.size() > best_lit.size()) best_lit = m;
+                }
+                if (!best_lit.empty()) {
+                    auto bcv = chunk_candidates(I, best_lit);
+                    cv.insert(cv.end(), bcv.begin(), bcv.end());
+                }
+            }
+            std::sort(cv.begin(), cv.end());
+            cv.erase(std::unique(cv.begin(), cv.end()), cv.end());
+        } else {
+            if (p.impl_->opt.case_mode != CaseMode::Insensitive) {
+                for (auto& m : p.impl_->re.mandatory) {
+                    if (m.size() > lit.size()) lit = m;
+                }
+            }
+            cv = chunk_candidates(I, lit);
+        }
         std::vector<uint32_t> files;
         for (auto ci : cv) {
             if (files.empty() || files.back() != I.chunks[ci].file_id) {
