@@ -102,7 +102,20 @@ TypeMap effective_type_map(const Args& a) {
 }
 
 
-bool globmatch(std::string pat,std::string path,bool ci){if(ci){std::transform(pat.begin(),pat.end(),pat.begin(),::tolower);std::transform(path.begin(),path.end(),path.begin(),::tolower);}return pergrep_cli::platform::fnmatch(pat,path)||pergrep_cli::platform::fnmatch(pat,to_path(path).filename().string());}
+bool globmatch(std::string pat,std::string path,bool ci){
+    if(ci){
+        auto fold_ascii_lower = [](std::string s){
+            for(char &c : s){
+                unsigned char uc = static_cast<unsigned char>(c);
+                if(uc >= 'A' && uc <= 'Z') c = static_cast<char>(uc + ('a' - 'A'));
+            }
+            return s;
+        };
+        pat = fold_ascii_lower(pat);
+        path = fold_ascii_lower(path);
+    }
+    return pergrep_cli::platform::fnmatch(pat,path)||pergrep_cli::platform::fnmatch(pat,to_path(path).filename().string());
+}
 
 std::string need(int&k,int argc,char**argv,std::string_view opt,std::optional<std::string>attached={}){if(attached)return*attached;if(++k>=argc)die("option requires a value: "+std::string(opt));return argv[k];}
 void parse_long(Args&a,std::string arg,int&k,int argc,char**argv){auto eq=arg.find('=');std::string name=arg.substr(2,eq==std::string::npos?std::string::npos:eq-2);std::optional<std::string>val;if(eq!=std::string::npos)val=arg.substr(eq+1);auto v=[&](){return need(k,argc,argv,"--"+name,val);};

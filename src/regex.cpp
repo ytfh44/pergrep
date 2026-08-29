@@ -38,10 +38,18 @@ bool ascii_word(unsigned char c) { return std::isalnum(c) || c == '_'; }
 
 UnicodeProperty property_from_name(std::string name, bool negated) {
     UnicodeProperty p; p.negated = negated;
+    // Trim leading/trailing whitespace from name for key=value handling
+    auto trim = [](std::string s){
+        size_t a = s.find_first_not_of(" \t\r\n");
+        size_t b = s.find_last_not_of(" \t\r\n");
+        if(a==std::string::npos) return std::string{};
+        return s.substr(a, b-a+1);
+    };
+    name = trim(name);
     auto eq_pos = name.find_first_of("=:");
     if (eq_pos != std::string::npos) {
-        std::string raw_key = name.substr(0, eq_pos);
-        std::string raw_val = name.substr(eq_pos + 1);
+        std::string raw_key = trim(name.substr(0, eq_pos));
+        std::string raw_val = trim(name.substr(eq_pos + 1));
         std::string k_norm, v_norm;
         for (char c : raw_key) if (c != '_' && c != '-' && c != ' ') k_norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         for (char c : raw_val) if (c != '_' && c != '-' && c != ' ') v_norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
