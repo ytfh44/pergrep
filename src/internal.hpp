@@ -155,6 +155,8 @@ struct RegexProgram {
 RegexProgram parse_regex(std::string_view pattern, const PatternOptions& opt);
 bool regex_search(const RegexProgram&, std::string_view, const PatternOptions&, std::size_t, Match*, std::uint32_t, unsigned char);
 std::vector<Match> regex_find_all(const RegexProgram&, std::string_view, const PatternOptions&, bool, std::uint32_t, std::uint64_t, std::uint64_t, unsigned char);
+// Test hook: directly exercises the eval recursion-depth guard without deep C++ recursion.
+void test_eval_depth_guard(int depth);
 
 struct IndexData {
     struct Group {
