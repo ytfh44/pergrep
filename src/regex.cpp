@@ -682,6 +682,12 @@ struct State { std::size_t pos=0; Caps caps; };
 bool literal_at(std::string_view text,std::size_t pos,std::string_view lit,bool icase,std::size_t* end) {
     std::size_t tp=pos,lp=0;while(lp<lit.size()){auto a=rune_at(text,tp),b=rune_at(lit,lp);if(!a.ok||!b.ok||!cp_eq(a.cp,b.cp,icase))return false;tp=a.next;lp=b.next;}if(end)*end=tp;return true;
 }
+// Extended VM (eval) resource bounds — enforced explicitly with clean throws:
+// - lookbehind window: 8192 bytes/code-units before s.pos (both positive and negative branches: lo = s.pos>8192 ? s.pos-8192 : 0)
+// - Repeat hard limit: capped to 10000 iterations (finite max -> min(max,10000); unbounded -> min(hard,10000))
+// - recursion depth: throws if depth>10000
+// - VM state limit: any Concat/Alt/Repeat intermediate expansion exceeding 50000 states throws
+//   "pergrep regex: VM state limit exceeded" instead of silent truncation
 std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,const PatternOptions&o,unsigned char sep,const State&s,int depth=0) {
     if(depth>10000) throw std::runtime_error("pergrep regex: recursion depth exceeded");
     using K=RegexNode::Kind;std::vector<State>out;bool icase=n->icase;
@@ -715,7 +721,7 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
         case K::WordStartHalf:{auto l=rune_before(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
         case K::WordEndHalf:{auto r=rune_at(t,s.pos);bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
         case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(next.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
-        case K::Alt:for(auto&c:n->children){auto v=eval(c,t,o,sep,s,depth+1);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));}break;
+        case K::Alt:{for(auto&c:n->children){auto v=eval(c,t,o,sep,s,depth+1);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(out.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}break;}
         case K::Group:{auto base=s;auto v=eval(n->children[0],t,o,sep,s,depth+1);for(auto&z:v){if(static_cast<int>(z.caps.g.size())<=n->group)z.caps.g.resize(n->group+1,{SIZE_MAX,SIZE_MAX});z.caps.g[n->group]={base.pos,z.pos};}out=std::move(v);break;}
         case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a||b>t.size())break;std::size_t e;if(literal_at(t,s.pos,t.substr(a,b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
         case K::LookAhead:{
@@ -745,6 +751,7 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
         }
         case K::Repeat:{
             std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};
+            std::size_t total = levels.size();
             std::size_t hard = t.size() - s.pos + 1;
             std::size_t limit = n->max == SIZE_MAX ? std::min<std::size_t>(hard, 10000) : std::min<std::size_t>(n->max, 10000);
             for(std::size_t k=1;k<=limit;++k){
@@ -754,10 +761,14 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
                     for(auto&z:v)if(z.pos!=st.pos)next.push_back(std::move(z));
                 }
                 if(next.empty())break;
+                if(next.size()>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
+                total += next.size();
+                if(total>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
                 all.push_back(next);levels=std::move(next);
             }
             if(n->greedy){for(std::size_t k=all.size();k-->n->min;)out.insert(out.end(),all[k].begin(),all[k].end());}
             else{for(std::size_t k=n->min;k<all.size();++k)out.insert(out.end(),all[k].begin(),all[k].end());}
+            if(out.size()>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
             break;
         }
     }
@@ -896,6 +907,16 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
 bool regex_search(const RegexProgram&p,std::string_view text,const PatternOptions&o,std::size_t from,Match*out,std::uint32_t file_id,unsigned char sep){
     if(!p.extended)return nfa_search(p,text,o,from,out,file_id,sep);
     std::size_t st=from;while(st<=text.size()){State s;s.pos=st;s.caps.g.resize(p.groups+1,{SIZE_MAX,SIZE_MAX});auto v=eval(p.ast,text,o,sep,s);if(!v.empty()){auto z=v.front();if(out){out->file_id=file_id;out->start=st;out->end=z.pos;out->captures.assign(p.groups+1,{});out->captures[0]={st,z.pos,true,""};for(int g=1;g<=p.groups;++g){if(g<static_cast<int>(z.caps.g.size())){auto[a,b]=z.caps.g[g];if(a!=SIZE_MAX)out->captures[g]={a,b,true,g<static_cast<int>(p.group_names.size())?p.group_names[g]:std::string{}};}}}return true;}if(st==text.size())break;auto r=rune_at(text,st);st=r.ok?r.next:st+1;}return false;
+}
+void test_eval_depth_guard(int depth){
+    // Build a minimal AST (literal) and call eval with the given depth to verify the guard.
+    auto n = std::make_shared<RegexNode>(); n->kind = RegexNode::Kind::Literal; n->literal = "a";
+    State s; s.pos = 0;
+    // Create a dummy text view; eval will immediately check depth before doing work.
+    std::string_view t = "a";
+    PatternOptions o;
+    unsigned char sep = '\n';
+    (void)eval(n, t, o, sep, s, depth);
 }
 std::vector<Match> regex_find_all(const RegexProgram&p,std::string_view text,const PatternOptions&o,bool overlapping,std::uint32_t file_id,std::uint64_t base,std::uint64_t max_matches,unsigned char sep){
     std::vector<Match>out;std::size_t pos=0;while(pos<=text.size()){Match m;if(!regex_search(p,text,o,pos,&m,file_id,sep))break;std::size_t ls=m.start,le=m.end;m.start+=base;m.end+=base;for(auto&c:m.captures)if(c.matched){c.start+=base;c.end+=base;}out.push_back(std::move(m));if(max_matches&&out.size()>=max_matches)break;if(overlapping){auto r=rune_at(text,ls);pos=r.ok?r.next:ls+1;}else if(le>ls)pos=le;else{auto r=rune_at(text,ls);pos=r.ok?r.next:ls+1;}}return out;

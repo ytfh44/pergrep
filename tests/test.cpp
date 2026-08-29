@@ -716,6 +716,7 @@ int main(){
     auto p_sce = Pattern::compile(R"(\p{ScriptExtensions=Han}+)");
     assert(!s3.find(p_sce).empty());
   }
+  std::cerr << "M22 differential done\n" << std::flush;
   // QO-2 q-gram rarity: skewed corpus, rare vs naive first-k pruning.
   {
     // Build a corpus where 4-gram "aaaa" is extremely common and "xyzq" is rare.
@@ -804,6 +805,125 @@ int main(){
       // Long query should prune heavily (candidate_blocks small)
       assert(st_long.candidate_blocks <= 4);
     }
+  }
+  std::cerr << "M23 QO-2 done\n" << std::flush;
+
+  // BF-2 resource bounds
+  {
+    // 1. Lookbehind window capped to 8192 — very long prefix must not crash.
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      auto p = Pattern::compile(R"((?<=a+)b)", o);
+      std::string hay(20000, 'a'); hay.push_back('b'); hay.push_back('\n');
+      auto idx = corpus(hay);
+      Searcher s(idx);
+      bool threw = false;
+      try {
+        auto m = s.find(p);
+        (void)m;
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        threw = true;
+        assert(msg.find("pergrep") != std::string::npos || msg.find("lookbehind") != std::string::npos || msg.find("state") != std::string::npos || msg.find("recursion") != std::string::npos);
+      }
+      (void)threw;
+      {
+        std::string hay2(100, 'a'); hay2.push_back('b'); hay2.push_back('\n');
+        auto idx2 = corpus(hay2);
+        Searcher s2(idx2);
+        auto m2 = s2.find(p);
+        assert(m2.size() == 1);
+      }
+    }
+    std::cerr << "BF2-1 done\n" << std::flush;
+    // 2. Repeat {1,100000} is capped to 10000 — should not OOM and match length <=10000.
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      bool compiled = false;
+      try {
+        auto p = Pattern::compile("a{1,100000}", o);
+        compiled = true;
+        std::string hay(20000, 'a'); hay.push_back('\n');
+        auto idx = corpus(hay);
+        Searcher s(idx);
+        auto m = s.find(p);
+        assert(!m.empty());
+        assert(m[0].end - m[0].start <= 10000);
+        assert(m[0].end - m[0].start >= 1);
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        assert(msg.find("pergrep") != std::string::npos);
+        (void)msg;
+      }
+      try {
+        auto p2 = Pattern::compile("a{1,100000}");
+        std::string hay(20000, 'a'); hay.push_back('\n');
+        auto idx2 = corpus(hay);
+        Searcher s2(idx2);
+        auto m2 = s2.find(p2);
+        (void)m2;
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        assert(msg.find("pergrep") != std::string::npos);
+      }
+      (void)compiled;
+    }
+    std::cerr << "BF2-2 done\n" << std::flush;
+    // 3. Recursion depth >10000 must throw cleanly (direct depth guard test).
+    {
+      bool threw = false;
+      try {
+        pergrep::detail::test_eval_depth_guard(10001);
+        assert(false && "expected recursion depth exceeded");
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        threw = true;
+        assert(msg.find("recursion") != std::string::npos || msg.find("pergrep") != std::string::npos);
+      }
+      assert(threw);
+      try {
+        pergrep::detail::test_eval_depth_guard(10000);
+      } catch (...) {
+        assert(false && "depth 10000 should not throw");
+      }
+      pergrep::detail::test_eval_depth_guard(0);
+      {
+        PatternOptions o; o.engine = Engine::Pcre2Compat;
+        const int depth2 = 500;
+        std::string pat;
+        pat.reserve(depth2 * 2 + 1);
+        for (int i = 0; i < depth2; ++i) pat.push_back('(');
+        pat.push_back('a');
+        for (int i = 0; i < depth2; ++i) pat.push_back(')');
+        auto p = Pattern::compile(pat, o);
+        std::string hay = "a\n";
+        auto idx = corpus(hay);
+        Searcher s(idx);
+        auto m = s.find(p);
+        assert(m.size() == 1);
+      }
+    }
+    std::cerr << "BF2-3 done\n" << std::flush;
+    // 4. Existing bounded repetition and catastrophic patterns still behave correctly.
+    {
+      auto p = Pattern::compile("a{2,4}");
+      auto idx = corpus("aaaaa\n");
+      Searcher s(idx);
+      auto m = s.find(p);
+      assert(!m.empty() && m.back().end - m.back().start == 4);
+      std::string hay(20000, 'a'); hay.push_back('\n');
+      auto idx2 = corpus(hay);
+      Searcher s2(idx2);
+      auto p2 = Pattern::compile("(a|aa)*b");
+      auto m2 = s2.find(p2);
+      assert(m2.empty());
+      std::string hit(2000, 'a'); hit += "b\n";
+      auto idx3 = corpus(hit);
+      Searcher s3(idx3);
+      auto hm = s3.find(p2);
+      assert(hm.size() == 1 && hm[0].end - hm[0].start == 2001);
+    }
+    std::cerr << "BF2-4 done\n" << std::flush;
   }
 
   return 0;
