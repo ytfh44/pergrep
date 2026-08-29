@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace pergrep {
+namespace detail { struct IndexData; struct QueryCost; enum class VerifierKind : std::uint8_t; }
 
 enum class PatternKind { Regex, Fixed };
 enum class CaseMode { Sensitive, Insensitive, Smart };
@@ -41,6 +42,9 @@ private:
     std::shared_ptr<const Impl> impl_;
     explicit Pattern(std::shared_ptr<const Impl> impl);
     friend class Searcher;
+    friend detail::QueryCost estimateCost(const Pattern&, const detail::IndexData&);
+    friend detail::VerifierKind chooseVerifier(const Pattern&, const detail::IndexData&);
+    friend std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string>>&, const detail::IndexData&);
 };
 
 struct IndexOptions {
@@ -81,6 +85,9 @@ public:
     std::uint64_t index_bytes() const noexcept;
     bool fresh() const;
     std::string_view content(std::size_t file_id) const;
+    // QO-4 test hook: expose underlying IndexData for cost-model unit tests.
+    // Returns nullptr if index is empty. Stable for the lifetime of the Index.
+    const void* debug_index_data() const noexcept;
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
@@ -119,7 +126,27 @@ struct SearchStats {
     std::uint64_t candidate_blocks = 0;
     std::uint64_t verified_bytes = 0;
     std::uint64_t matches = 0;
+    // QO-4 cost model: which verifier was chosen for this search.
+    // Set by Searcher::find(); default is FixedRareByte for fixed literals
+    // and RegexBruteForce for regex with no pruning. Used for per-flavor
+    // logging in bench/bench.cpp and tests. Values correspond to detail::VerifierKind.
+    std::string verifier = {};
+    double estimated_selectivity = 0.0;
 };
+
+// QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
+// for public visibility (bench/tests). FixedRareByte covers both whole-file and
+// chunk-level rare-byte anchor scans; FixedPositional is the positional Bloom path.
+enum class VerifierKind : std::uint8_t { FixedRareByte = 0, FixedPositional = 1, RegexChunk = 2, RegexBruteForce = 3 };
+inline const char* to_string(VerifierKind k) noexcept {
+    switch (k) {
+        case VerifierKind::FixedRareByte: return "FixedRareByte";
+        case VerifierKind::FixedPositional: return "FixedPositional";
+        case VerifierKind::RegexChunk: return "RegexChunk";
+        case VerifierKind::RegexBruteForce: return "RegexBruteForce";
+    }
+    return "Unknown";
+}
 
 class Searcher {
 public:
