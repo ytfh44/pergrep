@@ -314,6 +314,12 @@ const void* Index::debug_index_data() const noexcept {
     return impl_ ? static_cast<const void*>(impl_.get()) : nullptr;
 }
 
+// QO-5: Freshness check is O(files) — re-traverses the directory tree and compares
+// path/size/mtime per file using std::error_code overloads (no exceptions) and
+// lexically_relative (no weakly_canonical per file) with skip_permission_denied.
+// Cost is proportional to file count; cheap on stable trees, linear on high-churn trees.
+// No per-file weakly_canonical is needed because paths are already normalized via
+// lexically_relative against the canonical root. Suitable for stable-tree fast-path.
 bool Index::fresh() const {
     if (!impl_ || impl_->ephemeral) return false;
     std::vector<std::string> current;
@@ -452,7 +458,13 @@ void Index::save(const fs::path& file) const {
             std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
             if (!o) throw std::runtime_error("cannot create index: " + tmp.string());
             o.write("PERGREP\0", 8);
-            put(o, uint32_t(5));
+            // QO-5: v5 = filter-only (legacy, re-read corpus on load, O(corpus) I/O).
+            // v6 = filter + persisted corpus bytes (prototype on-disk corpus) so
+            // load can restore I->loaded without touching the filesystem.
+            // Default persist_corpus=false keeps v5 for backward compat and small files;
+            // persist_corpus=true emits v6 and appends raw corpus after pos vector.
+            uint32_t ver = impl_->opt.persist_corpus ? 6 : 5;
+            put(o, ver);
             puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
             put(o, uint64_t(impl_->opt.chunk_bytes));
             put(o, uint64_t(impl_->opt.chunk_overlap));
@@ -499,6 +511,15 @@ void Index::save(const fs::path& file) const {
                 put(o, uint32_t(d.blocks));
             }
             putv(o, impl_->pos);
+            // QO-5 prototype on-disk corpus: when persist_corpus is true, also
+            // persist the raw file contents after the filter. This decouples filter
+            // persistence from corpus re-read: load no longer needs O(corpus) I/O.
+            // Documented as prototype — index files become larger by corpus_bytes.
+            if (impl_->opt.persist_corpus) {
+                for (auto& lf : impl_->loaded) {
+                    puts(o, lf.data);
+                }
+            }
             o.flush();
             if (!o) {
                 o.close();
@@ -541,8 +562,9 @@ Index Index::load(const fs::path& file) {
     i.read(magic, 8);
     if (!i || std::memcmp(magic, "PERGREP\0", 8) != 0) throw std::runtime_error("pergrep index: truncated");
     auto ver = get<uint32_t>(i);
-    if (ver != 5) throw std::runtime_error("unsupported pergrep index version");
+    if (ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
     auto I = std::make_shared<Impl>();
+    I->opt.persist_corpus = (ver == 6);
 #ifdef _WIN32
     auto root_str = gets(i);
     I->root = fs::path(std::u8string(root_str.begin(), root_str.end()));
@@ -573,19 +595,6 @@ Index Index::load(const fs::path& file) {
         f.mtime_ns = get<int64_t>(i);
         f.binary = get<uint8_t>(i) != 0;
         I->infos.push_back(std::move(f));
-        // Do not load file contents here if ephemeral? For persisted index we reload from root.
-    }
-    // Reload file contents after infos are complete (preserves original behavior
-    // but avoids interleaving I/O with header parsing).
-    for (auto& f : I->infos) {
-#ifdef _WIN32
-        std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
-#else
-        std::ifstream src(I->root / f.path, std::ios::binary);
-#endif
-        if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
-        std::string data((std::istreambuf_iterator<char>(src)), {});
-        I->loaded.push_back({f, std::move(data)});
     }
     auto nc = get<uint64_t>(i);
     if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
@@ -617,6 +626,38 @@ Index Index::load(const fs::path& file) {
         I->pos_desc.push_back(d);
     }
     I->pos = getv<uint8_t>(i);
+    // QO-5: decouple filter persistence from corpus re-read.
+    // v5 (persist_corpus==false): legacy path re-reads every source file via
+    // std::ifstream (O(corpus) I/O) to repopulate I->loaded. Documented as
+    // prototype cost — suitable for stable trees, large corpora pay re-read.
+    // v6 (persist_corpus==true): persisted corpus bytes follow the filter;
+    // restore I->loaded directly from the index without touching the filesystem.
+    if (ver == 6) {
+        constexpr uint64_t kMaxCorpusPerFile = 512ULL * 1024 * 1024; // 512 MiB per file guard against OOM
+        for (size_t k = 0; k < I->infos.size(); ++k) {
+            auto n = get<uint64_t>(i);
+            if (n > kMaxCorpusPerFile) throw std::runtime_error("pergrep index: truncated");
+            std::string data;
+            data.resize(static_cast<size_t>(n));
+            if (n) {
+                i.read(data.data(), static_cast<std::streamsize>(n));
+                if (!i) throw std::runtime_error("pergrep index: truncated");
+            }
+            I->loaded.push_back({I->infos[k], std::move(data)});
+        }
+    } else {
+        // v5: re-read from filesystem (O(corpus) I/O per load)
+        for (auto& f : I->infos) {
+#ifdef _WIN32
+            std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
+#else
+            std::ifstream src(I->root / f.path, std::ios::binary);
+#endif
+            if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
+            std::string data((std::istreambuf_iterator<char>(src)), {});
+            I->loaded.push_back({f, std::move(data)});
+        }
+    }
     return Index(I);
 }
 

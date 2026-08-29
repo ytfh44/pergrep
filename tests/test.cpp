@@ -1,12 +1,14 @@
 #include <pergrep/pergrep.hpp>
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #if __has_include("../src/internal.hpp")
 #include "../src/internal.hpp"
@@ -1370,6 +1372,129 @@ int main(){
     }
     std::cerr << "BF-4 done\n" << std::flush;
   }
+  // QO-5 corpus
+  {
+    std::cerr << "QO-5 corpus\n" << std::flush;
+    namespace fs = std::filesystem;
+    // 1. persist_corpus=true: saving with persist and loading without re-reading files
+    //    (rename/remove source files after save) still yields correct content() and search.
+    {
+      auto base = fs::temp_directory_path() / "pergrep_qo5_persist";
+      fs::remove_all(base);
+      auto root = base / "corpus";
+      fs::create_directories(root);
+      std::string content_a = "hello pergrep persist test\nsecond line\n";
+      std::string content_b = "another file with needle xyz\n";
+      {
+        std::ofstream f(root / "a.txt", std::ios::binary);
+        f << content_a;
+      }
+      {
+        std::ofstream f(root / "b.txt", std::ios::binary);
+        f << content_b;
+      }
+      IndexOptions opt;
+      opt.persist_corpus = true;
+      auto idx = Index::build(root, opt);
+      // Ensure fresh() is true before mutation
+      assert(idx.fresh());
+      auto p = base / "idx_persist.bin";
+      idx.save(p);
+      assert(fs::exists(p));
+      // Verify saved opts preserve persist_corpus flag (load should report true).
+      // Move/rename source directory away so load cannot re-read files.
+      auto root_backup = base / "corpus_backup";
+      fs::rename(root, root_backup);
+      assert(!fs::exists(root));
+      // Load from persisted index without source files present.
+      auto loaded = Index::load(p);
+      assert(loaded.files().size() == 2);
+      // content() must match original despite source missing
+      // Files are sorted, so check both paths contain expected substrings
+      bool found_a = false, found_b = false;
+      for (size_t i = 0; i < loaded.files().size(); ++i) {
+        auto c = std::string(loaded.content(i));
+        if (c == content_a) found_a = true;
+        if (c == content_b) found_b = true;
+      }
+      assert(found_a && found_b);
+      // Search must still work without filesystem
+      Searcher s(loaded);
+      auto pat = Pattern::compile("persist", {.kind = PatternKind::Fixed});
+      auto m = s.find(pat);
+      assert(m.size() == 1);
+      // Also test needle in second file
+      auto pat2 = Pattern::compile("needle", {.kind = PatternKind::Fixed});
+      auto m2 = s.find(pat2);
+      assert(m2.size() == 1);
+      // Index with persist=true should report persist_corpus true on load
+      assert(loaded.options().persist_corpus == true);
+      // Also verify that default persist=false still re-reads: save with false should fail to load after removal
+      {
+        // Restore source for second test
+        fs::rename(root_backup, root);
+        IndexOptions opt2;
+        opt2.persist_corpus = false;
+        auto idx2 = Index::build(root, opt2);
+        auto p2 = base / "idx_nopersist.bin";
+        idx2.save(p2);
+        fs::rename(root, root_backup);
+        bool threw = false;
+        try {
+          (void)Index::load(p2);
+        } catch (const std::exception& e) {
+          std::string msg = e.what();
+          threw = true;
+          assert(msg.find("disappeared") != std::string::npos || msg.find("truncated") != std::string::npos || msg.find("cannot open") != std::string::npos);
+        }
+        assert(threw);
+        fs::rename(root_backup, root);
+      }
+      fs::remove_all(base);
+    }
+    // 2. fresh() returns false after touching a file and true otherwise
+    {
+      auto base = fs::temp_directory_path() / "pergrep_qo5_fresh";
+      fs::remove_all(base);
+      auto root = base / "corpus";
+      fs::create_directories(root);
+      {
+        std::ofstream f(root / "x.txt", std::ios::binary);
+        f << "fresh test content\n";
+      }
+      auto idx = Index::build(root);
+      assert(idx.fresh());
+      // Modify mtime by overwriting file (touch)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::ofstream f(root / "x.txt", std::ios::binary | std::ios::app);
+        f << "append\n";
+      }
+      // Ensure mtime changed (if filesystem granularity is coarse, force via last_write_time)
+      {
+        auto now = fs::file_time_type::clock::now();
+        std::error_code ec;
+        fs::last_write_time(root / "x.txt", now, ec);
+        (void)ec;
+      }
+      assert(!idx.fresh());
+      // Rebuild should be fresh again
+      auto idx2 = Index::build(root);
+      assert(idx2.fresh());
+      // Adding a new file should make old index not fresh
+      {
+        std::ofstream f(root / "y.txt", std::ios::binary);
+        f << "new file\n";
+      }
+      assert(!idx2.fresh());
+      // Removing a file should make not fresh
+      fs::remove(root / "y.txt");
+      fs::remove(root / "x.txt");
+      assert(!idx2.fresh());
+      fs::remove_all(base);
+    }
+    std::cerr << "QO-5 done\n" << std::flush;
+  }
 
-  return 0;
+   return 0;
 }

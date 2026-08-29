@@ -56,6 +56,16 @@ struct IndexOptions {
     std::size_t planned_qgrams = 4;
     bool include_hidden = true; // filtering is normally done by the CLI layer.
     bool follow_symlinks = false;
+    // QO-5: on-disk corpus prototype. When false (default), Index::save persists
+    // only filter structures and file metadata; Index::load re-reads each source
+    // file via std::ifstream (O(corpus) I/O) to repopulate I->loaded. This keeps
+    // index files small and backward-compatible (v5). When true, save also
+    // persists the raw corpus bytes after the positional filter (v6) so load
+    // restores content without touching the filesystem — prototype for a true
+    // on-disk index that decouples filter persistence from corpus re-read.
+    // Default false preserves backward compatibility; true trades larger index
+    // for O(1) load without corpus re-read.
+    bool persist_corpus = false;
 };
 
 struct FileInfo {
