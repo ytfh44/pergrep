@@ -38,15 +38,14 @@ QueryDesc compile_qgram_query(std::string_view q);
 
 struct Chunk {
     std::uint32_t file_id = 0;
-    std::uint32_t core_begin = 0;
-    std::uint32_t core_end = 0;
-    std::uint32_t ext_end = 0;
+    std::uint64_t core_begin = 0;
+    std::uint64_t core_end = 0;
+    std::uint64_t ext_end = 0;
 };
 struct LoadedFile { FileInfo info; std::string data; };
 
 struct UnicodeProperty {
-    enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit };
-    Kind kind = Kind::Binary;
+    enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit, AsciiDigit, AsciiWord, AsciiSpace };
     std::int32_t value = 0;
     bool negated = false;
 };
@@ -56,7 +55,7 @@ struct CharClassSpec {
     bool negated = false;
 };
 struct RegexNode {
-    enum class Kind { Empty, Literal, Dot, Class, Begin, End, WordBoundary, WordStartHalf, WordEndHalf, Concat, Alt, Repeat, Group, BackRef, LookAhead, LookBehind };
+    enum class Kind { Empty, Literal, Dot, Class, Begin, End, AbsBegin, AbsEnd, EndNewline, WordBoundary, WordStartHalf, WordEndHalf, Concat, Alt, Repeat, Group, BackRef, LookAhead, LookBehind };
     Kind kind = Kind::Empty;
     std::string literal;
     CharClassSpec char_class;
@@ -75,7 +74,7 @@ struct RegexNode {
     std::vector<std::shared_ptr<RegexNode>> children;
 };
 struct NfaInst {
-    enum class Op : std::uint8_t { Rune, Any, Class, Split, Jmp, SaveStart, SaveEnd, AssertBegin, AssertEnd, AssertWord, AssertWordStartHalf, AssertWordEndHalf, Match };
+    enum class Op : std::uint8_t { Rune, Any, Class, Split, Jmp, SaveStart, SaveEnd, AssertBegin, AssertEnd, AssertAbsBegin, AssertAbsEnd, AssertEndNewline, AssertWord, AssertWordStartHalf, AssertWordEndHalf, Match };
     Op op = Op::Match;
     std::uint32_t rune = 0;
     std::shared_ptr<const CharClassSpec> char_class;
@@ -110,10 +109,10 @@ struct IndexData {
         std::vector<std::uint64_t> bits;
     };
     struct PosDesc {
-        std::uint32_t off = 0;
+        std::uint64_t off = 0;
         std::uint16_t m = 0;
-        std::uint8_t mask_bytes = 0;
-        std::uint8_t blocks = 0;
+        std::uint32_t mask_bytes = 0;
+        std::uint32_t blocks = 0;
     };
 
     std::filesystem::path root;
