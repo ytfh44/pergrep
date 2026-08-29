@@ -47,6 +47,10 @@ pergrep::IndexOptions convert(const pg_index_options* x) {
     o.positional_budget_ratio = x->positional_budget_ratio;
     o.planned_qgrams = x->planned_qgrams;
     o.follow_symlinks = x->follow_symlinks;
+    // BF-1 audit: pg_index_options has no include_hidden field (C ABI). Keep
+    // default include_hidden=true for backward compat. If a future version adds
+    // include_hidden as a trailing int, detect via struct size / extra field
+    // and map it here to avoid breaking existing callers.
     return o;
 }
 pergrep::SearchOptions convert(const pg_search_options* x) {
