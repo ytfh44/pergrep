@@ -394,7 +394,72 @@ inline size_t utf8_char_len(unsigned char c) noexcept {
 }
 
 inline bool fnmatch(const std::string& pat, const std::string& text) {
-    return ::fnmatch(pat.c_str(), text.c_str(), FNM_PATHNAME) == 0;
+    const std::size_t P = pat.size(), T = text.size();
+    std::vector<signed char> memo((P + 1) * (T + 1), -1);
+    auto go = [&](auto&& self, std::size_t i, std::size_t j) -> bool {
+        auto& mm = memo[i * (T + 1) + j];
+        if (mm != -1) return mm != 0;
+        bool ok = false;
+        if (i == P) {
+            ok = (j == T);
+        } else if (pat[i] == '*') {
+            bool dbl = (i + 1 < P && pat[i + 1] == '*');
+            std::size_t ni = i + (dbl ? 2 : 1);
+            if (dbl && ni < P && (pat[ni] == '/' || pat[ni] == '\\')) {
+                if (self(self, ni + 1, j)) ok = true;
+                for (std::size_t k = j; !ok && k < T; ) {
+                    if (text[k] == '/' || text[k] == '\\') {
+                        if (self(self, ni + 1, k + 1)) ok = true;
+                    }
+                    std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
+                    if (k + clen > T) clen = 1;
+                    k += clen;
+                }
+            } else {
+                if (self(self, ni, j)) ok = true;
+                for (std::size_t k = j; !ok && k < T && (dbl || (text[k] != '/' && text[k] != '\\')); ) {
+                    std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
+                    if (k + clen > T) clen = 1;
+                    k += clen;
+                    if (self(self, ni, k)) ok = true;
+                }
+            }
+        } else if (pat[i] == '?') {
+            if (j < T && text[j] != '/' && text[j] != '\\') {
+                std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[j]));
+                if (j + clen > T) clen = 1;
+                ok = self(self, i + 1, j + clen);
+            }
+        } else if (pat[i] == '/' || pat[i] == '\\') {
+            ok = (j < T && (text[j] == '/' || text[j] == '\\')) && self(self, i + 1, j + 1);
+        } else if (pat[i] == '[') {
+            std::size_t e = pat.find(']', i + 1);
+            if (e == std::string::npos) {
+                ok = (j < T && pat[i] == text[j]) && self(self, i + 1, j + 1);
+            } else if (j < T && text[j] != '/' && text[j] != '\\') {
+                bool neg = (i + 1 < e && (pat[i + 1] == '!' || pat[i + 1] == '^'));
+                std::size_t k = i + 1 + (neg ? 1 : 0);
+                bool hit = false;
+                while (k < e) {
+                    if (k + 2 < e && pat[k + 1] == '-') {
+                        if (static_cast<unsigned char>(text[j]) >= static_cast<unsigned char>(pat[k]) &&
+                            static_cast<unsigned char>(text[j]) <= static_cast<unsigned char>(pat[k + 2])) hit = true;
+                        k += 3;
+                    } else {
+                        if (pat[k] == text[j]) hit = true;
+                        ++k;
+                    }
+                }
+                if (neg) hit = !hit;
+                ok = hit && self(self, e + 1, j + 1);
+            }
+        } else {
+            ok = (j < T && pat[i] == text[j]) && self(self, i + 1, j + 1);
+        }
+        mm = ok ? 1 : 0;
+        return ok;
+    };
+    return go(go, 0, 0);
 }
 
 inline bool ansi_to_utf8(std::string_view in, std::string& out) {
