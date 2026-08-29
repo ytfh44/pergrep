@@ -188,6 +188,9 @@ public:
         RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_; p.mandatory = mandatory(p.ast);
         std::sort(p.mandatory.begin(), p.mandatory.end()); p.mandatory.erase(std::unique(p.mandatory.begin(), p.mandatory.end()), p.mandatory.end());
         std::sort(p.mandatory.begin(), p.mandatory.end(), [](const auto&a,const auto&b){ return a.size() > b.size(); });
+        p.prefixes = extract_prefixes(p.ast);
+        p.branch_mandatory = extract_branch_mandatory(p.ast);
+        p.is_pure_literal = check_pure_literal(p.ast, p.exact_literal);
         return p;
     }
 private:
@@ -347,6 +350,66 @@ private:
         if(n->kind==K::Concat){std::vector<std::string>out;std::string run;for(auto&c:n->children){if(c->kind==K::Literal&&!c->icase)run+=c->literal;else{if(!run.empty()){out.push_back(run);run.clear();}auto m=mandatory(c);out.insert(out.end(),m.begin(),m.end());}}if(!run.empty())out.push_back(run);return out;}
         if(n->kind==K::Alt){if(n->children.empty())return{};auto acc=mandatory(n->children[0]);for(size_t i=1;i<n->children.size();++i){auto cur=mandatory(n->children[i]);std::vector<std::string>next;for(auto&a:acc)if(std::find(cur.begin(),cur.end(),a)!=cur.end())next.push_back(a);acc.swap(next);}return acc;}return{};
     }
+    static std::vector<std::string> extract_prefixes(const std::shared_ptr<RegexNode>& n) {
+        using K = RegexNode::Kind;
+        if (!n) return {};
+        if (n->kind == K::Literal) {
+            if (!n->literal.empty() && !n->icase) return {n->literal};
+            return {};
+        }
+        if (n->kind == K::Concat) {
+            if (!n->children.empty()) return extract_prefixes(n->children.front());
+            return {};
+        }
+        if (n->kind == K::Alt) {
+            std::vector<std::string> out;
+            for (const auto& c : n->children) {
+                auto p = extract_prefixes(c);
+                if (p.empty()) return {};
+                out.insert(out.end(), p.begin(), p.end());
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
+        }
+        return {};
+    }
+    static std::vector<std::vector<std::string>> extract_branch_mandatory(const std::shared_ptr<RegexNode>& n) {
+        using K = RegexNode::Kind;
+        if (!n) return {};
+        if (n->kind == K::Alt) {
+            std::vector<std::vector<std::string>> out;
+            for (const auto& c : n->children) {
+                auto m = mandatory(c);
+                if (m.empty()) return {};
+                out.push_back(std::move(m));
+            }
+            return out;
+        }
+        return {};
+    }
+    static bool check_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& lit) {
+        using K = RegexNode::Kind;
+        if (!n) return false;
+        if (n->kind == K::Literal) {
+            if (!n->icase) {
+                lit = n->literal;
+                return true;
+            }
+            return false;
+        }
+        if (n->kind == K::Concat) {
+            std::string run;
+            for (const auto& c : n->children) {
+                std::string sub;
+                if (!check_pure_literal(c, sub)) return false;
+                run += sub;
+            }
+            lit = run;
+            return true;
+        }
+        return false;
+    }
 };
 
 
@@ -489,15 +552,60 @@ bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptio
 
 bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&o,std::size_t from,Match*out,std::uint32_t file_id,unsigned char sep){
     if(p.nfa_start<0) return false;
-    std::vector<NfaThread>cur,next;std::vector<std::uint8_t>seen(p.nfa.size()),seen_next(p.nfa.size());std::optional<NfaThread>best;std::size_t best_end=0;std::size_t pos=from;
-    for(;;){
-        NfaThread start;start.pc=p.nfa_start;start.start=pos;start.caps.assign(static_cast<std::size_t>(p.groups)+1,{SIZE_MAX,SIZE_MAX});add_nfa_thread(p,text,o,sep,pos,std::move(start),cur,seen);
-        for(std::size_t k=0;k<cur.size();++k)if(p.nfa[cur[k].pc].op==NfaInst::Op::Match){best=cur[k];best_end=pos;cur.resize(k);break;}
-        if(best&&cur.empty()) break;
-        if(pos>=text.size()) break;
-        auto r=rune_at(text,pos);if(!r.ok)break;next.clear();std::fill(seen_next.begin(),seen_next.end(),0);
-        for(auto&t:cur){const auto&i=p.nfa[t.pc];if(nfa_consume(i,r.cp,sep,o)){auto z=t;z.pc=i.x;add_nfa_thread(p,text,o,sep,r.next,std::move(z),next,seen_next);}}
-        cur.swap(next);seen.swap(seen_next);pos=r.next;if(cur.empty()&&best)break;
+    std::vector<NfaThread> cur, next;
+    std::vector<std::uint8_t> seen(p.nfa.size()), seen_next(p.nfa.size());
+    std::optional<NfaThread> best;
+    std::size_t best_end = 0;
+    std::size_t pos = from;
+    for (;;) {
+        if (cur.empty() && !best && !p.prefixes.empty() && pos < text.size()) {
+            std::size_t next_jump = std::string_view::npos;
+            if (p.prefixes.size() == 1) {
+                next_jump = text.find(p.prefixes[0], pos);
+            } else {
+                for (const auto& pref : p.prefixes) {
+                    auto cand = text.find(pref, pos);
+                    if (cand != std::string_view::npos) {
+                        if (next_jump == std::string_view::npos || cand < next_jump) {
+                            next_jump = cand;
+                        }
+                    }
+                }
+            }
+            if (next_jump == std::string_view::npos) break;
+            pos = next_jump;
+        }
+        NfaThread start;
+        start.pc = p.nfa_start;
+        start.start = pos;
+        start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
+        add_nfa_thread(p, text, o, sep, pos, std::move(start), cur, seen);
+        for (std::size_t k = 0; k < cur.size(); ++k) {
+            if (p.nfa[cur[k].pc].op == NfaInst::Op::Match) {
+                best = cur[k];
+                best_end = pos;
+                cur.resize(k);
+                break;
+            }
+        }
+        if (best && cur.empty()) break;
+        if (pos >= text.size()) break;
+        auto r = rune_at(text, pos);
+        if (!r.ok) break;
+        next.clear();
+        std::fill(seen_next.begin(), seen_next.end(), 0);
+        for (auto& t : cur) {
+            const auto& i = p.nfa[t.pc];
+            if (nfa_consume(i, r.cp, sep, o)) {
+                auto z = t;
+                z.pc = i.x;
+                add_nfa_thread(p, text, o, sep, r.next, std::move(z), next, seen_next);
+            }
+        }
+        cur.swap(next);
+        seen.swap(seen_next);
+        pos = r.next;
+        if (cur.empty() && best) break;
     }
     if(!best) return false;
     if(out){out->file_id=file_id;out->start=best->start;out->end=best_end;out->captures.assign(static_cast<std::size_t>(p.groups)+1,{});out->captures[0]={best->start,best_end,true,""};for(int g=1;g<=p.groups;++g){if(static_cast<std::size_t>(g)<best->caps.size()){auto[a,b]=best->caps[g];if(a!=SIZE_MAX&&b!=SIZE_MAX)out->captures[g]={a,b,true,static_cast<std::size_t>(g)<p.group_names.size()?p.group_names[g]:std::string{}};}}}
