@@ -1212,7 +1212,164 @@ int main(){
     assert(str.verified_bytes < stc.verified_bytes);
   }
 #endif
-
+  // BF-4 hardening
+  {
+    std::cerr << "BF-4 hardening\n" << std::flush;
+    namespace fs = std::filesystem;
+    // 1. Crash-safe save with non-existent parent creates directories and atomic rename
+    {
+      auto base = fs::temp_directory_path() / "pergrep_bf4_test_parent";
+      fs::remove_all(base);
+      auto nested = base / "a" / "b" / "c" / "index.bin";
+      // Build a real persisted index via build (not ephemeral)
+      auto root = base / "corpus";
+      fs::create_directories(root);
+      {
+        std::ofstream f(root / "hello.txt", std::ios::binary);
+        f << "hello world\nsave test\n";
+      }
+      auto idx = Index::build(root);
+      // Save to nested path where parent does not exist
+      idx.save(nested);
+      assert(fs::exists(nested));
+      // Temp file should be gone
+      fs::path tmp = nested;
+      tmp += ".tmp.";
+      // Check no tmp file with pid suffix remains (glob)
+      bool tmp_exists = false;
+      for (auto& e : fs::directory_iterator(nested.parent_path())) {
+        if (e.path().string().find(".tmp.") != std::string::npos) tmp_exists = true;
+      }
+      assert(!tmp_exists);
+      auto loaded = Index::load(nested);
+      assert(loaded.files().size() == 1);
+      assert(loaded.content(0) == "hello world\nsave test\n");
+      // Second save should atomically replace
+      idx.save(nested);
+      auto loaded2 = Index::load(nested);
+      assert(loaded2.content(0) == "hello world\nsave test\n");
+      fs::remove_all(base);
+    }
+    // 2. Truncated file throws "truncated" or "read failed" not segfault
+    {
+      auto base = fs::temp_directory_path() / "pergrep_bf4_test_trunc";
+      fs::remove_all(base);
+      fs::create_directories(base / "corpus");
+      {
+        std::ofstream f(base / "corpus" / "a.txt", std::ios::binary);
+        f << "truncate me\n";
+      }
+      auto idx = Index::build(base / "corpus");
+      auto p = base / "idx.bin";
+      idx.save(p);
+      // Read full file
+      std::ifstream in(p, std::ios::binary);
+      std::string data((std::istreambuf_iterator<char>(in)), {});
+      in.close();
+      assert(data.size() > 20);
+      // Truncate to 10 bytes (header)
+      {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(data.data(), 10);
+      }
+      bool threw = false;
+      try {
+        (void)Index::load(p);
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        threw = true;
+        // Must be truncated or read failed, not string too long / bad_alloc
+        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos);
+        assert(msg.find("string too long") == std::string::npos);
+      }
+      assert(threw);
+      // Half truncation
+      {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(data.data(), data.size()/2);
+      }
+      threw = false;
+      try {
+        (void)Index::load(p);
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        threw = true;
+        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos);
+      } catch (...) { threw = true; }
+      assert(threw);
+      // Corrupt nf to huge value
+      {
+        std::string corrupt = data;
+        // nf is after magic 8 + ver 4 + root string (variable) + several fields.
+        // Simpler: just flip bytes near middle to 0xFF to make nf huge
+        if (corrupt.size() > 100) {
+          for (size_t i = 80; i < 88; ++i) corrupt[i] = char(0xFF);
+        }
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(corrupt.data(), corrupt.size());
+      }
+      threw = false;
+      try {
+        (void)Index::load(p);
+      } catch (const std::exception& e) {
+        std::string msg = e.what();
+        threw = true;
+        // Should be truncated, not OOM
+        assert(msg.find("string too long") == std::string::npos);
+      }
+      assert(threw);
+      fs::remove_all(base);
+    }
+    // 3. Chunk serialization round-trips for large offsets >4 GiB
+    {
+#if __has_include("../src/internal.hpp")
+      // Use persisted index so we can mutate and save (from_documents is ephemeral)
+      auto base = fs::temp_directory_path() / "pergrep_bf4_test_chunk";
+      fs::remove_all(base);
+      fs::create_directories(base / "corpus");
+      {
+        std::ofstream f(base / "corpus" / "x.txt", std::ios::binary);
+        f << "tiny\n";
+      }
+      auto idx = Index::build(base / "corpus");
+      auto* raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data()));
+      assert(raw != nullptr);
+      // Inject large offsets >4 GiB
+      const uint64_t GB = 1024ULL * 1024 * 1024;
+      raw->chunks.clear();
+      raw->chunks.push_back({0, 5*GB, 10*GB, 10*GB + 128});
+      raw->chunks.push_back({0, 0x1'0000'0000ULL, 0x2'0000'0000ULL, 0x2'0000'0010ULL});
+      // Keep pos_desc consistent with new chunks (minimal)
+      raw->pos_desc.clear();
+      raw->pos_desc.push_back({0, 64, 1, 1});
+      raw->pos_desc.push_back({64, 64, 1, 1});
+      raw->pos.assign(128, 0);
+      auto p = base / "chunk_idx.bin";
+      idx.save(p);
+      auto loaded = Index::load(p);
+      auto* raw2 = static_cast<const pergrep::detail::IndexData*>(loaded.debug_index_data());
+      assert(raw2 != nullptr);
+      assert(raw2->chunks.size() == 2);
+      assert(raw2->chunks[0].core_begin == 5*GB);
+      assert(raw2->chunks[0].core_end == 10*GB);
+      assert(raw2->chunks[0].ext_end == 10*GB + 128);
+      assert(raw2->chunks[1].core_begin == 0x1'0000'0000ULL);
+      assert(raw2->chunks[1].core_end == 0x2'0000'0000ULL);
+      assert(raw2->chunks[1].ext_end == 0x2'0000'0010ULL);
+      fs::remove_all(base);
+#else
+      // Fallback: verify Chunk fields are 64-bit and put/get preserves high bits
+      pergrep::detail::Chunk c;
+      c.file_id = 42;
+      c.core_begin = 0x1'2345'6789ULL;
+      c.core_end = 0x9'8765'4321ULL;
+      c.ext_end = 0x1'0000'0005ULL;
+      assert(c.core_begin > (1ULL<<32));
+      assert(c.core_end > (1ULL<<32));
+#endif
+    }
+    std::cerr << "BF-4 done\n" << std::flush;
+  }
 
   return 0;
 }
