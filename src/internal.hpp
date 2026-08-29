@@ -35,12 +35,18 @@ struct QueryDesc {
 };
 std::uint8_t lg_for(std::size_t n);
 QueryDesc compile_qgram_query(std::string_view q);
+struct PosDesc {
+    std::uint64_t off = 0;
+    std::uint16_t m = 0;
+    std::uint32_t mask_bytes = 0;
+    std::uint32_t blocks = 0;
+};
 
 struct Chunk {
     std::uint32_t file_id = 0;
-    std::uint32_t core_begin = 0;
-    std::uint32_t core_end = 0;
-    std::uint32_t ext_end = 0;
+    std::uint64_t core_begin = 0;
+    std::uint64_t core_end = 0;
+    std::uint64_t ext_end = 0;
 };
 struct LoadedFile { FileInfo info; std::string data; };
 
@@ -110,10 +116,10 @@ struct IndexData {
         std::vector<std::uint64_t> bits;
     };
     struct PosDesc {
-        std::uint32_t off = 0;
+        std::uint64_t off = 0;
         std::uint16_t m = 0;
-        std::uint8_t mask_bytes = 0;
-        std::uint8_t blocks = 0;
+        std::uint32_t mask_bytes = 0;
+        std::uint32_t blocks = 0;
     };
 
     std::filesystem::path root;

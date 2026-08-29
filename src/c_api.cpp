@@ -60,38 +60,73 @@ pg_pattern_options pg_pattern_options_default(void){ return {PG_REGEX,PG_CASE_SE
 pg_index_options pg_index_options_default(void){ auto o=pergrep::IndexOptions{}; return {o.chunk_bytes,o.chunk_overlap,o.positional_block_bytes,o.positional_budget_ratio,o.planned_qgrams,0}; }
 pg_search_options pg_search_options_default(void){ return {0,0,0,'\n'}; }
 
-pg_index* pg_index_build(const char* root,const pg_index_options* options,char** error){
-    if(!root){set_error(error,"root is null");return nullptr;}
-    return guarded(error,(pg_index*)nullptr,[&]{ auto p=new pg_index; p->value=std::make_shared<pergrep::Index>(pergrep::Index::build(root,convert(options))); return p;});
+pg_index* pg_index_build(const char* root, const pg_index_options* options, char** error) {
+    if (!root) { set_error(error, "root is null"); return nullptr; }
+    return guarded(error, (pg_index*)nullptr, [&] {
+        auto idx = pergrep::Index::build(root, convert(options));
+        auto p = std::make_unique<pg_index>();
+        p->value = std::make_shared<pergrep::Index>(std::move(idx));
+        return p.release();
+    });
 }
-pg_index* pg_index_load(const char* file,char** error){
-    if(!file){set_error(error,"file is null");return nullptr;}
-    return guarded(error,(pg_index*)nullptr,[&]{ auto p=new pg_index; p->value=std::make_shared<pergrep::Index>(pergrep::Index::load(file)); return p;});
+pg_index* pg_index_load(const char* file, char** error) {
+    if (!file) { set_error(error, "file is null"); return nullptr; }
+    return guarded(error, (pg_index*)nullptr, [&] {
+        auto idx = pergrep::Index::load(file);
+        auto p = std::make_unique<pg_index>();
+        p->value = std::make_shared<pergrep::Index>(std::move(idx));
+        return p.release();
+    });
 }
-int pg_index_save(const pg_index* index,const char* file,char** error){
-    if(!index||!file){set_error(error,"index/file is null");return 0;}
-    return guarded(error,0,[&]{index->value->save(file);return 1;});
+int pg_index_save(const pg_index* index, const char* file, char** error) {
+    if (!index || !index->value || !file) { set_error(error, "index/file is null"); return 0; }
+    return guarded(error, 0, [&] { index->value->save(file); return 1; });
 }
-void pg_index_free(pg_index* p){delete p;}
-uint64_t pg_index_corpus_bytes(const pg_index* p){return p?p->value->corpus_bytes():0;}
-uint64_t pg_index_bytes(const pg_index* p){return p?p->value->index_bytes():0;}
-size_t pg_index_file_count(const pg_index* p){return p?p->value->files().size():0;}
-const char* pg_index_file_path(const pg_index* p,size_t id){if(!p||id>=p->value->files().size())return nullptr;return p->value->files()[id].path.c_str();}
+void pg_index_free(pg_index* p) { delete p; }
+uint64_t pg_index_corpus_bytes(const pg_index* p) { return (p && p->value) ? p->value->corpus_bytes() : 0; }
+uint64_t pg_index_bytes(const pg_index* p) { return (p && p->value) ? p->value->index_bytes() : 0; }
+size_t pg_index_file_count(const pg_index* p) { return (p && p->value) ? p->value->files().size() : 0; }
+const char* pg_index_file_path(const pg_index* p, size_t id) {
+    if (!p || !p->value || id >= p->value->files().size()) return nullptr;
+    return p->value->files()[id].path.c_str();
+}
 
-pg_pattern* pg_pattern_compile(const char* expr,const pg_pattern_options* options,char** error){
-    if(!expr){set_error(error,"expression is null");return nullptr;}
-    return guarded(error,(pg_pattern*)nullptr,[&]{auto p=new pg_pattern{pergrep::Pattern::compile(expr,convert(options))};return p;});
+pg_pattern* pg_pattern_compile(const char* expr, const pg_pattern_options* options, char** error) {
+    if (!expr) { set_error(error, "expression is null"); return nullptr; }
+    return guarded(error, (pg_pattern*)nullptr, [&] {
+        auto pat = pergrep::Pattern::compile(expr, convert(options));
+        auto p = std::make_unique<pg_pattern>();
+        p->value = std::move(pat);
+        return p.release();
+    });
 }
-void pg_pattern_free(pg_pattern* p){delete p;}
-pg_searcher* pg_searcher_new(const pg_index* idx,char** error){
-    if(!idx){set_error(error,"index is null");return nullptr;}
-    return guarded(error,(pg_searcher*)nullptr,[&]{auto p=new pg_searcher;p->value=std::make_unique<pergrep::Searcher>(idx->value);return p;});
+void pg_pattern_free(pg_pattern* p) { delete p; }
+pg_searcher* pg_searcher_new(const pg_index* idx, char** error) {
+    if (!idx || !idx->value) { set_error(error, "index is null"); return nullptr; }
+    return guarded(error, (pg_searcher*)nullptr, [&] {
+        auto s = std::make_unique<pergrep::Searcher>(idx->value);
+        auto p = std::make_unique<pg_searcher>();
+        p->value = std::move(s);
+        return p.release();
+    });
 }
-void pg_searcher_free(pg_searcher* p){delete p;}
-pg_match* pg_search(pg_searcher* s,const pg_pattern* p,const pg_search_options* options,size_t* count,pg_search_stats* stats,char** error){
-    if(count) *count=0;
-    if(!s||!p){set_error(error,"searcher/pattern is null");return nullptr;}
-    return guarded(error,(pg_match*)nullptr,[&]{pergrep::SearchStats st;auto v=s->value->find(p->value,convert(options),&st);auto out=static_cast<pg_match*>(std::malloc(sizeof(pg_match)*v.size()));if(!out&&!v.empty())throw std::bad_alloc{};for(size_t i=0;i<v.size();++i)out[i]={v[i].file_id,v[i].start,v[i].end};if(count)*count=v.size();if(stats)*stats={st.candidate_chunks,st.candidate_blocks,st.verified_bytes,st.matches};return out;});
+void pg_searcher_free(pg_searcher* p) { delete p; }
+pg_match* pg_search(pg_searcher* s, const pg_pattern* p, const pg_search_options* options, size_t* count, pg_search_stats* stats, char** error) {
+    if (count) *count = 0;
+    if (!s || !s->value || !p) { set_error(error, "searcher/pattern is null"); return nullptr; }
+    return guarded(error, (pg_match*)nullptr, [&] {
+        pergrep::SearchStats st;
+        auto v = s->value->find(p->value, convert(options), &st);
+        pg_match* out = nullptr;
+        if (!v.empty()) {
+            out = static_cast<pg_match*>(std::malloc(sizeof(pg_match) * v.size()));
+            if (!out) throw std::bad_alloc{};
+            for (size_t i = 0; i < v.size(); ++i) out[i] = {v[i].file_id, v[i].start, v[i].end};
+        }
+        if (count) *count = v.size();
+        if (stats) *stats = {st.candidate_chunks, st.candidate_blocks, st.verified_bytes, st.matches};
+        return out;
+    });
 }
 void pg_matches_free(pg_match* p){std::free(p);}
 void pg_error_free(char* p){std::free(p);}
