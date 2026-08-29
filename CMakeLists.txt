@@ -51,6 +51,13 @@ if(PERGREP_BUILD_TESTS)
     target_compile_options(pergrep_c_tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
   endif()
   add_test(NAME pergrep_c_tests COMMAND pergrep_c_tests)
+  add_executable(pergrep_bench bench/bench.cpp)
+  target_link_libraries(pergrep_bench PRIVATE libpergrep)
+  if(MSVC)
+    target_compile_options(pergrep_bench PRIVATE /W4 /O2)
+  else()
+    target_compile_options(pergrep_bench PRIVATE -Wall -Wextra -Wpedantic -O3)
+  endif()
 
   # The shell suites require a real POSIX bash. On Windows that means Git for
   # Windows' bash; the WSL bash (C:\Windows\System32\bash.exe) cannot run
