@@ -39,7 +39,7 @@ Index Index::build(const fs::path&root,IndexOptions opt){
         auto z=I->chunks[ci]; uint32_t core_len=z.core_end-z.core_begin;
         uint32_t blocks=std::max<uint32_t>(1,(core_len+I->pos_block-1)/I->pos_block);
         uint32_t mask_bytes=(blocks+7)/8; uint16_t m=choose_m(core_len,mask_bytes);
-        I->pos_desc[ci]={uint32_t(pos_total),m,uint8_t(mask_bytes),uint8_t(blocks)};
+        I->pos_desc[ci]={pos_total,m,mask_bytes,blocks};
         pos_total += size_t(m)*mask_bytes;
     }
     I->pos.assign(pos_total,0);
@@ -75,7 +75,7 @@ Index Index::from_documents(std::vector<Document> documents,IndexOptions opt){
         auto z=I->chunks[ci]; uint32_t core_len=z.core_end-z.core_begin;
         uint32_t blocks=std::max<uint32_t>(1,(core_len+I->pos_block-1)/I->pos_block);
         uint32_t mask_bytes=(blocks+7)/8; uint16_t m=choose_m(core_len,mask_bytes);
-        I->pos_desc[ci]={uint32_t(pos_total),m,uint8_t(mask_bytes),uint8_t(blocks)};
+        I->pos_desc[ci]={pos_total,m,mask_bytes,blocks};
         pos_total += size_t(m)*mask_bytes;
     }
     I->pos.assign(pos_total,0);
