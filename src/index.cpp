@@ -4,6 +4,11 @@
 #include <filesystem>
 #include <iostream>
 #include <system_error>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 namespace pergrep::detail {
 std::uint8_t lg_for(std::size_t n){std::size_t want=std::clamp<std::size_t>(n*2,512,65536);std::uint8_t lg=9;for(std::size_t b=512;b<want&&lg<16;b<<=1)++lg;return lg;}
 QueryDesc compile_qgram_query(std::string_view q){QueryDesc d;if(q.size()>=4)for(size_t i=0;i+4<=q.size();++i)d.hashes.push_back(hash4((const unsigned char*)q.data()+i));for(uint8_t lg=9;lg<=16;++lg){uint32_t mask=(1u<<lg)-1;std::vector<uint16_t>b;for(uint32_t h:d.hashes)b.push_back(h&mask);std::sort(b.begin(),b.end());b.erase(std::unique(b.begin(),b.end()),b.end());auto&v=d.classes[lg-9];for(auto x:b){uint16_t w=x>>6;uint64_t m=1ull<<(x&63);if(!v.empty()&&v.back().first==w)v.back().second|=m;else v.push_back({w,m});}}return d;}
@@ -361,67 +366,180 @@ bool Index::fresh() const {
 }
 
 namespace {
-template<class T>void put(std::ostream&o,const T&x){o.write((const char*)&x,sizeof x);if(!o)throw std::runtime_error("index write failed");}template<class T>T get(std::istream&i){T x{};i.read((char*)&x,sizeof x);if(!i)throw std::runtime_error("index read failed");return x;}void puts(std::ostream&o,std::string_view s){uint64_t n=s.size();put(o,n);o.write(s.data(),n);}std::string gets(std::istream&i){auto n=get<uint64_t>(i);std::string s(n,'\0');i.read(s.data(),n);if(!i)throw std::runtime_error("index read failed");return s;}template<class T>void putv(std::ostream&o,const std::vector<T>&v){uint64_t n=v.size();put(o,n);if(n)o.write((const char*)v.data(),sizeof(T)*n);}template<class T>std::vector<T>getv(std::istream&i){auto n=get<uint64_t>(i);std::vector<T>v(n);if(n)i.read((char*)v.data(),sizeof(T)*n);if(!i)throw std::runtime_error("index read failed");return v;}
+// Serialization is host-endian (little-endian on x86_64) and not portable across
+// architectures. All scalar fields are written as raw host bytes via put<T> and
+// read via get<T>. This is intentional for speed; an index built on one
+// endianness cannot be loaded on another without conversion. Field-by-field
+// encoding is used for Chunk and PosDesc (no putv<Chunk>/putv<PosDesc>) to
+// avoid padding divergence across compilers/platforms.
+template<class T> void put(std::ostream& o, const T& x) {
+    o.write(reinterpret_cast<const char*>(&x), sizeof x);
+    if (!o) throw std::runtime_error("index write failed");
+}
+template<class T> T get(std::istream& i) {
+    T x{};
+    i.read(reinterpret_cast<char*>(&x), sizeof x);
+    if (!i) throw std::runtime_error("pergrep index: truncated");
+    return x;
+}
+void puts(std::ostream& o, std::string_view s) {
+    uint64_t n = s.size();
+    put(o, n);
+    if (n) {
+        o.write(s.data(), static_cast<std::streamsize>(n));
+        if (!o) throw std::runtime_error("index write failed");
+    }
+}
+// Max sizes to avoid OOM / "string too long" on corrupted input.
+constexpr uint64_t kMaxString = 16 * 1024 * 1024; // 16 MiB per string (path/root)
+constexpr uint64_t kMaxFiles = 10'000'000;
+constexpr uint64_t kMaxChunks = 100'000'000;
+constexpr uint64_t kMaxPosDesc = 100'000'000;
+constexpr uint64_t kMaxVectorElems = 200'000'000; // for gids/bits/pos
+std::string gets(std::istream& i) {
+    auto n = get<uint64_t>(i);
+    if (n > kMaxString) throw std::runtime_error("pergrep index: truncated");
+    std::string s;
+    s.resize(static_cast<size_t>(n));
+    if (n) {
+        i.read(s.data(), static_cast<std::streamsize>(n));
+        if (!i) throw std::runtime_error("pergrep index: truncated");
+    }
+    return s;
+}
+template<class T> void putv(std::ostream& o, const std::vector<T>& v) {
+    uint64_t n = v.size();
+    put(o, n);
+    if (n) {
+        o.write(reinterpret_cast<const char*>(v.data()), sizeof(T) * n);
+        if (!o) throw std::runtime_error("index write failed");
+    }
+}
+template<class T> std::vector<T> getv(std::istream& i) {
+    auto n = get<uint64_t>(i);
+    if (n > kMaxVectorElems) throw std::runtime_error("pergrep index: truncated");
+    // Guard against overflow in sizeof(T)*n allocation check
+    if (n > 0 && n > (UINT64_MAX / sizeof(T))) throw std::runtime_error("pergrep index: truncated");
+    std::vector<T> v;
+    v.resize(static_cast<size_t>(n));
+    if (n) {
+        i.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(sizeof(T) * n));
+        if (!i) throw std::runtime_error("pergrep index: truncated");
+    }
+    return v;
+}
+inline std::string pid_suffix() {
+#ifdef _WIN32
+    return std::to_string(_getpid());
+#else
+    return std::to_string(::getpid());
+#endif
+}
 }
 void Index::save(const fs::path& file) const {
     if (!impl_) throw std::runtime_error("cannot persist an uninitialized pergrep index");
     if (impl_->ephemeral) throw std::runtime_error("cannot persist an in-memory pergrep index");
     if (!file.parent_path().empty()) fs::create_directories(file.parent_path());
-    std::ofstream o(file, std::ios::binary | std::ios::trunc);
-    if (!o) throw std::runtime_error("cannot create index: " + file.string());
-    o.write("PERGREP\0", 8);
-    put(o, uint32_t(5));
-    puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
-    put(o, uint64_t(impl_->opt.chunk_bytes));
-    put(o, uint64_t(impl_->opt.chunk_overlap));
-    put(o, uint64_t(impl_->opt.positional_block_bytes));
-    put(o, impl_->opt.positional_budget_ratio);
-    put(o, uint64_t(impl_->opt.planned_qgrams));
-    put(o, uint8_t(impl_->opt.include_hidden ? 1 : 0));
-    put(o, uint8_t(impl_->opt.follow_symlinks ? 1 : 0));
-    put(o, uint64_t(impl_->corp_bytes));
-    put(o, int64_t(impl_->root_mtime_ns));
-    o.write(reinterpret_cast<const char*>(impl_->byte_freq.data()), sizeof(impl_->byte_freq));
-    o.write(reinterpret_cast<const char*>(impl_->qgram_freq.data()), sizeof(impl_->qgram_freq));
-    put(o, uint32_t(impl_->pos_block));
-    uint64_t nf = impl_->infos.size();
-    put(o, nf);
-    for (auto& f : impl_->infos) {
-        puts(o, f.path);
-        put(o, uint64_t(f.size));
-        put(o, int64_t(f.mtime_ns));
-        put(o, uint8_t(f.binary ? 1 : 0));
+    // Crash-safe: write to temp file then atomic rename. fs::rename is atomic on
+    // POSIX and uses MoveFileExW on Windows (atomic when on same volume).
+    fs::path tmp = file;
+    tmp += ".tmp." + pid_suffix();
+    // Ensure any stale temp is removed before writing
+    std::error_code ec_rm;
+    fs::remove(tmp, ec_rm);
+    try {
+        {
+            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+            if (!o) throw std::runtime_error("cannot create index: " + tmp.string());
+            o.write("PERGREP\0", 8);
+            put(o, uint32_t(5));
+            puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
+            put(o, uint64_t(impl_->opt.chunk_bytes));
+            put(o, uint64_t(impl_->opt.chunk_overlap));
+            put(o, uint64_t(impl_->opt.positional_block_bytes));
+            put(o, impl_->opt.positional_budget_ratio);
+            put(o, uint64_t(impl_->opt.planned_qgrams));
+            put(o, uint8_t(impl_->opt.include_hidden ? 1 : 0));
+            put(o, uint8_t(impl_->opt.follow_symlinks ? 1 : 0));
+            put(o, uint64_t(impl_->corp_bytes));
+            put(o, int64_t(impl_->root_mtime_ns));
+            o.write(reinterpret_cast<const char*>(impl_->byte_freq.data()), sizeof(impl_->byte_freq));
+            o.write(reinterpret_cast<const char*>(impl_->qgram_freq.data()), sizeof(impl_->qgram_freq));
+            if (!o) throw std::runtime_error("index write failed");
+            put(o, uint32_t(impl_->pos_block));
+            uint64_t nf = impl_->infos.size();
+            put(o, nf);
+            for (auto& f : impl_->infos) {
+                puts(o, f.path);
+                put(o, uint64_t(f.size));
+                put(o, int64_t(f.mtime_ns));
+                put(o, uint8_t(f.binary ? 1 : 0));
+            }
+            put(o, uint64_t(impl_->chunks.size()));
+            // Field-by-field, not putv<Chunk>, to avoid padding.
+            for (auto const& c : impl_->chunks) {
+                put(o, uint32_t(c.file_id));
+                put(o, uint64_t(c.core_begin));
+                put(o, uint64_t(c.core_end));
+                put(o, uint64_t(c.ext_end));
+            }
+            for (auto& g : impl_->groups) {
+                put(o, uint8_t(g.lg));
+                put(o, uint32_t(g.m));
+                put(o, uint32_t(g.words));
+                putv(o, g.gids);
+                putv(o, g.bits);
+            }
+            put(o, uint64_t(impl_->pos_desc.size()));
+            // Field-by-field for PosDesc as well.
+            for (auto const& d : impl_->pos_desc) {
+                put(o, uint64_t(d.off));
+                put(o, uint16_t(d.m));
+                put(o, uint32_t(d.mask_bytes));
+                put(o, uint32_t(d.blocks));
+            }
+            putv(o, impl_->pos);
+            o.flush();
+            if (!o) {
+                o.close();
+                fs::remove(tmp, ec_rm);
+                throw std::runtime_error("index write failed");
+            }
+            o.close();
+            if (!o) {
+                fs::remove(tmp, ec_rm);
+                throw std::runtime_error("index write failed");
+            }
+        }
+        std::error_code ec;
+        fs::rename(tmp, file, ec);
+        if (ec) {
+            fs::remove(tmp, ec_rm);
+            throw std::runtime_error("cannot finalize index: " + ec.message());
+        }
+    } catch (...) {
+        std::error_code ec2;
+        // Best-effort cleanup; do not hide original exception.
+        // If tmp still exists, remove it. If rename already succeeded, tmp is gone.
+        fs::remove(tmp, ec2);
+        throw;
     }
-    put(o, uint64_t(impl_->chunks.size()));
-    for (auto const& c : impl_->chunks) {
-        put(o, uint32_t(c.file_id));
-        put(o, uint64_t(c.core_begin));
-        put(o, uint64_t(c.core_end));
-        put(o, uint64_t(c.ext_end));
-    }
-    for (auto& g : impl_->groups) {
-        put(o, uint8_t(g.lg));
-        put(o, uint32_t(g.m));
-        put(o, uint32_t(g.words));
-        putv(o, g.gids);
-        putv(o, g.bits);
-    }
-    put(o, uint64_t(impl_->pos_desc.size()));
-    for (auto const& d : impl_->pos_desc) {
-        put(o, uint64_t(d.off));
-        put(o, uint16_t(d.m));
-        put(o, uint32_t(d.mask_bytes));
-        put(o, uint32_t(d.blocks));
-    }
-    putv(o, impl_->pos);
-    if (!o) throw std::runtime_error("index write failed");
 }
 Index Index::load(const fs::path& file) {
+    // Truncation guard: check file size is at least header before reading.
+    {
+        std::error_code ec;
+        auto sz = fs::file_size(file, ec);
+        if (!ec) {
+            constexpr uint64_t kMinHeader = 8 + 4; // magic + version
+            if (sz < kMinHeader) throw std::runtime_error("pergrep index: truncated");
+        }
+    }
     std::ifstream i(file, std::ios::binary);
     if (!i) throw std::runtime_error("cannot open index: " + file.string());
     char magic[8];
     i.read(magic, 8);
-    if (std::memcmp(magic, "PERGREP\0", 8)) throw std::runtime_error("not a pergrep index");
+    if (!i || std::memcmp(magic, "PERGREP\0", 8) != 0) throw std::runtime_error("pergrep index: truncated");
     auto ver = get<uint32_t>(i);
     if (ver != 5) throw std::runtime_error("unsupported pergrep index version");
     auto I = std::make_shared<Impl>();
@@ -442,18 +560,24 @@ Index Index::load(const fs::path& file) {
     I->root_mtime_ns = get<int64_t>(i);
     i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
     i.read(reinterpret_cast<char*>(I->qgram_freq.data()), sizeof(I->qgram_freq));
-    if (!i) throw std::runtime_error("index read failed");
+    if (!i) throw std::runtime_error("pergrep index: truncated");
     I->pos_block = get<uint32_t>(i);
     auto nf = get<uint64_t>(i);
-    I->infos.reserve(nf);
-    I->loaded.reserve(nf);
+    if (nf > kMaxFiles) throw std::runtime_error("pergrep index: truncated");
+    I->infos.reserve(static_cast<size_t>(nf));
+    I->loaded.reserve(static_cast<size_t>(nf));
     for (uint64_t k = 0; k < nf; ++k) {
         FileInfo f;
         f.path = gets(i);
         f.size = get<uint64_t>(i);
         f.mtime_ns = get<int64_t>(i);
         f.binary = get<uint8_t>(i) != 0;
-        I->infos.push_back(f);
+        I->infos.push_back(std::move(f));
+        // Do not load file contents here if ephemeral? For persisted index we reload from root.
+    }
+    // Reload file contents after infos are complete (preserves original behavior
+    // but avoids interleaving I/O with header parsing).
+    for (auto& f : I->infos) {
 #ifdef _WIN32
         std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
 #else
@@ -464,7 +588,8 @@ Index Index::load(const fs::path& file) {
         I->loaded.push_back({f, std::move(data)});
     }
     auto nc = get<uint64_t>(i);
-    I->chunks.reserve(nc);
+    if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
+    I->chunks.reserve(static_cast<size_t>(nc));
     for (uint64_t k = 0; k < nc; ++k) {
         Chunk c;
         c.file_id = get<uint32_t>(i);
@@ -481,7 +606,8 @@ Index Index::load(const fs::path& file) {
         g.bits = getv<uint64_t>(i);
     }
     auto npd = get<uint64_t>(i);
-    I->pos_desc.reserve(npd);
+    if (npd > kMaxPosDesc) throw std::runtime_error("pergrep index: truncated");
+    I->pos_desc.reserve(static_cast<size_t>(npd));
     for (uint64_t k = 0; k < npd; ++k) {
         detail::PosDesc d;
         d.off = get<uint64_t>(i);
