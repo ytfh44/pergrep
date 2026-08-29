@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master, "autoresearch/**"]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (unix preset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev libarchive-dev ninja-build
+      - name: Configure
+        run: cmake --preset unix
+      - name: Build
+        run: cmake --build --preset unix -j
+      - name: Test
+        run: ctest --preset unix --output-on-failure
+      - name: Bench smoke
+        run: ./build/unix/pergrep_bench || true
+
+  windows-msvc:
+    name: Windows MSVC (windows-vcpkg)
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        run: cmake --preset windows-vcpkg
+      - name: Build
+        run: cmake --build --preset windows-vcpkg -j
+      - name: Test
+        run: ctest --preset windows-vcpkg --output-on-failure
+
+  windows-clang:
+    name: Windows clang-cl (windows-clang)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+          directory: ${{ runner.temp }}/llvm
+      - name: Configure
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
+        run: cmake --preset windows-clang
+      - name: Build
+        run: cmake --build --preset windows-clang -j
+      - name: Test
+        run: ctest --preset windows-clang --output-on-failure
+      - name: Bench smoke
+        shell: bash
+        run: ./build/windows-clang/pergrep_bench.exe || ./build/windows/pergrep_bench.exe || true
+
+  # Fast lint: ensure bench respects IndexOptions bounds
+  bench-bounds:
+    name: Bench bounds check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libicu-dev libarchive-dev ninja-build
+      - name: Configure
+        run: cmake --preset unix -DPERGREP_BUILD_TESTS=ON
+      - name: Build bench
+        run: cmake --build --preset unix --target pergrep_bench -j
+      - name: Run bench (correctness gate)
+        run: ./build/unix/pergrep_bench
