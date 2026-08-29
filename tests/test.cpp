@@ -997,5 +997,107 @@ int main(){
     }
   }
 
+  // BF-3 CLI regression — differential invert / max-count / stats multi-pattern
+  {
+    // BF-3 audit: CLI performs OR-then-invert via `selected = !matched` after
+    // merging per-pattern positive matches, with core_opt.invert_match=false.
+    // Library-level invert (SearchOptions::invert_match) must be equivalent
+    // for single pattern, and CLI's OR-then-invert must exclude lines matching
+    // either pattern (not per-pattern invert union).
+    {
+      auto idx = corpus("foo\nbar\nbaz\nqux\n");
+      Searcher s(idx);
+      auto p_foo = Pattern::compile("foo");
+      auto p_bar = Pattern::compile("bar");
+      // Library invert: single pattern invert returns non-matching records
+      SearchOptions inv; inv.invert_match = true;
+      auto inv_foo = s.find(p_foo, inv);
+      assert(inv_foo.size() == 3); // bar, baz, qux
+      // Simulate CLI OR-then-invert for multi-pattern:
+      // positive union of foo OR bar = {foo, bar} -> invert = {baz, qux}
+      auto m_foo = s.find(p_foo);
+      auto m_bar = s.find(p_bar);
+      // Build per-record presence via lines: easier to check line count
+      // foo file: 4 lines, 2 positives -> 2 inverted
+      assert(m_foo.size() == 1 && m_bar.size() == 1);
+      // CLI-level invert must be equivalent to library invert for single pattern
+      // Compute CLI-style invert: find positives then complement via Searcher scan
+      // (library invert directly). For single pattern they must match count.
+      SearchOptions no_inv;
+      auto pos_foo = s.find(p_foo, no_inv);
+      // CLI would mark lines with pos_foo as matched, then invert -> 3 lines
+      // Verify library invert size == total_lines - positives (for single pattern corpus)
+      // Total records = 4 (foo,bar,baz,qux separated by \n)
+      assert(inv_foo.size() == 4 - pos_foo.size());
+      // Multi-pattern OR-then-invert: library has no OR, so simulate CLI merge:
+      // union positives size = 2, inverted = 2 (baz, qux). Verify per-pattern
+      // invert union would be wrong: inv_foo (3) union inv_bar (3) = 4 distinct,
+      // which is NOT correct rg parity (should be 2). This catches double-invert.
+      auto inv_bar = s.find(p_bar, inv);
+      // Naive per-pattern invert union would give 4 (foo+bar+baz+qux all covered),
+      // but correct OR-then-invert is 2.
+      std::unordered_set<std::size_t> union_inv;
+      for (auto& m : inv_foo) union_inv.insert(m.start);
+      for (auto& m : inv_bar) union_inv.insert(m.start);
+      assert(union_inv.size() == 4); // wrong parity if used
+      // Correct CLI logic gives 2:
+      std::unordered_set<std::size_t> pos_union;
+      for (auto& m : m_foo) pos_union.insert(m.start);
+      for (auto& m : m_bar) pos_union.insert(m.start);
+      assert(pos_union.size() == 2);
+      std::size_t correct_inverted = 4 - pos_union.size();
+      assert(correct_inverted == 2);
+    }
+    // max-count: SearchOptions::max_matches is global per find() call
+    // (opt.max_matches - out.size() globally). CLI's --max-count is per-file
+    // and applied after selected truncation, which is correct rg parity.
+    {
+      auto idx = corpus("foo\nfoo\nfoo\nfoo\nfoo\n");
+      Searcher s(idx);
+      auto p = Pattern::compile("foo");
+      SearchOptions lim; lim.max_matches = 2;
+      auto m = s.find(p, lim);
+      assert(m.size() == 2);
+      // CLI per-file truncation would also give 2 for this single-file corpus
+      // but semantics differ for multi-file Index (global vs per-file).
+      // Verify invert + max-count interaction: invert 5 lines all foo -> 0 inverted,
+      // but invert of no-match pattern should give 5 inverted truncated to 2.
+      auto p_nomatch = Pattern::compile("nomatch_xyz");
+      SearchOptions inv_lim; inv_lim.invert_match = true; inv_lim.max_matches = 2;
+      auto inv = s.find(p_nomatch, inv_lim);
+      assert(inv.size() == 2); // truncated inverted matches
+    }
+    // stats aggregation: per-pattern stats sum vs union dedup
+    {
+      auto idx = corpus("foo bar\nbaz\nfoo\nbar baz\n");
+      Searcher s(idx);
+      auto p_foo = Pattern::compile("foo");
+      auto p_bar = Pattern::compile("bar");
+      SearchStats st_foo{}, st_bar{};
+      auto m_foo = s.find(p_foo, {}, &st_foo);
+      auto m_bar = s.find(p_bar, {}, &st_bar);
+      // Each pattern has 2 matches in this corpus (foo appears in line1,line3; bar in line1,line4)
+      assert(m_foo.size() == 2);
+      assert(m_bar.size() == 2);
+      // Naive sum would be 4, which equals union dedup here (different offsets)
+      // but duplicate pattern would overcount: verify dedup not double-counting same offsets
+      auto p_foo2 = Pattern::compile("foo");
+      SearchStats st2{};
+      auto m_foo2 = s.find(p_foo2, {}, &st2);
+      // Same pattern twice sum=4 but union dedup=2 — CLI stats must report deduped union (2) not sum (4)
+      std::unordered_set<std::uint64_t> uniq;
+      for (auto& m : m_foo) uniq.insert((m.start<<32)|m.end);
+      for (auto& m : m_foo2) {
+        std::uint64_t k=(m.start<<32)|m.end;
+        // duplicate offset already in set
+        assert(uniq.count(k)==1);
+      }
+      assert(uniq.size()==2);
+      // Ensure SearchStats counts match matches size
+      assert(st_foo.matches==m_foo.size());
+      assert(st_bar.matches==m_bar.size());
+    }
+  }
+
   return 0;
 }

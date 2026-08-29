@@ -531,3 +531,30 @@ printf 'Ω
 ' > "$T/bf1_greek.txt"
 out="$($PG '\p{sc = Greek}' "$T/bf1_greek.txt" 2>&1)"
 contains "$out" 'Ω' bf1-regex-sc-spaced
+# BF-3 multi-pattern invert/max-count/stats
+# invert with multi-pattern is OR then invert: -v -e foo -e bar excludes lines matching either.
+printf 'foo\nbar\nbaz\n' > "$T/bf3_invert.txt"
+out="$($PG -v -e foo -e bar "$T/bf3_invert.txt")"
+eq "$out" 'baz' bf3-invert-multipattern
+# double-invert must be identity: -v alone vs multi-pattern invert comparison is covered by qgrep check, but we also check that -v with single pattern still inverts.
+out="$($PG -v foo "$T/bf3_invert.txt")"
+eq "$out" $'bar\nbaz' bf3-invert-single
+# max-count per file: -m 2 with 5 matching lines should cap at 2 (per file, rg parity)
+printf 'foo\nfoo\nfoo\nfoo\nfoo\n' > "$T/bf3_maxcount.txt"
+out="$($PG -m 2 -e foo "$T/bf3_maxcount.txt")"
+eq "$out" $'foo\nfoo' bf3-maxcount-perfile
+# stats with multi-pattern should report correct matches sum and file count
+printf 'foo bar\nbaz\nfoo\nbar baz\n' > "$T/bf3_stats.txt"
+out="$($PG --stats -e foo -e bar "$T/bf3_stats.txt" 2>&1)"
+contains "$out" '4 matches' bf3-stats-matches
+contains "$out" '3 matched lines' bf3-stats-lines
+contains "$out" '1 files contained matches' bf3-stats-files
+# stats invert: should count non-matching lines, not positive matches
+out="$($PG --stats -v -e foo -e bar "$T/bf3_stats.txt" 2>&1)"
+contains "$out" '1 matches' bf3-stats-invert-matches
+contains "$out" '1 matched lines' bf3-stats-invert-lines
+# stats + max-count: truncated to max-count
+out="$($PG --stats -m 1 -e foo "$T/bf3_maxcount.txt" 2>&1)"
+contains "$out" '1 matches' bf3-stats-maxcount
+contains "$out" '1 matched lines' bf3-stats-maxcount-lines
+contains "$out" '1 files contained matches' bf3-stats-maxcount-files
