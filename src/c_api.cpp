@@ -41,12 +41,12 @@ pergrep::PatternOptions convert(const pg_pattern_options* x) {
 }
 pergrep::IndexOptions convert(const pg_index_options* x) {
     auto o = pergrep::IndexOptions{}; if(!x) return o;
-    if(x->chunk_bytes) o.chunk_bytes=x->chunk_bytes;
-    o.chunk_overlap=x->chunk_overlap;
-    if(x->positional_block_bytes) o.positional_block_bytes=x->positional_block_bytes;
-    if(x->positional_budget_ratio>=0) o.positional_budget_ratio=x->positional_budget_ratio;
-    if(x->planned_qgrams) o.planned_qgrams=x->planned_qgrams;
-    o.follow_symlinks=x->follow_symlinks;
+    o.chunk_bytes = x->chunk_bytes;
+    o.chunk_overlap = x->chunk_overlap;
+    o.positional_block_bytes = x->positional_block_bytes;
+    o.positional_budget_ratio = x->positional_budget_ratio;
+    o.planned_qgrams = x->planned_qgrams;
+    o.follow_symlinks = x->follow_symlinks;
     return o;
 }
 pergrep::SearchOptions convert(const pg_search_options* x) {

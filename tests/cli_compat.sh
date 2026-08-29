@@ -439,7 +439,7 @@ eq "$eng_status" 2 engine-invalid-exit
 
 # Multiline --replace.
 printf 'start\nfoo\nbar\nend\n' > "$T/multiline_repl.txt"
-out="$($PG -U -r 'REPLACED' 'foo\nbar' "$T/multiline_repl.txt")"
+out="$($PG --passthru -U -r 'REPLACED' 'foo\nbar' "$T/multiline_repl.txt")"
 eq "$out" $'start\nREPLACED\nend' multiline-replace
 
 printf 'SECTION\nkey = value\nENDSECTION\n' > "$T/multiline_repl2.txt"
@@ -449,7 +449,7 @@ eq "$out" 'FOUND: key = value' multiline-replace-capture
 # Non-UTF8 path and data in JSON output mode.
 "$PY" - "$T/nonutf8.txt" <<'PY'
 import sys
-open(sys.argv[1],'wb').write(b'\xff\xfe\xfd needle \xfe\xff\n')
+open(sys.argv[1],'wb').write(b'\xff\xfd\xfe needle \xfe\xff\n')
 PY
 $PG --json -a needle "$T/nonutf8.txt" > "$T/nonutf8.out"
 "$PY" - "$T/nonutf8.out" <<'PY'

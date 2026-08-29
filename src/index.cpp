@@ -2,8 +2,8 @@
 #include "platform.hpp"
 #include <chrono>
 #include <filesystem>
+#include <iostream>
 #include <system_error>
-
 namespace pergrep::detail {
 std::uint8_t lg_for(std::size_t n){std::size_t want=std::clamp<std::size_t>(n*2,512,65536);std::uint8_t lg=9;for(std::size_t b=512;b<want&&lg<16;b<<=1)++lg;return lg;}
 QueryDesc compile_qgram_query(std::string_view q){QueryDesc d;if(q.size()>=4)for(size_t i=0;i+4<=q.size();++i)d.hashes.push_back(hash4((const unsigned char*)q.data()+i));for(uint8_t lg=9;lg<=16;++lg){uint32_t mask=(1u<<lg)-1;std::vector<uint16_t>b;for(uint32_t h:d.hashes)b.push_back(h&mask);std::sort(b.begin(),b.end());b.erase(std::unique(b.begin(),b.end()),b.end());auto&v=d.classes[lg-9];for(auto x:b){uint16_t w=x>>6;uint64_t m=1ull<<(x&63);if(!v.empty()&&v.back().first==w)v.back().second|=m;else v.push_back({w,m});}}return d;}
@@ -21,13 +21,16 @@ Index::Index() = default;
 Index::Index(std::shared_ptr<Impl> i) : impl_(std::move(i)) {}
 
 Index Index::build(const fs::path& root, IndexOptions opt) {
-    if (opt.chunk_bytes < 64) opt.chunk_bytes = 64;
-    if (opt.positional_block_bytes < 16) opt.positional_block_bytes = 16;
-    if (opt.planned_qgrams < 1) opt.planned_qgrams = 1;
-    if (opt.positional_budget_ratio < 0.0) opt.positional_budget_ratio = 0.0;
+    if (opt.chunk_bytes < 64) throw std::runtime_error("pergrep: chunk_bytes too small (minimum 64)");
+    if (opt.positional_block_bytes < 16) throw std::runtime_error("pergrep: positional_block_bytes too small (minimum 16)");
+    if (opt.planned_qgrams < 1) throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
+    if (opt.positional_budget_ratio < 0.0) throw std::runtime_error("pergrep: positional_budget_ratio cannot be negative");
 
     auto I = std::make_shared<Impl>();
     I->root = fs::weakly_canonical(root);
+    std::error_code ec_root;
+    if (!fs::exists(I->root, ec_root) || ec_root) throw std::runtime_error("pergrep: root path does not exist: " + root.string());
+    if (!fs::is_directory(I->root, ec_root) || ec_root) throw std::runtime_error("pergrep: root path is not a directory: " + root.string());
     I->opt = opt;
     I->pos_block = (uint32_t)opt.positional_block_bytes;
     I->root_mtime_ns = mtime_ns(I->root);
@@ -157,10 +160,10 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
 }
 
 Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
-    if (opt.chunk_bytes < 64) opt.chunk_bytes = 64;
-    if (opt.positional_block_bytes < 16) opt.positional_block_bytes = 16;
-    if (opt.planned_qgrams < 1) opt.planned_qgrams = 1;
-    if (opt.positional_budget_ratio < 0.0) opt.positional_budget_ratio = 0.0;
+    if (opt.chunk_bytes < 64) throw std::runtime_error("pergrep: chunk_bytes too small (minimum 64)");
+    if (opt.positional_block_bytes < 16) throw std::runtime_error("pergrep: positional_block_bytes too small (minimum 16)");
+    if (opt.planned_qgrams < 1) throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
+    if (opt.positional_budget_ratio < 0.0) throw std::runtime_error("pergrep: positional_budget_ratio cannot be negative");
 
     auto I = std::make_shared<Impl>();
     I->opt = opt;
@@ -330,43 +333,105 @@ bool Index::fresh() const {
 namespace {
 template<class T>void put(std::ostream&o,const T&x){o.write((const char*)&x,sizeof x);if(!o)throw std::runtime_error("index write failed");}template<class T>T get(std::istream&i){T x{};i.read((char*)&x,sizeof x);if(!i)throw std::runtime_error("index read failed");return x;}void puts(std::ostream&o,std::string_view s){uint64_t n=s.size();put(o,n);o.write(s.data(),n);}std::string gets(std::istream&i){auto n=get<uint64_t>(i);std::string s(n,'\0');i.read(s.data(),n);if(!i)throw std::runtime_error("index read failed");return s;}template<class T>void putv(std::ostream&o,const std::vector<T>&v){uint64_t n=v.size();put(o,n);if(n)o.write((const char*)v.data(),sizeof(T)*n);}template<class T>std::vector<T>getv(std::istream&i){auto n=get<uint64_t>(i);std::vector<T>v(n);if(n)i.read((char*)v.data(),sizeof(T)*n);if(!i)throw std::runtime_error("index read failed");return v;}
 }
-void Index::save(const fs::path&file)const{
-    if(!impl_)throw std::runtime_error("cannot persist an uninitialized pergrep index");
-    if(impl_->ephemeral)throw std::runtime_error("cannot persist an in-memory pergrep index");
-    if(!file.parent_path().empty())fs::create_directories(file.parent_path());
-    std::ofstream o(file,std::ios::binary|std::ios::trunc);
-    if(!o)throw std::runtime_error("cannot create index: "+file.string());
-    o.write("PERGREP\0",8);put(o,uint32_t(4));puts(o,pergrep_cli::platform::path_to_utf8(impl_->root));
-    put(o,uint64_t(impl_->opt.chunk_bytes)); put(o,uint64_t(impl_->opt.chunk_overlap));
-    put(o,uint64_t(impl_->opt.positional_block_bytes)); put(o,impl_->opt.positional_budget_ratio);
-    put(o,uint64_t(impl_->opt.planned_qgrams)); put(o,uint8_t(impl_->opt.include_hidden?1:0)); put(o,uint8_t(impl_->opt.follow_symlinks?1:0));
-    put(o,impl_->corp_bytes);put(o,impl_->root_mtime_ns);put(o,impl_->byte_freq);put(o,impl_->qgram_freq);put(o,impl_->pos_block);
-    uint64_t nf=impl_->infos.size();put(o,nf);for(auto&f:impl_->infos){puts(o,f.path);put(o,f.size);put(o,f.mtime_ns);put(o,uint8_t(f.binary?1:0));}
-    putv(o,impl_->chunks);for(auto&g:impl_->groups){put(o,g.lg);put(o,g.m);put(o,g.words);putv(o,g.gids);putv(o,g.bits);}putv(o,impl_->pos_desc);putv(o,impl_->pos);
+void Index::save(const fs::path& file) const {
+    if (!impl_) throw std::runtime_error("cannot persist an uninitialized pergrep index");
+    if (impl_->ephemeral) throw std::runtime_error("cannot persist an in-memory pergrep index");
+    if (!file.parent_path().empty()) fs::create_directories(file.parent_path());
+    std::ofstream o(file, std::ios::binary | std::ios::trunc);
+    if (!o) throw std::runtime_error("cannot create index: " + file.string());
+    o.write("PERGREP\0", 8);
+    put(o, uint32_t(4));
+    puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
+    put(o, uint64_t(impl_->opt.chunk_bytes));
+    put(o, uint64_t(impl_->opt.chunk_overlap));
+    put(o, uint64_t(impl_->opt.positional_block_bytes));
+    put(o, impl_->opt.positional_budget_ratio);
+    put(o, uint64_t(impl_->opt.planned_qgrams));
+    put(o, uint8_t(impl_->opt.include_hidden ? 1 : 0));
+    put(o, uint8_t(impl_->opt.follow_symlinks ? 1 : 0));
+    put(o, uint64_t(impl_->corp_bytes));
+    put(o, int64_t(impl_->root_mtime_ns));
+    o.write(reinterpret_cast<const char*>(impl_->byte_freq.data()), sizeof(impl_->byte_freq));
+    o.write(reinterpret_cast<const char*>(impl_->qgram_freq.data()), sizeof(impl_->qgram_freq));
+    put(o, uint32_t(impl_->pos_block));
+    uint64_t nf = impl_->infos.size();
+    put(o, nf);
+    for (auto& f : impl_->infos) {
+        puts(o, f.path);
+        put(o, uint64_t(f.size));
+        put(o, int64_t(f.mtime_ns));
+        put(o, uint8_t(f.binary ? 1 : 0));
+    }
+    putv(o, impl_->chunks);
+    for (auto& g : impl_->groups) {
+        put(o, uint8_t(g.lg));
+        put(o, uint32_t(g.m));
+        put(o, uint32_t(g.words));
+        putv(o, g.gids);
+        putv(o, g.bits);
+    }
+    putv(o, impl_->pos_desc);
+    putv(o, impl_->pos);
+    if (!o) throw std::runtime_error("index write failed");
 }
-Index Index::load(const fs::path&file){
-    std::ifstream i(file,std::ios::binary);if(!i)throw std::runtime_error("cannot open index: "+file.string());
-    char magic[8];i.read(magic,8);if(std::memcmp(magic,"PERGREP\0",8))throw std::runtime_error("not a pergrep index");
-    auto ver=get<uint32_t>(i);if(ver!=4)throw std::runtime_error("unsupported pergrep index version");
-    auto I=std::make_shared<Impl>();
+Index Index::load(const fs::path& file) {
+    std::ifstream i(file, std::ios::binary);
+    if (!i) throw std::runtime_error("cannot open index: " + file.string());
+    char magic[8];
+    i.read(magic, 8);
+    if (std::memcmp(magic, "PERGREP\0", 8)) throw std::runtime_error("not a pergrep index");
+    auto ver = get<uint32_t>(i);
+    if (ver != 4) throw std::runtime_error("unsupported pergrep index version");
+    auto I = std::make_shared<Impl>();
 #ifdef _WIN32
-    I->root=fs::path(std::u8string(gets(i).begin(),gets(i).end()));
+    auto root_str = gets(i);
+    I->root = fs::path(std::u8string(root_str.begin(), root_str.end()));
 #else
-    I->root=gets(i);
+    I->root = gets(i);
 #endif
-    I->opt.chunk_bytes=get<uint64_t>(i);I->opt.chunk_overlap=get<uint64_t>(i);I->opt.positional_block_bytes=get<uint64_t>(i);
-    I->opt.positional_budget_ratio=get<double>(i);I->opt.planned_qgrams=get<uint64_t>(i);I->opt.include_hidden=get<uint8_t>(i)!=0;I->opt.follow_symlinks=get<uint8_t>(i)!=0;
-    I->corp_bytes=get<uint64_t>(i);I->root_mtime_ns=get<int64_t>(i);I->byte_freq=get<std::array<uint64_t,256>>(i);I->qgram_freq=get<std::array<uint32_t,65536>>(i);I->pos_block=get<uint32_t>(i);
-    auto nf=get<uint64_t>(i);I->infos.reserve(nf);I->loaded.reserve(nf);
-    for(uint64_t k=0;k<nf;++k){FileInfo f;f.path=gets(i);f.size=get<uint64_t>(i);f.mtime_ns=get<int64_t>(i);f.binary=get<uint8_t>(i)!=0;I->infos.push_back(f);
+    I->opt.chunk_bytes = get<uint64_t>(i);
+    I->opt.chunk_overlap = get<uint64_t>(i);
+    I->opt.positional_block_bytes = get<uint64_t>(i);
+    I->opt.positional_budget_ratio = get<double>(i);
+    I->opt.planned_qgrams = get<uint64_t>(i);
+    I->opt.include_hidden = get<uint8_t>(i) != 0;
+    I->opt.follow_symlinks = get<uint8_t>(i) != 0;
+    I->corp_bytes = get<uint64_t>(i);
+    I->root_mtime_ns = get<int64_t>(i);
+    i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
+    i.read(reinterpret_cast<char*>(I->qgram_freq.data()), sizeof(I->qgram_freq));
+    if (!i) throw std::runtime_error("index read failed");
+    I->pos_block = get<uint32_t>(i);
+    auto nf = get<uint64_t>(i);
+    I->infos.reserve(nf);
+    I->loaded.reserve(nf);
+    for (uint64_t k = 0; k < nf; ++k) {
+        FileInfo f;
+        f.path = gets(i);
+        f.size = get<uint64_t>(i);
+        f.mtime_ns = get<int64_t>(i);
+        f.binary = get<uint8_t>(i) != 0;
+        I->infos.push_back(f);
 #ifdef _WIN32
-        std::ifstream src(I->root/fs::path(std::u8string(f.path.begin(),f.path.end())),std::ios::binary);
+        std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
 #else
-        std::ifstream src(I->root/f.path,std::ios::binary);
+        std::ifstream src(I->root / f.path, std::ios::binary);
 #endif
-        if(!src)throw std::runtime_error("indexed source disappeared: "+f.path);std::string data((std::istreambuf_iterator<char>(src)),{});I->loaded.push_back({f,std::move(data)});}
-    I->chunks=getv<Chunk>(i);for(auto&g:I->groups){g.lg=get<uint8_t>(i);g.m=get<uint32_t>(i);g.words=get<uint32_t>(i);g.gids=getv<uint32_t>(i);g.bits=getv<uint64_t>(i);}I->pos_desc=getv<detail::PosDesc>(i);I->pos=getv<uint8_t>(i);return Index(I);
+        if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
+        std::string data((std::istreambuf_iterator<char>(src)), {});
+        I->loaded.push_back({f, std::move(data)});
+    }
+    I->chunks = getv<Chunk>(i);
+    for (auto& g : I->groups) {
+        g.lg = get<uint8_t>(i);
+        g.m = get<uint32_t>(i);
+        g.words = get<uint32_t>(i);
+        g.gids = getv<uint32_t>(i);
+        g.bits = getv<uint64_t>(i);
+    }
+    I->pos_desc = getv<detail::PosDesc>(i);
+    I->pos = getv<uint8_t>(i);
+    return Index(I);
 }
-
 std::string version(){return "0.1.0";}
 } // namespace pergrep

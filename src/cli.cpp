@@ -581,7 +581,7 @@ std::string interpolate_replacement(std::string_view repl, std::string_view data
     return out;
 }
 
-std::string replace_line(std::string_view data, const LineRecord& line, const std::vector<Match>& matches, std::string_view repl) {
+std::string replace_line(std::string_view data, const LineRecord& line, const std::vector<Match>& matches, std::string_view repl, const std::vector<LineRecord>& lines = {}, std::size_t line_idx = 0) {
     std::string out;
     std::uint64_t cursor = line.begin;
     for (const auto& m : matches) {
@@ -593,6 +593,15 @@ std::string replace_line(std::string_view data, const LineRecord& line, const st
             out.append(data.substr(cursor, m.start - cursor));
             out += interpolate_replacement(repl, data, m);
             cursor = m.end;
+            if (cursor > line.term_end && !lines.empty() && line_idx < lines.size()) {
+                auto last_li = line_for_offset(lines, m.end > m.start ? m.end - 1 : m.start);
+                if (last_li < lines.size()) {
+                    if (cursor < lines[last_li].term_end) {
+                        out.append(data.substr(cursor, lines[last_li].term_end - cursor));
+                    }
+                    cursor = lines[last_li].term_end;
+                }
+            }
         }
         if (cursor >= line.term_end) break;
     }
@@ -688,6 +697,11 @@ int main(int argc, char** argv) {
         auto start = std::chrono::steady_clock::now();
         std::vector<std::vector<Match>> perpat;
         SearchOptions core_opt = a.sopt;
+        core_opt.invert_match = false;
+        core_opt.files_with_matches = false;
+        core_opt.files_without_match = false;
+        core_opt.max_matches = 0;
+        core_opt.include_binary = true;
         core_opt.record_separator = a.null_data ? '\0' : '\n';
         if (!(a.max_count_set && a.max_count == 0)) {
             for (auto& ps : a.patterns) {
@@ -756,7 +770,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> selected(lines.size(), 0);
             for (std::size_t i = 0; i < lines.size(); ++i) {
                 bool matched = !line_matches[i].empty();
-                selected[i] = static_cast<std::uint8_t>(matched ? 1 : 0);
+                selected[i] = static_cast<std::uint8_t>(a.sopt.invert_match ? !matched : matched);
             }
             if (a.stop_on_nonmatch) {
                 bool seen_match = false;
@@ -896,7 +910,9 @@ int main(int argc, char** argv) {
                 std::cout << ansi_path(display_path(idx->files()[fid].path, a),a) << '\n';
             bool previous_emitted = false;
             std::size_t previous_index = 0;
+            std::size_t skip_until = 0;
             for (std::size_t i = 0; i < lines.size(); ++i) {
+                if (i < skip_until) continue;
                 if (!emit[i]) continue;
                 bool match_line = selected[i] != 0;
                 if (!a.passthru && (a.after > 0 || a.before > 0) && previous_emitted && i > previous_index + 1 && !a.context_sep_disabled)
@@ -905,9 +921,15 @@ int main(int argc, char** argv) {
 
                 const auto& line = lines[i];
                 std::string rendered;
-                if (match_line && !a.replacement.empty() && !a.sopt.invert_match)
-                    rendered = replace_line(data, line, ms, a.replacement);
-                else rendered.assign(data.data()+line.begin, data.data()+line.term_end);
+                if (match_line && !a.replacement.empty() && !a.sopt.invert_match) {
+                    rendered = replace_line(data, line, ms, a.replacement, lines, i);
+                    for (const auto& m : ms) {
+                        if (m.start >= line.begin && m.start < line.term_end && m.end > line.term_end) {
+                            auto last_li = line_for_offset(lines, m.end > m.start ? m.end - 1 : m.start);
+                            if (last_li > i) skip_until = std::max(skip_until, last_li + 1);
+                        }
+                    }
+                } else rendered.assign(data.data()+line.begin, data.data()+line.term_end);
 
                 if (match_line && a.replacement.empty() && !a.sopt.invert_match && color_enabled(a)) {
                     std::string colored; std::uint64_t cur=line.begin;

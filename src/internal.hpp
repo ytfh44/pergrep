@@ -51,6 +51,7 @@ struct LoadedFile { FileInfo info; std::string data; };
 
 struct UnicodeProperty {
     enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit, AsciiDigit, AsciiWord, AsciiSpace };
+    Kind kind = Kind::Binary;
     std::int32_t value = 0;
     bool negated = false;
 };
