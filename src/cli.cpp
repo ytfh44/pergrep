@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -53,7 +54,26 @@ struct Args {
     uint64_t max_count=0,max_filesize=0;int max_depth=-1,threads=0,max_columns=0;bool help=false,short_help=false,version=false,type_list=false,pcre2_version=false,debug=false,trace=false,max_count_set=false,context_sep_disabled=false,no_config=false;int unrestricted=0;
 };
 
-[[noreturn]] void die(std::string s,int code=2){std::cerr<<"pergrep: "<<s<<"\n";std::exit(code);}uint64_t num(std::string_view s){uint64_t mult=1;if(!s.empty()){char c=s.back();if(c=='K'||c=='k'){mult=1024;s.remove_suffix(1);}else if(c=='M'||c=='m'){mult=1024ull*1024;s.remove_suffix(1);}else if(c=='G'||c=='g'){mult=1024ull*1024*1024;s.remove_suffix(1);}}uint64_t x=0;auto [p,e]=std::from_chars(s.data(),s.data()+s.size(),x);if(e!=std::errc()||p!=s.data()+s.size())die("invalid numeric value");return x*mult;}
+[[noreturn]] void die(std::string s,int code=2){std::cerr<<"pergrep: "<<s<<"\n";std::exit(code);}
+uint64_t num(std::string_view s){
+    uint64_t mult=1;
+    if(!s.empty()){
+        char c=s.back();
+        if(c=='K'||c=='k'){mult=1024;s.remove_suffix(1);}
+        else if(c=='M'||c=='m'){mult=1024ull*1024;s.remove_suffix(1);}
+        else if(c=='G'||c=='g'){mult=1024ull*1024*1024;s.remove_suffix(1);}
+    }
+    uint64_t x=0;
+    auto [p,e]=std::from_chars(s.data(),s.data()+s.size(),x);
+    if(e!=std::errc()||p!=s.data()+s.size())die("invalid numeric value");
+    if(mult>1&&x>std::numeric_limits<uint64_t>::max()/mult)die("invalid numeric value");
+    return x*mult;
+}
+int num_int(std::string_view s){
+    uint64_t v=num(s);
+    if(v>static_cast<uint64_t>(std::numeric_limits<int>::max()))die("invalid numeric value");
+    return static_cast<int>(v);
+}
 
 const std::unordered_map<std::string,std::vector<std::string>>& type_map(){ return pergrep_cli::default_types(); }
 
@@ -87,24 +107,24 @@ bool globmatch(std::string pat,std::string path,bool ci){if(ci){std::transform(p
 std::string need(int&k,int argc,char**argv,std::string_view opt,std::optional<std::string>attached={}){if(attached)return*attached;if(++k>=argc)die("option requires a value: "+std::string(opt));return argv[k];}
 void parse_long(Args&a,std::string arg,int&k,int argc,char**argv){auto eq=arg.find('=');std::string name=arg.substr(2,eq==std::string::npos?std::string::npos:eq-2);std::optional<std::string>val;if(eq!=std::string::npos)val=arg.substr(eq+1);auto v=[&](){return need(k,argc,argv,"--"+name,val);};
 #define L(n,code) if(name==n){code;return;}
-    L("after-context",a.after=(int)num(v());a.after_explicit=true;a.context_seen=true) L("before-context",a.before=(int)num(v());a.before_explicit=true;a.context_seen=true) L("context",{int z=(int)num(v());if(!a.after_explicit)a.after=z;if(!a.before_explicit)a.before=z;a.context_seen=true;})
+    L("after-context",a.after=num_int(v());a.after_explicit=true;a.context_seen=true) L("before-context",a.before=num_int(v());a.before_explicit=true;a.context_seen=true) L("context",{int z=num_int(v());if(!a.after_explicit)a.after=z;if(!a.before_explicit)a.before=z;a.context_seen=true;})
     L("binary",a.binary=true) L("no-binary",a.binary=false) L("block-buffered",a.block_buffered=true) L("no-block-buffered",a.block_buffered=false) L("byte-offset",a.byte_offset=true) L("no-byte-offset",a.byte_offset=false)
     L("case-sensitive",a.popt.case_mode=CaseMode::Sensitive) L("color",a.color=v()) L("colors",a.color_specs.push_back(v())) L("column",a.column=true;a.line_number=true) L("no-column",a.column=false)
     L("context-separator",a.context_sep=v();a.context_sep_disabled=false) L("no-context-separator",a.context_sep_disabled=true) L("count",if(!a.files_mode){a.count=true;a.count_matches=false;a.files_with=false;a.files_without=false;}) L("count-matches",if(!a.files_mode){a.count_matches=true;a.count=false;a.files_with=false;a.files_without=false;}) L("crlf",a.popt.crlf=true;a.null_data=false) L("no-crlf",a.popt.crlf=false)
-    L("debug",a.debug=true) L("dfa-size-limit",(void)v()) L("encoding",a.encoding=v()) L("engine",a.engine=v();a.popt.engine=a.engine=="pcre2"?Engine::Pcre2Compat:a.engine=="auto"?Engine::Auto:Engine::Default)
+    L("debug",a.debug=true) L("dfa-size-limit",(void)v()) L("encoding",a.encoding=v()) L("engine",{a.engine=v();if(a.engine=="default")a.popt.engine=Engine::Default;else if(a.engine=="pcre2")a.popt.engine=Engine::Pcre2Compat;else if(a.engine=="auto")a.popt.engine=Engine::Auto;else die("unrecognized engine: "+a.engine);})
     L("field-context-separator",a.field_context_sep=v()) L("field-match-separator",a.field_match_sep=v()) L("files",a.files_mode=true) L("files-with-matches",if(!a.files_mode){a.files_with=true;a.files_without=false;a.count=false;a.count_matches=false;}) L("files-without-match",if(!a.files_mode){a.files_without=true;a.files_with=false;a.count=false;a.count_matches=false;})
     L("fixed-strings",a.popt.kind=PatternKind::Fixed) L("no-fixed-strings",a.popt.kind=PatternKind::Regex) L("follow",a.follow=true) L("no-follow",a.follow=false) L("generate",a.generate=v()) L("glob",a.globs.push_back(v())) L("glob-case-insensitive",a.glob_ci=true) L("no-glob-case-insensitive",a.glob_ci=false)
     L("heading",a.heading=true;a.no_heading=false) L("no-heading",a.no_heading=true;a.heading=false) L("help",a.help=true) L("hidden",a.hidden=true) L("no-hidden",a.hidden=false) L("hostname-bin",a.hostname_bin=v()) L("hyperlink-format",a.hyperlink_format=v()) L("iglob",a.iglobs.push_back(v()))
     L("ignore-case",a.popt.case_mode=CaseMode::Insensitive) L("no-ignore-case",a.popt.case_mode=CaseMode::Sensitive) L("ignore-file",a.ignore_files.push_back(v())) L("ignore-file-case-insensitive",a.ignore_file_ci=true) L("no-ignore-file-case-insensitive",a.ignore_file_ci=false) L("include-zero",a.include_zero=true) L("no-include-zero",a.include_zero=false) L("invert-match",a.sopt.invert_match=true) L("no-invert-match",a.sopt.invert_match=false)
     L("json",a.json=true) L("no-json",a.json=false) L("line-buffered",a.line_buffered=true) L("no-line-buffered",a.line_buffered=false) L("line-number",a.line_number=true) L("no-line-number",a.line_number=false) L("line-regexp",a.popt.line=true;a.popt.word=false) L("no-line-regexp",a.popt.line=false)
-    L("max-columns",a.max_columns=(int)num(v())) L("max-columns-preview",a.max_columns_preview=true) L("no-max-columns-preview",a.max_columns_preview=false) L("max-count",a.max_count=num(v());a.max_count_set=true) L("max-depth",a.max_depth=(int)num(v())) L("max-filesize",a.max_filesize=num(v()))
+    L("max-columns",a.max_columns=num_int(v())) L("max-columns-preview",a.max_columns_preview=true) L("no-max-columns-preview",a.max_columns_preview=false) L("max-count",a.max_count=num(v());a.max_count_set=true) L("max-depth",a.max_depth=num_int(v())) L("max-filesize",a.max_filesize=num(v()))
     L("mmap",) L("no-mmap",) L("multiline",a.popt.multiline=true;a.stop_on_nonmatch=false) L("no-multiline",a.popt.multiline=false) L("multiline-dotall",a.popt.dotall=true) L("no-multiline-dotall",a.popt.dotall=false) L("no-config",a.no_config=true)
     L("no-ignore",a.no_ignore=true) L("ignore",a.no_ignore=false) L("no-ignore-dot",a.no_ignore_dot=true) L("ignore-dot",a.no_ignore_dot=false) L("no-ignore-exclude",a.no_ignore_exclude=true) L("ignore-exclude",a.no_ignore_exclude=false) L("no-ignore-files",a.no_ignore_files=true) L("ignore-files",a.no_ignore_files=false) L("no-ignore-global",a.no_ignore_global=true) L("ignore-global",a.no_ignore_global=false) L("no-ignore-messages",a.no_ignore_messages=true) L("ignore-messages",a.no_ignore_messages=false) L("no-ignore-parent",a.no_ignore_parent=true) L("ignore-parent",a.no_ignore_parent=false) L("no-ignore-vcs",a.no_ignore_vcs=true) L("ignore-vcs",a.no_ignore_vcs=false)
     L("no-messages",a.no_messages=true) L("messages",a.no_messages=false) L("no-require-git",a.no_require_git=true) L("require-git",a.no_require_git=false) L("no-unicode",a.popt.unicode=false) L("unicode",a.popt.unicode=true) L("null",a.null_out=true) L("no-null",a.null_out=false) L("null-data",a.null_data=true;a.text=true;a.popt.crlf=false) L("no-null-data",a.null_data=false) L("one-file-system",a.one_file_system=true) L("no-one-file-system",a.one_file_system=false)
     L("only-matching",a.only_matching=true) L("no-only-matching",a.only_matching=false) L("path-separator",a.path_sep=v()) L("passthru",a.passthru=true;a.context_seen=false) L("no-passthru",a.passthru=false) L("pcre2",a.popt.engine=Engine::Pcre2Compat;a.engine="pcre2") L("no-pcre2",a.popt.engine=Engine::Default;a.engine="default") L("pcre2-version",a.pcre2_version=true)
     L("pre",a.pre=v()) L("pre-glob",a.pre_globs.push_back(v())) L("pretty",a.pretty=true;a.color="always";a.heading=true;a.line_number=true) L("quiet",a.quiet=true) L("no-quiet",a.quiet=false) L("regex-size-limit",(void)v()) L("regexp",a.patterns.push_back(v())) L("file",a.pattern_files.push_back(v()))
     L("replace",a.replacement=v()) L("search-zip",a.search_zip=true) L("no-search-zip",a.search_zip=false) L("smart-case",a.popt.case_mode=CaseMode::Smart) L("no-smart-case",a.popt.case_mode=CaseMode::Sensitive)
-    L("sort",a.sort=v()) L("sortr",a.sort="reverse:"+v()) L("stats",a.stats=true) L("no-stats",a.stats=false) L("stop-on-nonmatch",a.stop_on_nonmatch=true;a.popt.multiline=false) L("no-stop-on-nonmatch",a.stop_on_nonmatch=false) L("text",a.text=true) L("no-text",a.text=false) L("threads",a.threads=(int)num(v())) L("trace",a.trace=true) L("trim",a.trim=true) L("no-trim",a.trim=false)
+    L("sort",a.sort=v()) L("sortr",a.sort="reverse:"+v()) L("stats",a.stats=true) L("no-stats",a.stats=false) L("stop-on-nonmatch",a.stop_on_nonmatch=true;a.popt.multiline=false) L("no-stop-on-nonmatch",a.stop_on_nonmatch=false) L("text",a.text=true) L("no-text",a.text=false) L("threads",a.threads=num_int(v())) L("trace",a.trace=true) L("trim",a.trim=true) L("no-trim",a.trim=false)
     L("type",a.types.push_back(v())) L("type-not",a.type_not.push_back(v())) L("type-add",a.type_add.push_back(v())) L("type-clear",a.type_clear.push_back(v())) L("type-list",a.type_list=true) L("unrestricted",++a.unrestricted;a.no_ignore=true;if(a.unrestricted>=2)a.hidden=true;if(a.unrestricted>=3)a.binary=true)
     L("version",a.version=true) L("vimgrep",a.vimgrep=true;a.line_number=true;a.column=true) L("with-filename",a.with_filename=true;a.no_filename=false) L("no-filename",a.no_filename=true;a.with_filename=false) L("word-regexp",a.popt.word=true;a.popt.line=false) L("no-word-regexp",a.popt.word=false)
     L("auto-hybrid-regex",a.popt.engine=Engine::Auto;a.engine="auto") L("no-auto-hybrid-regex",a.popt.engine=Engine::Default;a.engine="default") L("no-pcre2-unicode",a.popt.unicode=false) L("pcre2-unicode",a.popt.unicode=true) L("sort-files",a.sort="path") L("no-sort-files",a.sort.clear())
@@ -112,8 +132,8 @@ void parse_long(Args&a,std::string arg,int&k,int argc,char**argv){auto eq=arg.fi
 #undef L
 }
 void parse_short(Args&a,std::string arg,int&k,int argc,char**argv){for(size_t j=1;j<arg.size();++j){char c=arg[j];auto attached=[&]()->std::optional<std::string>{if(j+1<arg.size()){auto s=arg.substr(j+1);j=arg.size();return s;}return{};};switch(c){
-case'A':a.after=(int)num(need(k,argc,argv,"-A",attached()));a.after_explicit=true;a.context_seen=true;return;case'B':a.before=(int)num(need(k,argc,argv,"-B",attached()));a.before_explicit=true;a.context_seen=true;return;case'C':{int z=(int)num(need(k,argc,argv,"-C",attached()));if(!a.after_explicit)a.after=z;if(!a.before_explicit)a.before=z;a.context_seen=true;return;}
-case'a':a.text=true;break;case'b':a.byte_offset=true;break;case'c':if(!a.files_mode){a.count=true;a.count_matches=false;a.files_with=false;a.files_without=false;}break;case'0':a.null_out=true;break;case'd':a.max_depth=(int)num(need(k,argc,argv,"-d",attached()));return;case'E':a.encoding=need(k,argc,argv,"-E",attached());return;case'e':a.patterns.push_back(need(k,argc,argv,"-e",attached()));return;case'f':a.pattern_files.push_back(need(k,argc,argv,"-f",attached()));return;case'F':a.popt.kind=PatternKind::Fixed;break;case'g':a.globs.push_back(need(k,argc,argv,"-g",attached()));return;case'h':a.short_help=true;break;case'H':a.with_filename=true;a.no_filename=false;break;case'I':a.no_filename=true;a.with_filename=false;break;case'i':a.popt.case_mode=CaseMode::Insensitive;break;case'j':a.threads=(int)num(need(k,argc,argv,"-j",attached()));return;case'l':if(!a.files_mode){a.files_with=true;a.files_without=false;a.count=false;a.count_matches=false;}break;case'L':a.follow=true;break;case'm':a.max_count=num(need(k,argc,argv,"-m",attached()));a.max_count_set=true;return;case'M':a.max_columns=(int)num(need(k,argc,argv,"-M",attached()));return;case'n':a.line_number=true;break;case'N':a.line_number=false;break;case'o':a.only_matching=true;break;case'p':a.pretty=true;a.color="always";a.heading=true;a.line_number=true;break;case'P':a.popt.engine=Engine::Pcre2Compat;a.engine="pcre2";break;case'q':a.quiet=true;break;case'r':a.replacement=need(k,argc,argv,"-r",attached());return;case's':a.popt.case_mode=CaseMode::Sensitive;break;case'S':a.popt.case_mode=CaseMode::Smart;break;case't':a.types.push_back(need(k,argc,argv,"-t",attached()));return;case'T':a.type_not.push_back(need(k,argc,argv,"-T",attached()));return;case'u':++a.unrestricted;a.no_ignore=true;if(a.unrestricted>=2)a.hidden=true;if(a.unrestricted>=3)a.binary=true;break;case'U':a.popt.multiline=true;a.stop_on_nonmatch=false;break;case'v':a.sopt.invert_match=true;break;case'V':a.version=true;break;case'w':a.popt.word=true;a.popt.line=false;break;case'x':a.popt.line=true;a.popt.word=false;break;case'z':a.search_zip=true;break;default:die(std::string("unrecognized flag -")+c);}}
+case'A':a.after=num_int(need(k,argc,argv,"-A",attached()));a.after_explicit=true;a.context_seen=true;return;case'B':a.before=num_int(need(k,argc,argv,"-B",attached()));a.before_explicit=true;a.context_seen=true;return;case'C':{int z=num_int(need(k,argc,argv,"-C",attached()));if(!a.after_explicit)a.after=z;if(!a.before_explicit)a.before=z;a.context_seen=true;return;}
+case'a':a.text=true;break;case'b':a.byte_offset=true;break;case'c':if(!a.files_mode){a.count=true;a.count_matches=false;a.files_with=false;a.files_without=false;}break;case'0':a.null_out=true;break;case'd':a.max_depth=num_int(need(k,argc,argv,"-d",attached()));return;case'E':a.encoding=need(k,argc,argv,"-E",attached());return;case'e':a.patterns.push_back(need(k,argc,argv,"-e",attached()));return;case'f':a.pattern_files.push_back(need(k,argc,argv,"-f",attached()));return;case'F':a.popt.kind=PatternKind::Fixed;break;case'g':a.globs.push_back(need(k,argc,argv,"-g",attached()));return;case'h':a.short_help=true;break;case'H':a.with_filename=true;a.no_filename=false;break;case'I':a.no_filename=true;a.with_filename=false;break;case'i':a.popt.case_mode=CaseMode::Insensitive;break;case'j':a.threads=num_int(need(k,argc,argv,"-j",attached()));return;case'l':if(!a.files_mode){a.files_with=true;a.files_without=false;a.count=false;a.count_matches=false;}break;case'L':a.follow=true;break;case'm':a.max_count=num(need(k,argc,argv,"-m",attached()));a.max_count_set=true;return;case'M':a.max_columns=num_int(need(k,argc,argv,"-M",attached()));return;case'n':a.line_number=true;break;case'N':a.line_number=false;break;case'o':a.only_matching=true;break;case'p':a.pretty=true;a.color="always";a.heading=true;a.line_number=true;break;case'P':a.popt.engine=Engine::Pcre2Compat;a.engine="pcre2";break;case'q':a.quiet=true;break;case'r':a.replacement=need(k,argc,argv,"-r",attached());return;case's':a.popt.case_mode=CaseMode::Sensitive;break;case'S':a.popt.case_mode=CaseMode::Smart;break;case't':a.types.push_back(need(k,argc,argv,"-t",attached()));return;case'T':a.type_not.push_back(need(k,argc,argv,"-T",attached()));return;case'u':++a.unrestricted;a.no_ignore=true;if(a.unrestricted>=2)a.hidden=true;if(a.unrestricted>=3)a.binary=true;break;case'U':a.popt.multiline=true;a.stop_on_nonmatch=false;break;case'v':a.sopt.invert_match=true;break;case'V':a.version=true;break;case'w':a.popt.word=true;a.popt.line=false;break;case'x':a.popt.line=true;a.popt.word=false;break;case'z':a.search_zip=true;break;default:die(std::string("unrecognized flag -")+c);}}
 }
 
 Args parse(int argc,char**argv){Args a;bool positional=false;for(int k=1;k<argc;++k){std::string x=argv[k];if(!positional&&x=="--"){positional=true;continue;}if(!positional&&x.rfind("--",0)==0)parse_long(a,x,k,argc,argv);else if(!positional&&x.size()>1&&x[0]=='-')parse_short(a,x,k,argc,argv);else{if(a.files_mode)a.paths.push_back(x);else if(a.patterns.empty()&&a.pattern_files.empty())a.patterns.push_back(x);else a.paths.push_back(x);}}for(auto&pf:a.pattern_files){std::istream*in=nullptr;std::ifstream f;if(pf=="-")in=&std::cin;else{f.open(to_path(pf));if(!f)die("cannot open pattern file: "+pf);in=&f;}std::string s;while(std::getline(*in,s))a.patterns.push_back(s);}if(a.context_seen)a.passthru=false;if(a.only_matching&&a.count){a.count=false;a.count_matches=true;}if(a.paths.empty()){if(!pergrep_cli::platform::isatty_stdin()){a.paths.push_back("-");a.stdin_haystack=true;}else a.paths.push_back(".");}a.sopt.include_binary=a.text||a.binary||a.unrestricted>=3;if(a.files_with){a.sopt.files_with_matches=true;}if(a.files_without){a.sopt.files_without_match=true;}return a;}
@@ -565,12 +585,20 @@ std::string replace_line(std::string_view data, const LineRecord& line, const st
     std::string out;
     std::uint64_t cursor = line.begin;
     for (const auto& m : matches) {
-        if (m.start < line.begin || m.start > line.end || m.end > line.term_end || m.start < cursor) continue;
-        out.append(data.substr(cursor, m.start - cursor));
-        out += interpolate_replacement(repl, data, m);
-        cursor = m.end;
+        if (m.end < cursor) continue;
+        if (m.start >= line.term_end) break;
+        if (m.start < cursor) {
+            cursor = std::max(cursor, m.end);
+        } else {
+            out.append(data.substr(cursor, m.start - cursor));
+            out += interpolate_replacement(repl, data, m);
+            cursor = m.end;
+        }
+        if (cursor >= line.term_end) break;
     }
-    out.append(data.substr(cursor, line.term_end - cursor));
+    if (cursor < line.term_end) {
+        out.append(data.substr(cursor, line.term_end - cursor));
+    }
     return out;
 }
 
@@ -660,11 +688,6 @@ int main(int argc, char** argv) {
         auto start = std::chrono::steady_clock::now();
         std::vector<std::vector<Match>> perpat;
         SearchOptions core_opt = a.sopt;
-        core_opt.invert_match = false;
-        core_opt.files_with_matches = false;
-        core_opt.files_without_match = false;
-        core_opt.max_matches = 0;
-        core_opt.include_binary = true;
         core_opt.record_separator = a.null_data ? '\0' : '\n';
         if (!(a.max_count_set && a.max_count == 0)) {
             for (auto& ps : a.patterns) {
@@ -705,7 +728,7 @@ int main(int argc, char** argv) {
         if (a.json && (a.files_mode || a.files_with || a.files_without || a.count || a.count_matches))
             die("--json cannot be combined with file/count summary output modes");
 
-        std::uint64_t json_searches = 0, json_searches_with_match = 0, json_bytes = 0, json_matched_lines = 0, json_matches = 0;
+        std::uint64_t json_searches = 0, json_searches_with_match = 0, json_bytes = 0, json_matched_lines = 0, json_matches = 0, json_bytes_printed = 0;
         auto print_path_field = [&](std::string_view path) {
             std::cout << ansi_path(path,a);
             if (a.null_out) std::cout.put('\0'); else std::cout << a.field_match_sep;
@@ -733,7 +756,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> selected(lines.size(), 0);
             for (std::size_t i = 0; i < lines.size(); ++i) {
                 bool matched = !line_matches[i].empty();
-                selected[i] = static_cast<std::uint8_t>(a.sopt.invert_match ? !matched : matched);
+                selected[i] = static_cast<std::uint8_t>(matched ? 1 : 0);
             }
             if (a.stop_on_nonmatch) {
                 bool seen_match = false;
@@ -783,15 +806,27 @@ int main(int argc, char** argv) {
                 if (!hit) continue;
                 ++json_searches; ++json_searches_with_match; json_bytes += data.size(); json_matched_lines += selected_count;
                 std::uint64_t file_matches = 0;
-                for (std::size_t i = 0; i < selected.size(); ++i) if (selected[i]) file_matches += line_matches[i].size();
-                json_matches += a.sopt.invert_match ? selected_count : file_matches;
+                if (a.sopt.invert_match) {
+                    file_matches = selected_count;
+                } else {
+                    for (const auto& m : ms) {
+                        auto li = line_for_offset(lines, m.start);
+                        if (li < selected.size() && selected[li]) ++file_matches;
+                    }
+                }
+                json_matches += file_matches;
+                std::uint64_t file_bytes_printed = 0;
+                for (std::size_t i = 0; i < lines.size(); ++i) {
+                    if (selected[i]) file_bytes_printed += (lines[i].term_end - lines[i].begin);
+                }
+                json_bytes_printed += file_bytes_printed;
                 auto path = display_path(idx->files()[fid].path, a);
                 std::cout << "{\"type\":\"begin\",\"data\":{\"path\":" << json_data(path) << "}}\n";
                 for (std::size_t i = 0; i < lines.size(); ++i) {
                     if (!selected[i]) continue;
                     const auto& line = lines[i];
-                    std::cout << "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"" << json_escape(path)
-                              << "\"},\"lines\":" << json_data(std::string_view(data).substr(line.begin, line.term_end-line.begin))
+                    std::cout << "{\"type\":\"match\",\"data\":{\"path\":" << json_data(path)
+                              << ",\"lines\":" << json_data(std::string_view(data).substr(line.begin, line.term_end-line.begin))
                               << ",\"line_number\":" << (i+1) << ",\"absolute_offset\":" << line.begin << ",\"submatches\":[";
                     bool first = true;
                     if (!a.sopt.invert_match) for (const Match* mp : line_matches[i]) {
@@ -809,8 +844,8 @@ int main(int argc, char** argv) {
                 std::cout << "{\"type\":\"end\",\"data\":{\"path\":" << json_data(path)
                           << ",\"binary_offset\":null,\"stats\":{\"elapsed\":{\"secs\":0,\"nanos\":0,\"human\":\"0.000000s\"},"
                              "\"searches\":1,\"searches_with_match\":1,\"bytes_searched\":" << data.size()
-                          << ",\"bytes_printed\":0,\"matched_lines\":" << selected_count << ",\"matches\":"
-                          << (a.sopt.invert_match ? selected_count : file_matches) << "}}}\n";
+                          << ",\"bytes_printed\":" << file_bytes_printed << ",\"matched_lines\":" << selected_count << ",\"matches\":"
+                          << file_matches << "}}}\n";
                 any = true;
                 continue;
             }
@@ -821,7 +856,6 @@ int main(int argc, char** argv) {
                 for (const auto& m : ms) {
                     auto li = line_for_offset(lines, m.start);
                     if (li >= selected.size() || !selected[li]) continue;
-                    if(m.start==m.end) continue;
                     auto path = display_path(idx->files()[fid].path, a);
                     if (show_filename) print_path_field(path);
                     if (a.line_number) std::cout << ansi_line(std::to_string(li + 1),a) << a.field_match_sep;
@@ -918,13 +952,13 @@ int main(int argc, char** argv) {
                       << "\",\"nanos\":" << nanos << ",\"secs\":" << secs << "},\"stats\":{\"elapsed\":{\"human\":\"" << human.str()
                       << "\",\"nanos\":" << nanos << ",\"secs\":" << secs << "},\"searches\":" << json_searches
                       << ",\"searches_with_match\":" << json_searches_with_match << ",\"bytes_searched\":" << json_bytes
-                      << ",\"bytes_printed\":0,\"matched_lines\":" << json_matched_lines << ",\"matches\":" << json_matches << "}}}\n";
+                      << ",\"bytes_printed\":" << json_bytes_printed << ",\"matched_lines\":" << json_matched_lines << ",\"matches\":" << json_matches << "}}}\n";
         }
 
         if (a.stats && !a.files_with && !a.files_without && !a.count && !a.count_matches && !a.files_mode) {
             auto dt=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-            std::uint64_t fsrch=0,fmatch=0,mlines=0,mcnt=0,bsearch=0;for(std::size_t fid=0;fid<allowed.size();++fid)if(allowed[fid]){++fsrch;bsearch+=idx->files()[fid].size;if(!byfile[fid].empty()){++fmatch;mcnt+=byfile[fid].size();auto ls=split_lines(idx->content(fid),a.null_data?'\0':'\n');std::unordered_set<std::size_t>x;for(auto&m:byfile[fid])x.insert(line_for_offset(ls,m.start));mlines+=x.size();}}
-            std::cout << mcnt << " matches\n" << mlines << " matched lines\n" << fmatch << " files contained matches\n" << fsrch << " files searched\n" << 0 << " bytes printed\n" << bsearch << " bytes searched\n" << std::fixed << std::setprecision(6) << dt << " seconds spent searching\n";
+            std::uint64_t fsrch=0,fmatch=0,mlines=0,mcnt=0,bsearch=0,bprinted=0;for(std::size_t fid=0;fid<allowed.size();++fid)if(allowed[fid]){++fsrch;bsearch+=idx->files()[fid].size;if(!byfile[fid].empty()){++fmatch;mcnt+=byfile[fid].size();auto ls=split_lines(idx->content(fid),a.null_data?'\0':'\n');std::unordered_set<std::size_t>x;for(auto&m:byfile[fid]){auto li=line_for_offset(ls,m.start);if(x.insert(li).second){bprinted+=(ls[li].term_end-ls[li].begin);}}mlines+=x.size();}}
+            std::cout << mcnt << " matches\n" << mlines << " matched lines\n" << fmatch << " files contained matches\n" << fsrch << " files searched\n" << bprinted << " bytes printed\n" << bsearch << " bytes searched\n" << std::fixed << std::setprecision(6) << dt << " seconds spent searching\n";
         }
         return any ? 0 : 1;
     } catch (const std::exception& e) {
