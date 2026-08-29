@@ -34,8 +34,12 @@ DecodedRune decode_prev(std::string_view s, std::size_t pos) {
     return {cp, static_cast<std::size_t>(i), true};
 }
 bool unicode_word_cp(UChar32 cp) {
-    return cp == '_' || u_isalnum(cp) || u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
-           u_charType(cp) == U_NON_SPACING_MARK || u_charType(cp) == U_COMBINING_SPACING_MARK;
+    return u_isalnum(cp) ||
+           u_charType(cp) == U_CONNECTOR_PUNCTUATION ||
+           u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
+           u_charType(cp) == U_NON_SPACING_MARK ||
+           u_charType(cp) == U_COMBINING_SPACING_MARK ||
+           u_charType(cp) == U_ENCLOSING_MARK;
 }
 bool unicode_icase_equal_at(std::string_view s, std::string_view q, std::size_t pos, std::size_t* end = nullptr) {
     std::size_t sp = pos, qp = 0;

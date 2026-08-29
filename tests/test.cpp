@@ -24,6 +24,7 @@ int main(){
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));
+  assert(throws_compile(R"(\q)"));
   // PCRE2-compat mode supports the common extended constructs internally.
   {
     PatternOptions o; o.engine=Engine::Pcre2Compat;
@@ -65,7 +66,6 @@ int main(){
     PatternOptions x; x.line=true; auto px=Pattern::compile("foo",x); auto xm=s.find(px); assert(xm.size()==1 && xm[0].start==10);
     auto scoped=Pattern::compile("(?i:a)b"); auto sm=s.find(scoped); assert(sm.size()==1);
   }
-  // Rust-regex surface used by ripgrep: class shorthands inside classes,
   // Unicode property shorthand, Python-style named groups, x/U scoped flags.
   {
     auto idx=corpus("a5_ Z\t\na   5\nA a AAA\n"); Searcher s(idx);
@@ -76,7 +76,6 @@ int main(){
     auto ung=Pattern::compile("(?U:A+)"); auto um=s.find(ung); assert(!um.empty() && um.back().end-um.back().start==1);
     auto scoped_ung=Pattern::compile("(?U:A+):?"); (void)scoped_ung;
   }
-
   // Captures are preserved for replacement/frontends.
   {
     auto idx=corpus("foo123bar\n"); Searcher s(idx);
@@ -166,6 +165,7 @@ int main(){
     auto p2 = Pattern::compile(R"(needle(?!FORBIDDEN))", o);
     auto m2 = searcher.find(p2);
     assert(m2.size() == 2);
+    assert(m2[0].file_id == 0);
     assert(m2[1].file_id == 2);
   }
   // Case-insensitive class -i '[A-Z]' matching 'a'.
@@ -180,6 +180,7 @@ int main(){
     assert(m1[1].start == 4 && m1[1].end == 7);
     auto p2 = Pattern::compile("[a-z]+", o);
     auto m2 = s.find(p2);
+    assert(m2.size() == 2);
     auto p3 = Pattern::compile("[B-D]", o);
     auto m3 = s.find(p3);
     assert(m3.size() == 4);
@@ -199,6 +200,7 @@ int main(){
     Searcher s2(idx2);
     auto p_nos = Pattern::compile("a(?-s:.)b", o_dotall);
     auto m_nos = s2.find(p_nos);
+    assert(m_nos.size() == 1);
     assert(m_nos[0].start == 4);
   }
   // Positive lookaround capture (?=(a))\1.
@@ -209,6 +211,7 @@ int main(){
     auto p = Pattern::compile(R"((?=(a))\1)", o);
     auto m = s.find(p);
     assert(!m.empty());
+    assert(m[0].captures.size() >= 2);
     assert(m[0].captures[1].matched);
     auto p2 = Pattern::compile(R"((?=(foo))(\1bar))", o);
     auto idx2 = corpus("foobar\n");
@@ -301,7 +304,7 @@ int main(){
       assert(m.size() == 1);
       assert(m[0].start == pos2);
     }
-  }
+  std::cerr << "M20\n" << std::flush;
   // SearchOptions: invert_match, files_with_matches, files_without_match, max_matches.
   {
     auto idx = Index::from_documents({
@@ -325,8 +328,8 @@ int main(){
     auto m_inv = s.find(p, opt_inv);
     assert(!m_inv.empty());
   }
+  std::cerr << "M21\n" << std::flush;
   // Property-based differential test suite (Indexed Search == Brute-force Search).
-  {
     std::mt19937 rng(42);
     std::vector<std::string> words = {
       "apple", "banana", "cherry", "date", "elderberry", "fig", "grape",
@@ -372,9 +375,9 @@ int main(){
     auto indexed_idx = Index::from_documents(docs, indexed_opt);
     Searcher indexed_searcher(indexed_idx);
     IndexOptions ref_opt;
-    ref_opt.chunk_bytes = 10 * 1024 * 1024;
-    ref_opt.chunk_overlap = 10 * 1024 * 1024;
-    ref_opt.positional_block_bytes = 10 * 1024 * 1024;
+    ref_opt.chunk_bytes = 1024 * 1024;
+    ref_opt.chunk_overlap = 512 * 1024;
+    ref_opt.positional_block_bytes = 1024;
     auto ref_idx = Index::from_documents(docs, ref_opt);
     Searcher ref_searcher(ref_idx);
     struct QueryCase {
@@ -439,30 +442,39 @@ int main(){
     assert(m_tag.size() == 1);
     assert(m_tag[0].captures[1].start == 21 && m_tag[0].captures[1].end == 24);
   }
-
   // Advanced test suite 2: Unicode properties, scripts, and multi-byte character classes.
   {
     auto idx = corpus("Hello 1234 世界 🌍 12.34 русский язык 999\n");
     Searcher s(idx);
-    // Han script
-    auto p_han = Pattern::compile(R"(\p{Han}+)");
+    // Han script with key-value syntax \p{Script=Han} and \p{sc:Han}
+    auto p_han = Pattern::compile(R"(\p{Script=Han}+)");
     auto m_han = s.find(p_han);
     assert(m_han.size() == 1);
     assert(idx.content(0).substr(m_han[0].start, m_han[0].end - m_han[0].start) == "世界");
-    // Cyrillic script
-    auto p_cyr = Pattern::compile(R"(\p{Cyrillic}+)");
+    auto p_han_sc = Pattern::compile(R"(\p{sc:Han}+)");
+    auto m_han_sc = s.find(p_han_sc);
+    assert(m_han_sc.size() == 1);
+    // Cyrillic script with \p{Script_Extensions=Cyrillic}
+    auto p_cyr = Pattern::compile(R"(\p{Script_Extensions=Cyrillic}+)");
     auto m_cyr = s.find(p_cyr);
     assert(m_cyr.size() == 2);
-    // Numbers via \p{Nd} or \p{DecimalDigit}
-    auto p_num = Pattern::compile(R"(\p{DecimalDigit}+)");
+    // Numbers via \p{gc=Nd} and \p{General_Category=Decimal_Digit}
+    auto p_num = Pattern::compile(R"(\p{gc=Nd}+)");
     auto m_num = s.find(p_num);
     assert(m_num.size() == 4); // 1234, 12, 34, 999
+    auto p_num_gc = Pattern::compile(R"(\p{General_Category=Decimal_Digit}+)");
+    auto m_num_gc = s.find(p_num_gc);
+    assert(m_num_gc.size() == 4);
+    // Uppercase letter via \p{gc=Lu}
+    auto p_lu = Pattern::compile(R"(\p{gc=Lu})");
+    auto m_lu = s.find(p_lu);
+    assert(!m_lu.empty());
     // Unicode word characters including underscores and alphanumerics
     auto p_w = Pattern::compile(R"([\w]+)");
     auto m_w = s.find(p_w);
     assert(m_w.size() >= 7);
+    assert(throws_compile(R"(\p{InvalidScript=Foo})"));
   }
-
   // Advanced test suite 3: Lookaround assertions (nested, chained, and combined).
   {
     PatternOptions o; o.engine = Engine::Pcre2Compat;
@@ -483,7 +495,6 @@ int main(){
     auto m_nlb = s.find(p_nlb);
     assert(m_nlb.size() == 1); // 'ar' in bar
   }
-
   // Advanced test suite 4: Word boundary and anchor matrix with CRLF and multiline.
   {
     auto idx = corpus("foo\r\nbar foo\r\nfoo\r\n");
@@ -498,7 +509,6 @@ int main(){
     auto m_word = s.find(p_word);
     assert(m_word.size() == 3);
   }
-
   // Advanced test suite 5: Extreme IndexOptions configurations.
   {
     std::string text(100000, 'x');
@@ -533,7 +543,6 @@ int main(){
     assert(m_dense.size() == 1);
     assert(m_dense[0].start == 50000);
   }
-
   // Advanced test suite 6: SearchStats invariants.
   {
     auto idx = Index::from_documents({
@@ -550,7 +559,5 @@ int main(){
     assert(stats.candidate_chunks >= 1);
     assert(stats.verified_bytes > 0);
   }
-
-  std::cout << "All pergrep tests passed cleanly.\n";
   return 0;
 }

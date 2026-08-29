@@ -21,11 +21,16 @@ Index::Index() = default;
 Index::Index(std::shared_ptr<Impl> i) : impl_(std::move(i)) {}
 
 Index Index::build(const fs::path& root, IndexOptions opt) {
-    if (opt.chunk_bytes < 64) throw std::runtime_error("pergrep: chunk_bytes too small (minimum 64)");
-    if (opt.positional_block_bytes < 16) throw std::runtime_error("pergrep: positional_block_bytes too small (minimum 16)");
-    if (opt.planned_qgrams < 1) throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
-    if (opt.positional_budget_ratio < 0.0) throw std::runtime_error("pergrep: positional_budget_ratio cannot be negative");
-
+    if (opt.chunk_bytes < 64 || opt.chunk_bytes > (1ULL << 30))
+        throw std::runtime_error("pergrep: chunk_bytes out of range [64, 1073741824]");
+    if (opt.positional_block_bytes < 16 || opt.positional_block_bytes > (1ULL << 20))
+        throw std::runtime_error("pergrep: positional_block_bytes out of range [16, 1048576]");
+    if (opt.chunk_overlap > opt.chunk_bytes / 2)
+        throw std::runtime_error("pergrep: chunk_overlap must be <= chunk_bytes / 2");
+    if (opt.planned_qgrams < 1 || opt.planned_qgrams > 64)
+        throw std::runtime_error("pergrep: planned_qgrams out of range [1, 64]");
+    if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
+        throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
     auto I = std::make_shared<Impl>();
     I->root = fs::weakly_canonical(root);
     std::error_code ec_root;
@@ -160,10 +165,16 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
 }
 
 Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
-    if (opt.chunk_bytes < 64) throw std::runtime_error("pergrep: chunk_bytes too small (minimum 64)");
-    if (opt.positional_block_bytes < 16) throw std::runtime_error("pergrep: positional_block_bytes too small (minimum 16)");
-    if (opt.planned_qgrams < 1) throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
-    if (opt.positional_budget_ratio < 0.0) throw std::runtime_error("pergrep: positional_budget_ratio cannot be negative");
+    if (opt.chunk_bytes < 64 || opt.chunk_bytes > (1ULL << 30))
+        throw std::runtime_error("pergrep: chunk_bytes out of range [64, 1073741824]");
+    if (opt.positional_block_bytes < 16 || opt.positional_block_bytes > (1ULL << 20))
+        throw std::runtime_error("pergrep: positional_block_bytes out of range [16, 1048576]");
+    if (opt.chunk_overlap > opt.chunk_bytes / 2)
+        throw std::runtime_error("pergrep: chunk_overlap must be <= chunk_bytes / 2");
+    if (opt.planned_qgrams < 1 || opt.planned_qgrams > 64)
+        throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
+    if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
+        throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
 
     auto I = std::make_shared<Impl>();
     I->opt = opt;
@@ -340,7 +351,7 @@ void Index::save(const fs::path& file) const {
     std::ofstream o(file, std::ios::binary | std::ios::trunc);
     if (!o) throw std::runtime_error("cannot create index: " + file.string());
     o.write("PERGREP\0", 8);
-    put(o, uint32_t(4));
+    put(o, uint32_t(5));
     puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
     put(o, uint64_t(impl_->opt.chunk_bytes));
     put(o, uint64_t(impl_->opt.chunk_overlap));
@@ -362,7 +373,13 @@ void Index::save(const fs::path& file) const {
         put(o, int64_t(f.mtime_ns));
         put(o, uint8_t(f.binary ? 1 : 0));
     }
-    putv(o, impl_->chunks);
+    put(o, uint64_t(impl_->chunks.size()));
+    for (auto const& c : impl_->chunks) {
+        put(o, uint32_t(c.file_id));
+        put(o, uint64_t(c.core_begin));
+        put(o, uint64_t(c.core_end));
+        put(o, uint64_t(c.ext_end));
+    }
     for (auto& g : impl_->groups) {
         put(o, uint8_t(g.lg));
         put(o, uint32_t(g.m));
@@ -370,7 +387,13 @@ void Index::save(const fs::path& file) const {
         putv(o, g.gids);
         putv(o, g.bits);
     }
-    putv(o, impl_->pos_desc);
+    put(o, uint64_t(impl_->pos_desc.size()));
+    for (auto const& d : impl_->pos_desc) {
+        put(o, uint64_t(d.off));
+        put(o, uint16_t(d.m));
+        put(o, uint32_t(d.mask_bytes));
+        put(o, uint32_t(d.blocks));
+    }
     putv(o, impl_->pos);
     if (!o) throw std::runtime_error("index write failed");
 }
@@ -381,7 +404,7 @@ Index Index::load(const fs::path& file) {
     i.read(magic, 8);
     if (std::memcmp(magic, "PERGREP\0", 8)) throw std::runtime_error("not a pergrep index");
     auto ver = get<uint32_t>(i);
-    if (ver != 4) throw std::runtime_error("unsupported pergrep index version");
+    if (ver != 5) throw std::runtime_error("unsupported pergrep index version");
     auto I = std::make_shared<Impl>();
 #ifdef _WIN32
     auto root_str = gets(i);
@@ -421,7 +444,16 @@ Index Index::load(const fs::path& file) {
         std::string data((std::istreambuf_iterator<char>(src)), {});
         I->loaded.push_back({f, std::move(data)});
     }
-    I->chunks = getv<Chunk>(i);
+    auto nc = get<uint64_t>(i);
+    I->chunks.reserve(nc);
+    for (uint64_t k = 0; k < nc; ++k) {
+        Chunk c;
+        c.file_id = get<uint32_t>(i);
+        c.core_begin = get<uint64_t>(i);
+        c.core_end = get<uint64_t>(i);
+        c.ext_end = get<uint64_t>(i);
+        I->chunks.push_back(c);
+    }
     for (auto& g : I->groups) {
         g.lg = get<uint8_t>(i);
         g.m = get<uint32_t>(i);
@@ -429,9 +461,19 @@ Index Index::load(const fs::path& file) {
         g.gids = getv<uint32_t>(i);
         g.bits = getv<uint64_t>(i);
     }
-    I->pos_desc = getv<detail::PosDesc>(i);
+    auto npd = get<uint64_t>(i);
+    I->pos_desc.reserve(npd);
+    for (uint64_t k = 0; k < npd; ++k) {
+        detail::PosDesc d;
+        d.off = get<uint64_t>(i);
+        d.m = get<uint16_t>(i);
+        d.mask_bytes = get<uint32_t>(i);
+        d.blocks = get<uint32_t>(i);
+        I->pos_desc.push_back(d);
+    }
     I->pos = getv<uint8_t>(i);
     return Index(I);
 }
+
 std::string version(){return "0.1.0";}
 } // namespace pergrep

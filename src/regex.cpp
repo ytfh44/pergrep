@@ -38,6 +38,24 @@ bool ascii_word(unsigned char c) { return std::isalnum(c) || c == '_'; }
 
 UnicodeProperty property_from_name(std::string name, bool negated) {
     UnicodeProperty p; p.negated = negated;
+    auto eq_pos = name.find_first_of("=:");
+    if (eq_pos != std::string::npos) {
+        std::string raw_key = name.substr(0, eq_pos);
+        std::string raw_val = name.substr(eq_pos + 1);
+        std::string k_norm, v_norm;
+        for (char c : raw_key) if (c != '_' && c != '-' && c != ' ') k_norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (char c : raw_val) if (c != '_' && c != '-' && c != ' ') v_norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (k_norm == "sc" || k_norm == "script" || k_norm == "scx" || k_norm == "scriptextensions") {
+            UErrorCode ec = U_ZERO_ERROR; UScriptCode codes[8]; int32_t count = uscript_getCode(raw_val.c_str(), codes, 8, &ec);
+            if (U_SUCCESS(ec) && count > 0) { p.kind = UnicodeProperty::Kind::Script; p.value = static_cast<std::int32_t>(codes[0]); return p; }
+            throw std::runtime_error("pergrep regex: unknown Unicode script: " + raw_val);
+        }
+        if (k_norm == "gc" || k_norm == "generalcategory" || k_norm == "category") {
+            return property_from_name(raw_val, negated);
+        }
+        name = raw_val;
+    }
     std::string norm;
     for (char c : name) {
         if (c != '_' && c != '-' && c != ' ') {
@@ -292,7 +310,34 @@ private:
             n->char_class.properties.push_back(p);
             return n;
         }
-        char out=c;if(c=='n')out='\n';else if(c=='r')out='\r';else if(c=='t')out='\t';else if(c=='f')out='\f';else if(c=='v')out='\v';else if(c=='a')out='\a';else if(c=='e')out=27;else if(c=='x'){auto hex=[](char h)->int{if(h>='0'&&h<='9')return h-'0';if(h>='a'&&h<='f')return h-'a'+10;if(h>='A'&&h<='F')return h-'A'+10;return -1;};if(i_+2>s_.size())fail("short hex escape");int a=hex(s_[i_++]),b=hex(s_[i_++]);if(a<0||b<0)fail("bad hex escape");out=static_cast<char>((a<<4)|b);}auto n=node(RegexNode::Kind::Literal);n->literal.push_back(out);return n;
+        if (c == 'n') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\n'); return n; }
+        if (c == 'r') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\r'); return n; }
+        if (c == 't') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\t'); return n; }
+        if (c == 'f') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\f'); return n; }
+        if (c == 'v') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\v'); return n; }
+        if (c == 'a') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\a'); return n; }
+        if (c == 'e') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back(27); return n; }
+        if (c == '0') { auto n = node(RegexNode::Kind::Literal); n->literal.push_back('\0'); return n; }
+        if (c == 'x') {
+            auto hex = [](char h) -> int {
+                if (h >= '0' && h <= '9') return h - '0';
+                if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+                if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+                return -1;
+            };
+            if (i_ + 2 > s_.size()) fail("short hex escape");
+            int a = hex(s_[i_++]), b = hex(s_[i_++]);
+            if (a < 0 || b < 0) fail("bad hex escape");
+            auto n = node(RegexNode::Kind::Literal);
+            n->literal.push_back(static_cast<char>((a << 4) | b));
+            return n;
+        }
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            fail("unrecognized escape sequence: \\" + std::string(1, c));
+        }
+        auto n = node(RegexNode::Kind::Literal);
+        n->literal.push_back(c);
+        return n;
     }
     UChar32 class_rune() {
         if(eat('\\')){
@@ -310,6 +355,9 @@ private:
                 int a=hex(s_[i_++]),b=hex(s_[i_++]);
                 if(a<0||b<0)fail("bad hex escape");
                 return static_cast<unsigned char>((a<<4)|b);
+            }
+            if (std::isalnum(static_cast<unsigned char>(e))) {
+                fail("unrecognized escape sequence inside character class: \\" + std::string(1, e));
             }
             return static_cast<unsigned char>(e);
         }
@@ -618,7 +666,6 @@ struct State { std::size_t pos=0; Caps caps; };
 bool literal_at(std::string_view text,std::size_t pos,std::string_view lit,bool icase,std::size_t* end) {
     std::size_t tp=pos,lp=0;while(lp<lit.size()){auto a=rune_at(text,tp),b=rune_at(lit,lp);if(!a.ok||!b.ok||!cp_eq(a.cp,b.cp,icase))return false;tp=a.next;lp=b.next;}if(end)*end=tp;return true;
 }
-
 std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,const PatternOptions&o,unsigned char sep,const State&s,int depth=0) {
     if(depth>10000) throw std::runtime_error("pergrep regex: recursion depth exceeded");
     using K=RegexNode::Kind;std::vector<State>out;bool icase=n->icase;
@@ -651,7 +698,7 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
         case K::WordBoundary:{auto l=rune_before(t,s.pos),r=rune_at(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));bool ok=lw!=rw;if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
         case K::WordStartHalf:{auto l=rune_before(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
         case K::WordEndHalf:{auto r=rune_at(t,s.pos);bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
-        case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
+        case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(next.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
         case K::Alt:for(auto&c:n->children){auto v=eval(c,t,o,sep,s,depth+1);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));}break;
         case K::Group:{auto base=s;auto v=eval(n->children[0],t,o,sep,s,depth+1);for(auto&z:v){if(static_cast<int>(z.caps.g.size())<=n->group)z.caps.g.resize(n->group+1,{SIZE_MAX,SIZE_MAX});z.caps.g[n->group]={base.pos,z.pos};}out=std::move(v);break;}
         case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a||b>t.size())break;std::size_t e;if(literal_at(t,s.pos,t.substr(a,b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
@@ -662,16 +709,17 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
             break;
         }
         case K::LookBehind:{
+            std::size_t lo = s.pos > 8192 ? s.pos - 8192 : 0;
             if(n->negative){
                 bool ok=false;
-                for(std::size_t p=0;p<=s.pos;){
+                for(std::size_t p=lo;p<=s.pos;){
                     State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
                     for(auto&z:v)if(z.pos==s.pos){ok=true;break;}
                     if(ok||p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
                 }
                 if(!ok)out.push_back(s);
             } else {
-                for(std::size_t p=0;p<=s.pos;){
+                for(std::size_t p=lo;p<=s.pos;){
                     State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
                     for(auto&z:v)if(z.pos==s.pos){State r=z;r.pos=s.pos;out.push_back(std::move(r));}
                     if(p==s.pos)break;auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
@@ -681,7 +729,8 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
         }
         case K::Repeat:{
             std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};
-            std::size_t limit=n->max==SIZE_MAX?(t.size()-s.pos+1):n->max;
+            std::size_t hard = t.size() - s.pos + 1;
+            std::size_t limit = n->max == SIZE_MAX ? std::min<std::size_t>(hard, 10000) : std::min<std::size_t>(n->max, 10000);
             for(std::size_t k=1;k<=limit;++k){
                 std::vector<State>next;
                 for(auto&st:levels){
