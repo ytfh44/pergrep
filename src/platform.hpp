@@ -47,8 +47,16 @@ inline bool is_reparse_point(const std::filesystem::path& p) {
            (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
 
-// fnmatch(3) subset sufficient for pergrep: '*' (crosses '/'), '?',
-// '[...]' character classes. No FNM_PATHNAME semantics needed.
+inline size_t utf8_char_len(unsigned char c) noexcept {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+// fnmatch(3) subset with FNM_PATHNAME semantics: '*' stops at '/',
+// '?' advances by UTF-8 code point and stops at '/', '[...]' character classes.
 inline bool fnmatch(const std::string& pat, const std::string& text) {
     const std::size_t P = pat.size(), T = text.size();
     std::vector<signed char> memo((P + 1) * (T + 1), -1);
@@ -56,23 +64,36 @@ inline bool fnmatch(const std::string& pat, const std::string& text) {
         auto& mm = memo[i * (T + 1) + j];
         if (mm != -1) return mm != 0;
         bool ok = false;
-        if (i == P) ok = j == T;
-        else if (pat[i] == '*') {
+        if (i == P) {
+            ok = (j == T);
+        } else if (pat[i] == '*') {
             if (self(self, i + 1, j)) ok = true;
-            for (std::size_t k = j; !ok && k < T; ++k)
-                if (self(self, i + 1, k + 1)) ok = true;
+            for (std::size_t k = j; !ok && k < T && text[k] != '/' && text[k] != '\\'; ) {
+                std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[k]));
+                if (k + clen > T) clen = 1;
+                k += clen;
+                if (self(self, i + 1, k)) ok = true;
+            }
         } else if (pat[i] == '?') {
-            ok = j < T && self(self, i + 1, j + 1);
+            if (j < T && text[j] != '/' && text[j] != '\\') {
+                std::size_t clen = utf8_char_len(static_cast<unsigned char>(text[j]));
+                if (j + clen > T) clen = 1;
+                ok = self(self, i + 1, j + clen);
+            }
+        } else if (pat[i] == '/' || pat[i] == '\\') {
+            ok = (j < T && (text[j] == '/' || text[j] == '\\')) && self(self, i + 1, j + 1);
         } else if (pat[i] == '[') {
             std::size_t e = pat.find(']', i + 1);
-            if (e == std::string::npos) ok = j < T && pat[i] == text[j] && self(self, i + 1, j + 1);
-            else if (j < T) {
-                bool neg = i + 1 < e && (pat[i + 1] == '!' || pat[i + 1] == '^');
+            if (e == std::string::npos) {
+                ok = (j < T && pat[i] == text[j]) && self(self, i + 1, j + 1);
+            } else if (j < T && text[j] != '/' && text[j] != '\\') {
+                bool neg = (i + 1 < e && (pat[i + 1] == '!' || pat[i + 1] == '^'));
                 std::size_t k = i + 1 + (neg ? 1 : 0);
                 bool hit = false;
                 while (k < e) {
                     if (k + 2 < e && pat[k + 1] == '-') {
-                        if (text[j] >= pat[k] && text[j] <= pat[k + 2]) hit = true;
+                        if (static_cast<unsigned char>(text[j]) >= static_cast<unsigned char>(pat[k]) &&
+                            static_cast<unsigned char>(text[j]) <= static_cast<unsigned char>(pat[k + 2])) hit = true;
                         k += 3;
                     } else {
                         if (pat[k] == text[j]) hit = true;
@@ -83,13 +104,14 @@ inline bool fnmatch(const std::string& pat, const std::string& text) {
                 ok = hit && self(self, e + 1, j + 1);
             }
         } else {
-            ok = j < T && pat[i] == text[j] && self(self, i + 1, j + 1);
+            ok = (j < T && pat[i] == text[j]) && self(self, i + 1, j + 1);
         }
         mm = ok ? 1 : 0;
         return ok;
     };
     return go(go, 0, 0);
 }
+
 
 // UTF-8 narrow string to UTF-16, for Win32 APIs that require wide strings.
 inline std::wstring utf8_to_wide(std::string_view in) {
@@ -147,24 +169,51 @@ inline std::int64_t file_time_ns(const std::filesystem::path& path, std::string_
 // Whether two paths live on the same filesystem (volume). Used for
 // --one-file-system.
 inline bool same_device(const std::filesystem::path& a, const std::filesystem::path& b) {
-    auto vol = [](const std::wstring& w) {
-        wchar_t root[4] = {0, 0, 0, 0};
-        if (w.size() >= 2 && w[1] == L':') {
-            root[0] = w[0]; root[1] = L':'; root[2] = L'\\';
-        } else {
-            // UNC path; use its server/share prefix via GetFullPathNameW.
-            DWORD n = ::GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
-            if (n == 0) return std::wstring{};
-            std::wstring full(n, L'\0');
-            ::GetFullPathNameW(w.c_str(), n, full.data(), nullptr);
-            auto pos = full.find_first_of(L"\\/", 2);
-            if (pos != std::wstring::npos) full.resize(pos);
+    auto vol = [](const std::filesystem::path& p) -> std::wstring {
+        const std::wstring& w = p.native();
+        if (w.empty()) return {};
+        DWORD n = ::GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
+        if (n == 0) return {};
+        std::wstring full(n, L'\0');
+        DWORD ret = ::GetFullPathNameW(w.c_str(), n, full.data(), nullptr);
+        if (ret == 0 || ret >= n) return {};
+        full.resize(ret);
+        for (auto& c : full) {
+            if (c == L'/') c = L'\\';
+        }
+        // Extended UNC path \\?\UNC\server\share\...
+        if (full.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+            auto pos1 = full.find(L'\\', 8);
+            if (pos1 == std::wstring::npos) return full;
+            auto pos2 = full.find(L'\\', pos1 + 1);
+            if (pos2 != std::wstring::npos) full.resize(pos2);
+            for (auto& c : full) c = static_cast<wchar_t>(::towlower(c));
             return full;
         }
-        return std::wstring(root);
+        // Extended drive path \\?\C:\...
+        if (full.rfind(L"\\\\?\\", 0) == 0 && full.size() >= 6 && full[5] == L':') {
+            std::wstring root = { static_cast<wchar_t>(::towupper(full[4])), L':', L'\\' };
+            return root;
+        }
+        // Standard drive path C:\...
+        if (full.size() >= 2 && full[1] == L':') {
+            std::wstring root = { static_cast<wchar_t>(::towupper(full[0])), L':', L'\\' };
+            return root;
+        }
+        // Standard UNC path \\server\share\...
+        if (full.rfind(L"\\\\", 0) == 0) {
+            auto pos1 = full.find(L'\\', 2);
+            if (pos1 == std::wstring::npos) return full;
+            auto pos2 = full.find(L'\\', pos1 + 1);
+            if (pos2 != std::wstring::npos) full.resize(pos2);
+            for (auto& c : full) c = static_cast<wchar_t>(::towlower(c));
+            return full;
+        }
+        return full;
     };
-    return vol(a.native()) == vol(b.native());
+    return vol(a) == vol(b);
 }
+
 
 // Runs a command with the given argv, feeding `input` on stdin, and captures
 // stdout. Returns false if the process could not be started or exited nonzero.
@@ -192,8 +241,12 @@ inline bool run_capture(const std::vector<std::string>& argv, std::string_view i
                 cmdline += c;
             }
         }
-        cmdline.append(backslashes, L'\\');
-        if (need_quote) cmdline += L'"';
+        if (need_quote) {
+            cmdline.append(backslashes * 2, L'\\');
+            cmdline += L'"';
+        } else {
+            cmdline.append(backslashes, L'\\');
+        }
     }
 
     SECURITY_ATTRIBUTES sa{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
@@ -226,19 +279,34 @@ inline bool run_capture(const std::vector<std::string>& argv, std::string_view i
     }
 
     // Feed stdin on a thread to avoid deadlock on large inputs.
-    struct StdinWriter { HANDLE h; std::string d; };
-    std::string iv(input);
-    HANDLE hIn = in_w;
+    struct StdinWriter {
+        HANDLE h = nullptr;
+        std::string d;
+    };
+    auto* ctx = new StdinWriter{in_w, std::string(input)};
     DWORD tid = 0;
     HANDLE writer = ::CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
         auto* w = static_cast<StdinWriter*>(p);
-        DWORD written = 0;
-        ::WriteFile(w->h, w->d.data(), static_cast<DWORD>(w->d.size()), &written, nullptr);
+        const char* ptr = w->d.data();
+        size_t rem = w->d.size();
+        while (rem > 0) {
+            DWORD to_write = static_cast<DWORD>(std::min<size_t>(rem, 65536));
+            DWORD written = 0;
+            if (!::WriteFile(w->h, ptr, to_write, &written, nullptr) || written == 0) {
+                break;
+            }
+            ptr += written;
+            rem -= written;
+        }
         ::CloseHandle(w->h);
         delete w;
         return 0;
-    }, new StdinWriter{hIn, std::move(iv)}, 0, &tid);
-    if (writer) ::CloseHandle(writer);
+    }, ctx, 0, &tid);
+
+    if (!writer) {
+        ::CloseHandle(in_w);
+        delete ctx;
+    }
 
     char buf[16384];
     DWORD n = 0;
@@ -247,12 +315,15 @@ inline bool run_capture(const std::vector<std::string>& argv, std::string_view i
         output.append(buf, n);
     }
     ::CloseHandle(out_r);
+    if (writer) {
+        ::WaitForSingleObject(writer, INFINITE);
+        ::CloseHandle(writer);
+    }
     ::WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 0;
     ::GetExitCodeProcess(pi.hProcess, &code);
     ::CloseHandle(pi.hProcess);
     ::CloseHandle(pi.hThread);
-    ::CloseHandle(in_w);
     return code == 0;
 }
 
