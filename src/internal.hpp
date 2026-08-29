@@ -191,10 +191,52 @@ using PosDesc = detail::PosDesc;
         return n;
     }
 };
+// QO-4 cost model & scheduler: estimates selectivity via corpus qgram_freq / byte_freq
+// and chunk pruning rate, then chooses the cheapest verifier. The model is
+// conservative (no false negatives) — it only influences which verifier runs,
+// never whether a candidate is discarded. Current dispatch (kept but documented):
+//   is_pure_literal (multiline || !contains sep) -> Fixed
+//   q.size()>overlap -> whole-file rare-byte scan
+//   icase||word||line -> chunk-level rare-byte
+//   q.size()<=64 -> positional blocks
+//   else -> chunk fallback
+// For regex: branch_mandatory union or mandatory chunk pruning, then per-file regex_find_all.
+enum class VerifierKind : std::uint8_t { FixedRareByte = 0, FixedPositional = 1, RegexChunk = 2, RegexBruteForce = 3 };
+inline const char* to_string(VerifierKind k) noexcept {
+    switch (k) {
+        case VerifierKind::FixedRareByte: return "FixedRareByte";
+        case VerifierKind::FixedPositional: return "FixedPositional";
+        case VerifierKind::RegexChunk: return "RegexChunk";
+        case VerifierKind::RegexBruteForce: return "RegexBruteForce";
+    }
+    return "Unknown";
+}
+struct QueryCost {
+    double selectivity = 1.0; // estimated fraction of chunks that survive pruning (0..1)
+    std::uint64_t estimated_candidate_chunks = 0;
+    std::uint64_t estimated_candidate_blocks = 0;
+    std::uint64_t estimated_verified_bytes = 0;
+    VerifierKind verifier = VerifierKind::FixedRareByte;
+    double cost = 0.0; // abstract cost: verified_bytes + 100 * candidate_chunks (tunable)
+};
+// Forward-declare pergrep::Pattern for cost estimation (defined in pergrep.hpp).
+
 
 } // namespace pergrep::detail
 
 namespace pergrep {
+// QO-4 cost model: estimate selectivity via IndexData qgram_freq/byte_freq and
+// chunk pruning rate, then choose cheapest verifier. Keeps existing dispatch
+// but adds explicit cost comments and helper chooseVerifier.
+detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I);
+detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I);
+// Internal helper: pick rarest q-gram branch (for tests).
+std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string>>& branches, const detail::IndexData& I);
+namespace detail {
+double estimate_literal_selectivity(std::string_view lit, const IndexData& I);
+double estimate_branch_selectivity(const std::vector<std::vector<std::string>>& branches, const IndexData& I);
+} // namespace detail
+
 struct Pattern::Impl { std::string expr; PatternOptions opt; detail::RegexProgram re; };
 struct Index::Impl : detail::IndexData {};
 } // namespace pergrep

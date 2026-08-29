@@ -305,6 +305,9 @@ uint64_t Index::corpus_bytes() const noexcept {
 uint64_t Index::index_bytes() const noexcept {
     return impl_ ? impl_->bytes() : 0;
 }
+const void* Index::debug_index_data() const noexcept {
+    return impl_ ? static_cast<const void*>(impl_.get()) : nullptr;
+}
 
 bool Index::fresh() const {
     if (!impl_ || impl_->ephemeral) return false;

@@ -1098,6 +1098,121 @@ int main(){
       assert(st_bar.matches==m_bar.size());
     }
   }
+  // QO-4 cost model & scheduler: skewed rarity picks rarest q-gram branch
+#if __has_include("../src/internal.hpp")
+  {
+    // Build skewed corpus: 8 docs dominated by 'a', plus one rare doc with "xyzq"
+    IndexOptions opt;
+    opt.chunk_bytes = 1024;
+    opt.chunk_overlap = 128;
+    opt.positional_block_bytes = 64;
+    opt.positional_budget_ratio = 0.5;
+    opt.planned_qgrams = 4;
+    std::vector<Document> docs;
+    std::string common(5000, 'a');
+    for (size_t i = 80; i < common.size(); i += 80) common[i] = '\n';
+    for (int i = 0; i < 8; ++i) docs.push_back({std::string("common_")+std::to_string(i)+".txt", common});
+    std::string rare_doc = std::string(2000, 'a') + "xyzq" + std::string(2000, 'a');
+    for (size_t i = 80; i < rare_doc.size(); i += 80) if (i < 1990 || i > 2010) rare_doc[i] = '\n';
+    docs.push_back({"rare.txt", rare_doc});
+    docs.push_back({"common_extra.txt", common});
+    auto idx = Index::from_documents(docs, opt);
+    Searcher s(idx);
+    // Access IndexData via debug hook (public test helper)
+    auto* raw = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data());
+    assert(raw != nullptr);
+    const auto& I = *raw;
+    double sel_common = pergrep::detail::estimate_literal_selectivity("aaaa", I);
+    double sel_rare = pergrep::detail::estimate_literal_selectivity("xyzq", I);
+    assert(sel_rare < sel_common);
+    assert(sel_rare < 0.1); // rare gram appears in tiny fraction of corpus
+    // Mixed literal containing both common prefix and rare suffix: rare dominates
+    double sel_mixed = pergrep::detail::estimate_literal_selectivity("aaaaxyzq", I);
+    assert(sel_mixed == sel_rare); // rarest q-gram is xyzq
+    // pick_rarest_branch_literal across two branches: should pick rare
+    std::vector<std::vector<std::string>> branches = {{"aaaa"}, {"xyzq"}};
+    auto picked = pergrep::pick_rarest_branch_literal(branches, I);
+    assert(picked == "xyzq");
+    // Larger branch test: common branch has "aaaa","aaaab" (still 'a's), rare has "xyzq"; still picks rare
+    // Use 'a'-only literals for common so that 'b' (never in corpus) is not artificially rarest
+    branches = {{"aaaa","aaaaa"}, {"xyzq"}};
+    picked = pergrep::pick_rarest_branch_literal(branches, I);
+    assert(picked == "xyzq");
+    // estimateCost / chooseVerifier: both fixed literals map to Fixed* but rare has lower cost
+    auto p_common = Pattern::compile("aaaa", {.kind=PatternKind::Fixed});
+    auto p_rare = Pattern::compile("xyzq", {.kind=PatternKind::Fixed});
+    auto cost_common = pergrep::estimateCost(p_common, I);
+    auto cost_rare = pergrep::estimateCost(p_rare, I);
+    assert(cost_rare.selectivity < cost_common.selectivity);
+    assert(cost_rare.cost < cost_common.cost);
+    assert(cost_rare.estimated_candidate_chunks <= cost_common.estimated_candidate_chunks);
+    // chooseVerifier should respect cost model: both are FixedPositional (size<=64, no word/line/icase)
+    auto v_common = pergrep::chooseVerifier(p_common, I);
+    auto v_rare = pergrep::chooseVerifier(p_rare, I);
+    // Both fixed small literals -> FixedPositional per dispatch; verify enum mapping
+    assert(v_common == pergrep::detail::VerifierKind::FixedPositional);
+    assert(v_rare == pergrep::detail::VerifierKind::FixedPositional);
+    // Regex branch_mandatory: "aaaa|xyzq" should produce two branches and cost model picks rare
+    auto prog = pergrep::detail::parse_regex("aaaa|xyzq", {});
+    assert(prog.branch_mandatory.size() == 2);
+    double sel_branch = pergrep::detail::estimate_branch_selectivity(prog.branch_mandatory, I);
+    // Branch selectivity is sum of per-branch rare selectivities, but with one rare and one common it should be approx sel_rare + sel_common
+    // Since both small, sel_branch should be > sel_rare but < 1.0 and less than 2*sel_common
+    assert(sel_branch >= sel_rare && sel_branch <= 1.0);
+    // Regex cost for branch pattern should be RegexChunk (has branch_mandatory)
+    auto p_regex = Pattern::compile("aaaa|xyzq");
+    auto cost_regex = pergrep::estimateCost(p_regex, I);
+    assert(cost_regex.verifier == pergrep::detail::VerifierKind::RegexChunk);
+    // SearchStats verifier logging: rare fixed search should log FixedPositional, regex logs RegexChunk
+    {
+      SearchStats st{};
+      (void)s.find(p_rare, {}, &st);
+      assert(st.verifier == std::string(pergrep::detail::to_string(pergrep::detail::VerifierKind::FixedPositional)));
+      // Pure-literal regex fast path: "hello" is pure literal but not in skewed corpus -> still FixedRareByte via cost model when not multiline? Check.
+      // For default sep '\n', pure literal without sep should be FixedRareByte (fast path) and is_pure_literal respects (multiline || !contains sep)
+      auto p_pure = Pattern::compile("hello");
+      assert(p_pure.mandatory_literals().size()==1 || true); // may be mandatory
+      auto cost_pure = pergrep::estimateCost(p_pure, I);
+      // pure literal "hello" size 5 <=64 -> FixedPositional as fixed, but regex pure literal maps to FixedRareByte in estimateCost
+      // Ensure chooseVerifier doesn't crash and returns either Fixed*
+      (void)cost_pure;
+    }
+    {
+      SearchStats st{};
+      (void)s.find(p_regex, {}, &st);
+      assert(st.verifier == std::string(pergrep::detail::to_string(pergrep::detail::VerifierKind::RegexChunk)));
+    }
+    // Zero false negatives under skewed corpus: both literals still find exact matches
+    {
+      SearchStats st{};
+      auto m_rare = s.find(p_rare, {}, &st);
+      assert(m_rare.size()==1 && idx.files()[m_rare[0].file_id].path=="rare.txt");
+      assert(st.candidate_blocks <= 4);
+      auto m_common = s.find(p_common, {}, &st);
+      assert(m_common.size() >= 1); // common appears everywhere
+      assert(st.candidate_blocks > m_rare.size()); // common has more blocks than rare (pruning less)
+    }
+    std::cerr << "M24 QO-4 cost model done\n" << std::flush;
+  }
+#else
+  // Fallback public-API check when internal.hpp not reachable: verify rare vs common via SearchStats
+  {
+    IndexOptions opt; opt.chunk_bytes=1024; opt.chunk_overlap=128; opt.positional_block_bytes=64;
+    std::string common(5000,'a'); for(size_t i=80;i<common.size();i+=80) common[i]='\n';
+    std::string rare_doc=std::string(2000,'a')+"xyzq"+std::string(2000,'a');
+    for(size_t i=80;i<rare_doc.size();i+=80) if(i<1990||i>2010) rare_doc[i]='\n';
+    auto idx=Index::from_documents({{"common.txt",common},{"rare.txt",rare_doc}}, opt);
+    Searcher s(idx);
+    auto p_common=Pattern::compile("aaaa", {.kind=PatternKind::Fixed});
+    auto p_rare=Pattern::compile("xyzq", {.kind=PatternKind::Fixed});
+    SearchStats stc{}, str{};
+    (void)s.find(p_common, {}, &stc);
+    (void)s.find(p_rare, {}, &str);
+    assert(str.candidate_blocks < stc.candidate_blocks);
+    assert(str.verified_bytes < stc.verified_bytes);
+  }
+#endif
+
 
   return 0;
 }

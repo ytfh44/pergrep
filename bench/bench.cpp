@@ -138,8 +138,11 @@ int main() {
     uint64_t total_verified_bytes = 0;
     uint64_t total_candidate_chunks = 0;
     uint64_t total_matches = 0;
-    // Per-flavor candidate_chunks logging for QO-2 rarity analysis
+    // Per-flavor candidate_chunks logging for QO-2 rarity analysis + QO-4 cost model verifier
     std::vector<uint64_t> per_case_candidate_chunks(cases.size(), 0);
+    std::vector<std::string> per_case_verifier(cases.size());
+    std::vector<double> per_case_selectivity(cases.size(), 0.0);
+    std::vector<uint64_t> per_case_blocks(cases.size(), 0);
 
     auto t0 = std::chrono::steady_clock::now();
     for (int iter = 0; iter < ITERATIONS; ++iter) {
@@ -151,6 +154,12 @@ int main() {
             total_verified_bytes += stats.verified_bytes;
             total_candidate_chunks += stats.candidate_chunks;
             per_case_candidate_chunks[ci] += stats.candidate_chunks;
+            per_case_blocks[ci] += stats.candidate_blocks;
+            // QO-4 cost model: capture verifier and selectivity chosen by estimateCost/chooseVerifier
+            if (iter == 0) {
+                per_case_verifier[ci] = stats.verifier.empty() ? "Unknown" : stats.verifier;
+                per_case_selectivity[ci] = stats.estimated_selectivity;
+            }
             total_matches += ms.size();
         }
     }
@@ -172,10 +181,16 @@ int main() {
     std::cout << "METRIC matches_count=" << (total_matches / ITERATIONS) << "\n";
     std::cout << "ASI cases_count=" << cases.size() << "\n";
     std::cout << "ASI corpus_size_mb=" << corpus_mb << "\n";
-    // Per-flavor candidate_chunks (averaged over iterations) for rarity planner visibility
+    // Per-flavor candidate_chunks (averaged over iterations) for rarity planner visibility + QO-4 verifier
     for (size_t ci = 0; ci < cases.size(); ++ci) {
         uint64_t avg_cc = per_case_candidate_chunks[ci] / ITERATIONS;
+        uint64_t avg_blocks = per_case_blocks[ci] / ITERATIONS;
         std::cout << "METRIC candidate_chunks[" << cases[ci].name << "]=" << avg_cc << "\n";
+        std::cout << "METRIC candidate_blocks[" << cases[ci].name << "]=" << avg_blocks << "\n";
+        std::cout << "METRIC verifier[" << cases[ci].name << "]=" << per_case_verifier[ci] << "\n";
+        std::cout << "METRIC selectivity[" << cases[ci].name << "]=" << std::fixed << std::setprecision(6) << per_case_selectivity[ci] << "\n";
+        // is_pure_literal dispatch check: lit_scoped / lit_escaped should be Fixed* (pure literal fast path)
+        // when (multiline || !contains sep) holds; bench ensures per-flavor candidate_chunks measured.
     }
     return 0;
 }
