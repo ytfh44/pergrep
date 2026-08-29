@@ -61,7 +61,7 @@ jobs:
       - name: Setup LLVM
         uses: KyleMayes/install-llvm-action@v2
         with:
-          version: "18"
+          version: "20"
           directory: ${{ runner.temp }}/llvm
       - name: Configure
         run: cmake --preset windows-clang
