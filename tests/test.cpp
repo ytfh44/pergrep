@@ -806,5 +806,127 @@ int main(){
     }
   }
 
+  // BF-2 resource bounds
+  {
+    // 1. Lookbehind window capped to 8192 — very long prefix must not crash.
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      // Very long prefix (20000 'a's) with cheap lookbehind (?<=a)b — test window without 67M blow-up.
+      // Use direct regex_search at the 'b' position to avoid scanning 20000 positions (which would be 20000*8192 work).
+      {
+        auto prog = pergrep::detail::parse_regex(R"((?<=a)b)", o);
+        std::string hay(20000, 'a'); hay.push_back('b');
+        pergrep::Match m;
+        bool ok = false;
+        bool threw = false;
+        try {
+          ok = pergrep::detail::regex_search(prog, hay, o, 20000, &m, 0, '\n');
+        } catch (const std::runtime_error& e) {
+          threw = true;
+          std::string msg = e.what();
+          assert(msg.find("pergrep") != std::string::npos);
+        }
+        assert(threw || ok);
+        if (ok) assert(m.start == 20000 && m.end == 20001);
+      }
+      // Within-window correctness with the spec's (?<=a+)b on a small hay (Searcher path).
+      {
+        auto p = Pattern::compile(R"((?<=a+)b)", o);
+        std::string hay2(100, 'a'); hay2.push_back('b'); hay2.push_back('\n');
+        auto idx2 = corpus(hay2);
+        Searcher s2(idx2);
+        auto m2 = s2.find(p);
+        assert(m2.size() == 1);
+      }
+    }
+    // 2. Repeat {1,100000} is capped to 10000 — should not OOM and match length <=10000.
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      bool compiled = false;
+      try {
+        // Use (?=a) prefix to force extended VM (lookahead) so Repeat goes via eval with 10k cap.
+        auto p = Pattern::compile("(?=a)a{1,100000}", o);
+        compiled = true;
+        std::string hay(20000, 'a'); hay.push_back('\n');
+        auto idx = corpus(hay);
+        Searcher s(idx);
+        auto m = s.find(p);
+        assert(!m.empty());
+        // (?=a) is zero-width, so match length is just the a{1,100000} part, capped to 10000.
+        assert(m[0].end - m[0].start <= 10000);
+        assert(m[0].end - m[0].start >= 1);
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        assert(msg.find("pergrep") != std::string::npos);
+        (void)msg;
+      }
+      try {
+        auto p2 = Pattern::compile("a{1,100000}");
+        std::string hay(20000, 'a'); hay.push_back('\n');
+        auto idx2 = corpus(hay);
+        Searcher s2(idx2);
+        auto m2 = s2.find(p2);
+        (void)m2;
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        assert(msg.find("pergrep") != std::string::npos);
+      }
+      (void)compiled;
+    }
+    // 3. Recursion depth >10000 must throw cleanly (direct depth guard test).
+    {
+      bool threw = false;
+      try {
+        pergrep::detail::test_eval_depth_guard(10001);
+        assert(false && "expected recursion depth exceeded");
+      } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        threw = true;
+        assert(msg.find("recursion") != std::string::npos || msg.find("pergrep") != std::string::npos);
+      }
+      assert(threw);
+      try {
+        pergrep::detail::test_eval_depth_guard(10000);
+      } catch (...) {
+        assert(false && "depth 10000 should not throw");
+      }
+      pergrep::detail::test_eval_depth_guard(0);
+      {
+        PatternOptions o; o.engine = Engine::Pcre2Compat;
+        const int depth2 = 500;
+        std::string pat;
+        pat.reserve(depth2 * 2 + 1);
+        for (int i = 0; i < depth2; ++i) pat.push_back('(');
+        pat.push_back('a');
+        for (int i = 0; i < depth2; ++i) pat.push_back(')');
+        auto p = Pattern::compile(pat, o);
+        std::string hay = "a\n";
+        auto idx = corpus(hay);
+        Searcher s(idx);
+        auto m = s.find(p);
+        assert(m.size() == 1);
+      }
+    }
+    // 4. Existing bounded repetition and catastrophic patterns still behave correctly.
+    {
+      auto p = Pattern::compile("a{2,4}");
+      auto idx = corpus("aaaaa\n");
+      Searcher s(idx);
+      auto m = s.find(p);
+      assert(!m.empty() && m.back().end - m.back().start == 4);
+      std::string hay(20000, 'a'); hay.push_back('\n');
+      auto idx2 = corpus(hay);
+      Searcher s2(idx2);
+      auto p2 = Pattern::compile("(a|aa)*b");
+      auto m2 = s2.find(p2);
+      assert(m2.empty());
+      std::string hit(2000, 'a'); hit += "b\n";
+      auto idx3 = corpus(hit);
+      Searcher s3(idx3);
+      auto hm = s3.find(p2);
+      assert(hm.size() == 1 && hm[0].end - hm[0].start == 2001);
+    }
+  }
+
   return 0;
 }
