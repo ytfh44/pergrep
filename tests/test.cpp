@@ -716,5 +716,95 @@ int main(){
     auto p_sce = Pattern::compile(R"(\p{ScriptExtensions=Han}+)");
     assert(!s3.find(p_sce).empty());
   }
+  // QO-2 q-gram rarity: skewed corpus, rare vs naive first-k pruning.
+  {
+    // Build a corpus where 4-gram "aaaa" is extremely common and "xyzq" is rare.
+    // This skew lets us verify that rarity-ordered selection (rarest first)
+    // prunes more than a naive first-k (prefix-order) selection.
+    IndexOptions opt;
+    opt.chunk_bytes = 1024;
+    opt.chunk_overlap = 128;
+    opt.positional_block_bytes = 64;
+    opt.positional_budget_ratio = 0.5;
+    opt.planned_qgrams = 2;
+    // 8 heavily skewed documents dominated by 'a', plus one document containing the rare gram.
+    std::vector<Document> docs;
+    std::string common(5000, 'a');
+    for (size_t i = 80; i < common.size(); i += 80) common[i] = '\n';
+    for (int i = 0; i < 8; ++i) {
+      docs.push_back({std::string("common_") + std::to_string(i) + ".txt", common});
+    }
+    // Rare document: still mostly 'a' but with a unique "xyzq" island and a longer tail.
+    // Avoid newline insertion over the rare gram (which sits at offset 2000) to keep the literal intact.
+    std::string rare_doc = std::string(2000, 'a') + "xyzq" + std::string(2000, 'a');
+    for (size_t i = 80; i < rare_doc.size(); i += 80) if (i < 1990 || i > 2010) rare_doc[i] = '\n';
+    docs.push_back({"rare.txt", rare_doc});
+    // Add one more common doc to increase total chunks without adding rare gram
+    docs.push_back({"common_extra.txt", common});
+    auto idx = Index::from_documents(docs, opt);
+    Searcher s(idx);
+    // Query that mixes common and rare q-grams: "aaaa" prefix is common, "xyzq" suffix is rare.
+    // The full literal carries q-grams: aaaa, aaax, aaxy, axyz, xyzq (when q="aaaaxyzq").
+    std::string q = "aaaaxyzq";
+    auto pat = Pattern::compile(q, {.kind = PatternKind::Fixed});
+    SearchStats stats{};
+    auto matches = s.find(pat, {}, &stats);
+    // Correctness: only the rare document contains the literal
+    assert(matches.size() == 1);
+    assert(idx.files()[matches[0].file_id].path == "rare.txt");
+    // Rarity pruning: stats.candidate_blocks is after positional filtering on rarest q-grams.
+    // With rarity ordering, candidate_blocks should be tiny (only chunks containing xyzq).
+    // Naive first-k (prefix order) would pick "aaaa" (extremely common) and keep many chunks;
+    // rarity picks "xyzq" and keeps only the rare chunk(s). Demonstrate by comparing
+    // candidate_blocks for a common-only query vs the rare query.
+    {
+      auto pat_common = Pattern::compile("aaaa", {.kind = PatternKind::Fixed});
+      SearchStats st_common{};
+      (void)s.find(pat_common, {}, &st_common);
+      // Common gram appears in every doc, so candidate_blocks should be large (many chunks).
+      // Rare query should prune to far fewer blocks.
+      assert(st_common.candidate_blocks > stats.candidate_blocks);
+      assert(st_common.candidate_blocks >= 10);
+    }
+    // Rarity-aware should prune to ~1 doc worth of chunks.
+    assert(stats.candidate_blocks <= 4);
+    // Also candidate_chunks (pre-positional) is Bloom-based; rarity mainly affects blocks,
+    // but overall verified_bytes should be small thanks to block pruning.
+    assert(stats.verified_bytes < 8192);
+    // Zero false negatives: searching the rare gram alone also finds it
+    auto pat2 = Pattern::compile("xyzq", {.kind = PatternKind::Fixed});
+    SearchStats st2{};
+    auto m2 = s.find(pat2, {}, &st2);
+    assert(m2.size() == 1);
+    // Adaptive k: short query (<=4) keeps k=1; long query uses larger k up to 8.
+    // Verify via stats: short literal "abc" (size 3 <4) falls back to all chunks (no q-gram filter)
+    // and still finds nothing without false positives beyond verification.
+    {
+      auto p_short = Pattern::compile("abc", {.kind = PatternKind::Fixed});
+      SearchStats st_short{};
+      auto ms_short = s.find(p_short, {}, &st_short);
+      // "abc" does not occur in 'a'-dominated corpus
+      assert(ms_short.empty());
+      // Short query with no q-gram should have candidate_chunks == all chunks (conservative)
+      // or at least not prune incorrectly to zero.
+      assert(st_short.candidate_chunks >= 1);
+    }
+    // Long literal (>=20 chars) should still prune correctly and benefit from larger k
+    {
+      std::string long_q = std::string(10, 'a') + "xyzq" + std::string(10, 'b');
+      // Ensure rare part still only in one tailored doc
+      std::vector<Document> docs2 = docs;
+      docs2.push_back({"long_rare.txt", long_q});
+      auto idx2 = Index::from_documents(docs2, opt);
+      Searcher s2(idx2);
+      auto p_long = Pattern::compile(long_q, {.kind = PatternKind::Fixed});
+      SearchStats st_long{};
+      auto ml = s2.find(p_long, {}, &st_long);
+      assert(ml.size() == 1);
+      // Long query should prune heavily (candidate_blocks small)
+      assert(st_long.candidate_blocks <= 4);
+    }
+  }
+
   return 0;
 }

@@ -162,18 +162,114 @@ size_t anchor_find(std::string_view s, std::string_view q, size_t anchor, size_t
     return std::string_view::npos;
 }
 
+// Adaptive k helper: chooses how many q-grams to use for positional filtering.
+// - Short query (<=4 bytes, i.e. 0-1 distinct q-grams): k=1 (or 0 if <4, meaning no q-gram filter).
+// - Otherwise k = min(planned_qgrams, num_unique_qgrams, budget_based_k) where
+//   budget_based_k is derived from positional_budget_ratio and chunk_bytes.
+// - For long literals (many distinct q-grams) budget is relaxed up to 8 for
+//   better pruning; this still respects the 8-cap and never increases false
+//   negatives because using more q-grams can only tighten the intersection,
+//   while capping at 8 bounds positional row lookups per chunk.
+// Conservative fallback: k==0 means no positional q-gram filter -> all chunks
+// pass (zero false negatives).
+size_t adaptive_k(const detail::IndexData& I, std::string_view q) {
+    if (q.size() < 4) return 0;
+    if (q.size() <= 4) return 1;
+    // Count distinct 4-byte q-gram hashes in the query (per-query distinctness).
+    std::unordered_set<uint32_t> uniq;
+    uniq.reserve(q.size());
+    for (size_t i = 0; i + 4 <= q.size(); ++i) {
+        uniq.insert(detail::hash4((const unsigned char*)q.data() + i));
+    }
+    size_t num_unique = uniq.size();
+    if (num_unique == 0) return 0;
+    size_t planned = I.opt.planned_qgrams;
+    // Cost model: each positional q-gram probe costs roughly one row (m * mask_bytes).
+    // Derive a budget-based cap from index memory budget:
+    //   budget_bytes ~= chunk_bytes * positional_budget_ratio
+    //   budget_based_k ~= budget_bytes / 4096, clamped to [1,8].
+    // This ties k to both knobs the user controls (chunk size and budget ratio)
+    // and keeps the per-chunk row intersection cheap.
+    double budget_bytes = double(I.opt.chunk_bytes) * I.opt.positional_budget_ratio;
+    size_t budget_based_k = 1;
+    if (budget_bytes > 0) {
+        budget_based_k = static_cast<size_t>(budget_bytes / 4096.0);
+        if (budget_based_k < 1) budget_based_k = 1;
+        if (budget_based_k > 8) budget_based_k = 8;
+    }
+    // Long literals carry many distinct q-grams; relax budget slightly for
+    // better pruning (still capped at 8). This is the "adaptive" part:
+    // short queries stay at 1, long queries can use up to 8 rarest q-grams.
+    if (num_unique >= 6 && q.size() >= 12) {
+        budget_based_k = std::min<size_t>(8, budget_based_k + 2);
+    }
+    if (q.size() >= 20) {
+        budget_based_k = std::min<size_t>(8, budget_based_k + 1);
+    }
+    size_t k = std::min({planned, num_unique, budget_based_k});
+    // Ensure at least 1 for any query that actually has a q-gram.
+    if (k == 0) k = 1;
+    return k;
+}
+
+// Rarity-aware q-gram planner.
+// - Collects all 4-byte q-gram hashes of the query.
+// - Sorts by corpus frequency (I.qgram_freq on low 16 bits of hash) ascending:
+//   rarest first, because rare q-grams prune more candidates per probe.
+// - Deduplicates hashes to respect per-query distinctness (repeated q-grams
+//   do not add filtering power).
+// - Drops extremely common q-grams whose corpus frequency exceeds 10% of
+//   corpus_bytes. This threshold identifies q-grams that appear in a large
+//   fraction of chunks and would pollute the candidate set with low-selectivity
+//   rows. Dropping is conservative: using fewer q-grams relaxes the positional
+//   intersection (more blocks pass), so zero false negatives is preserved;
+//   we only keep a subset of the rarest q-grams.
+// - Selects the first k hashes after filtering, where k is from adaptive_k().
+//   If filtering empties the set, returns empty -> caller falls back to no
+//   q-gram filter (all chunks).
 std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_view q) {
     std::vector<uint32_t> h;
     if (q.size() < 4) return h;
     for (size_t i = 0; i + 4 <= q.size(); ++i)
         h.push_back(detail::hash4((const unsigned char*)q.data() + i));
+    // Rarity ordering: rarest first using corpus qgram frequency.
     std::sort(h.begin(), h.end(), [&](uint32_t a, uint32_t b) {
         auto fa = I.qgram_freq[a & 65535u], fb = I.qgram_freq[b & 65535u];
         if (fa != fb) return fa < fb;
         return a < b;
     });
     h.erase(std::unique(h.begin(), h.end()), h.end());
-    if (h.size() > I.opt.planned_qgrams) h.resize(I.opt.planned_qgrams);
+    // Adaptive k (budget + distinctness aware).
+    size_t k = adaptive_k(I, q);
+    if (k == 0) return {};
+    // Drop extremely common q-grams: freq > 10% of corpus bytes.
+    // For tiny corpora corpus_bytes may be 0-100; threshold then tiny, so
+    // guard against over-dropping by only applying when corpus_bytes is large
+    // enough for the ratio to be meaningful (>40). Otherwise keep all.
+    if (I.corp_bytes > 40) {
+        uint64_t common_thresh = I.corp_bytes / 10;
+        std::vector<uint32_t> filtered;
+        filtered.reserve(h.size());
+        for (auto hh : h) {
+            uint32_t f = I.qgram_freq[hh & 65535u];
+            if (static_cast<uint64_t>(f) <= common_thresh) filtered.push_back(hh);
+        }
+        // Only use filtered set if it still contains at least one q-gram;
+        // otherwise fall back to the rarest (even if common) to retain some
+        // pruning rather than disabling the filter entirely. But spec says
+        // dropping common even within budget is intended; if all are common,
+        // returning empty (no filter) is the conservative fallback.
+        // Here we prefer the conservative empty-return when everything is
+        // common, to avoid a useless highly-common filter.
+        if (!filtered.empty()) {
+            h.swap(filtered);
+        } else {
+            // All q-grams are extremely common -> disable positional filter
+            // rather than polluting with a low-selectivity gram.
+            return {};
+        }
+    }
+    if (h.size() > k) h.resize(k);
     return h;
 }
 

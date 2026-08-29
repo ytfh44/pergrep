@@ -138,15 +138,19 @@ int main() {
     uint64_t total_verified_bytes = 0;
     uint64_t total_candidate_chunks = 0;
     uint64_t total_matches = 0;
+    // Per-flavor candidate_chunks logging for QO-2 rarity analysis
+    std::vector<uint64_t> per_case_candidate_chunks(cases.size(), 0);
 
     auto t0 = std::chrono::steady_clock::now();
     for (int iter = 0; iter < ITERATIONS; ++iter) {
-        for (const auto& c : cases) {
+        for (size_t ci = 0; ci < cases.size(); ++ci) {
+            const auto& c = cases[ci];
             auto pat = Pattern::compile(c.pattern, c.popt);
             SearchStats stats{};
             auto ms = searcher.find(pat, c.sopt, &stats);
             total_verified_bytes += stats.verified_bytes;
             total_candidate_chunks += stats.candidate_chunks;
+            per_case_candidate_chunks[ci] += stats.candidate_chunks;
             total_matches += ms.size();
         }
     }
@@ -168,6 +172,10 @@ int main() {
     std::cout << "METRIC matches_count=" << (total_matches / ITERATIONS) << "\n";
     std::cout << "ASI cases_count=" << cases.size() << "\n";
     std::cout << "ASI corpus_size_mb=" << corpus_mb << "\n";
-
+    // Per-flavor candidate_chunks (averaged over iterations) for rarity planner visibility
+    for (size_t ci = 0; ci < cases.size(); ++ci) {
+        uint64_t avg_cc = per_case_candidate_chunks[ci] / ITERATIONS;
+        std::cout << "METRIC candidate_chunks[" << cases[ci].name << "]=" << avg_cc << "\n";
+    }
     return 0;
 }
