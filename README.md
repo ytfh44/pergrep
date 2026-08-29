@@ -19,13 +19,44 @@ Linux/Unix build requirements:
 - libarchive for the `pergrep` CLI compressed-input path
 - iconv (normally provided by libc on Linux) for non-UTF-8 input conversion
 
+Windows build requirements:
+
+- CMake 3.20+ with the Ninja generator
+- Visual Studio 2022 (MSVC) or clang-cl
+- [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set, providing
+  the `icu` and `libarchive` ports
+
 ## Build and test
+
+Linux/Unix:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Windows (MSVC via vcpkg):
+
+```powershell
+cmake --preset windows-vcpkg
+cmake --build --preset windows-vcpkg
+ctest --preset windows-vcpkg
+```
+
+Windows (clang-cl via vcpkg):
+
+```powershell
+cmake --preset windows-clang
+cmake --build --preset windows-clang
+ctest --preset windows-clang
+```
+
+The Windows port is implemented in `src/platform.hpp`: fnmatch, iconv, tty
+detection, `--pre` subprocess execution, and file timestamps all map to Win32
+calls, and UTF-8 is used end-to-end for paths (wmain converts argv). The
+shell-based test suites (`cli_compat.sh`, `flags_surface.sh`,
+`upstream_cases.sh`) run under Git for Windows' bash when it is on `PATH`.
 
 Install to a prefix:
 

@@ -6,6 +6,24 @@ eq(){ [[ "$1" == "$2" ]] || fail "$3: expected <$2>, got <$1>"; }
 contains(){ [[ "$1" == *"$2"* ]] || fail "$3: missing <$2> in <$1>"; }
 not_contains(){ [[ "$1" != *"$2"* ]] || fail "$3: unexpected <$2> in <$1>"; }
 
+# Locate a real Python. On Windows the WindowsApps "python3" stub opens the
+# Microsoft Store instead of running, so fall back to `python`.
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+[ -n "$PY" ] || fail "no working python interpreter found"
+
+# Git for Windows / MSYS environment: some Unix-isms (executable shell
+# scripts, sed as a spawnable command) are unavailable, so those cases are
+# skipped.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+  *) IS_WINDOWS=0 ;;
+esac
+
 mkdir -p "$T/basic"
 printf 'alpha beta\nbeta gamma\n' > "$T/basic/a.txt"
 printf 'delta alpha\n' > "$T/basic/b.txt"
@@ -22,7 +40,7 @@ out="$(printf 'alpha\n' | $PG -F -f - "$T/basic/a.txt")"
 eq "$out" 'alpha beta' stdin-pattern-file
 
 # UTF-16 BOM auto-detection and explicit UTF-16LE decoding.
-python3 - "$T/utf16.txt" <<'PY'
+"$PY" - "$T/utf16.txt" <<'PY'
 from pathlib import Path
 import sys
 Path(sys.argv[1]).write_bytes(('hello Ωmega\n').encode('utf-16'))
@@ -47,16 +65,23 @@ printf '*.log\n' > "$T/ign/custom.ignore"
 out="$($PG --ignore-file "$T/ign/custom.ignore" needle "$T/ign")"
 contains "$out" 'sub/keep.log:needle' explicit-ignore-precedence
 
-# Symlink traversal is opt-in.
+# Symlink traversal is opt-in. On Windows, Git's ln -s may fall back to a
+# directory copy when symlinks are unavailable (no admin/developer mode), so
+# verify a real symlink was created before asserting traversal behavior.
 mkdir -p "$T/link/root" "$T/link/ext"
 printf 'needle\n' > "$T/link/ext/a.txt"
 ln -s ../ext "$T/link/root/alias"
-out="$($PG needle "$T/link/root" 2>/dev/null || true)"
-eq "$out" '' symlink-default
-out="$($PG -L needle "$T/link/root")"
-contains "$out" 'alias/a.txt:needle' symlink-follow
+if [ -L "$T/link/root/alias" ]; then
+  out="$($PG needle "$T/link/root" 2>/dev/null || true)"
+  eq "$out" '' symlink-default
+  out="$($PG -L needle "$T/link/root")"
+  contains "$out" 'alias/a.txt:needle' symlink-follow
+fi
 
 # --pre executes the user supplied transform and searches its stdout.
+# On Windows the transformer must be a real .exe; shell scripts and sed are
+# not spawnable, so these cases only run on Unix-like hosts.
+if [ "$IS_WINDOWS" = "0" ]; then
 printf 'hello\n' > "$T/pre.txt"
 cat > "$T/upcase.sh" <<'SH'
 #!/bin/sh
@@ -67,9 +92,10 @@ out="$($PG --pre "$T/upcase.sh" HELLO "$T/pre.txt")"
 eq "$out" 'HELLO' pre
 out="$($PG --pre "sed -n 1p" hello "$T/pre.txt")"
 eq "$out" 'hello' pre-command-args
+fi
 
 # --search-zip searches decompressed content without delegating matching.
-python3 - "$T/a.gz" <<'PY'
+"$PY" - "$T/a.gz" <<'PY'
 import gzip,sys
 with gzip.open(sys.argv[1], 'wb') as f: f.write(b'zip needle\n')
 PY
@@ -144,7 +170,7 @@ out="$($PG -r '${digits}' 'foo(?<digits>[0-9]+)bar' "$T/repl.txt")"; eq "$out" '
 files="$($PG --files --sort path "$T/basic")"
 eq "$files" $'a.txt\nb.txt' files-sort
 $PG --json alpha "$T/basic" > "$T/out.jsonl"
-python3 - "$T/out.jsonl" <<'PY'
+"$PY" - "$T/out.jsonl" <<'PY'
 import json,sys
 rows=[json.loads(x) for x in open(sys.argv[1],encoding='utf8')]
 assert rows and rows[-1]['type']=='summary'
@@ -177,7 +203,8 @@ out="$($PG needle "$T/nogit")"; contains "$out" 'a.skip:needle' require-git-defa
 out="$($PG --no-require-git needle "$T/nogit" || true)"; eq "$out" '' no-require-git
 
 # --one-file-system filters followed entries on another device, per search root.
-if [[ -r /proc/version ]]; then
+# Linux-only: relies on /proc being a different device than the temp dir.
+if [[ -r /proc/version ]] && [ "$IS_WINDOWS" = "0" ]; then
   mkdir -p "$T/fsroot"; ln -s /proc/version "$T/fsroot/proc-version"
   out="$($PG -L -F Linux "$T/fsroot" || true)"; contains "$out" 'proc-version:' one-filesystem-baseline
   out="$($PG -L --one-file-system -F Linux "$T/fsroot" || true)"; eq "$out" '' one-filesystem-filter
@@ -186,7 +213,7 @@ fi
 # --null-data makes NUL the logical record terminator for anchors/output.
 printf 'one\0hit\0three\0' > "$T/nulldata"
 $PG --null-data '^hit$' "$T/nulldata" > "$T/nulldata.out"
-python3 - "$T/nulldata.out" <<'PY'
+"$PY" - "$T/nulldata.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read()
 assert b == b'hit\0', b
@@ -206,19 +233,19 @@ eq "$out" $'hit\nhit\nhit' multiline-overrides-stop
 # configurable, but --color=always must emit ANSI and --color=never must not.
 printf 'needle\n' > "$T/color.txt"
 $PG --color=always -n -F needle "$T/color.txt" > "$T/color.always"
-python3 - "$T/color.always" <<'PY'
+"$PY" - "$T/color.always" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[' in b, b
 PY
 $PG --color=never -n -F needle "$T/color.txt" > "$T/color.never"
-python3 - "$T/color.never" <<'PY'
+"$PY" - "$T/color.never" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[' not in b, b
 PY
 
 # Hyperlink output uses OSC 8 when explicitly requested and output is enabled.
 $PG --color=always --hyperlink-format=file -H -F needle "$T/color.txt" > "$T/hyper.out"
-python3 - "$T/hyper.out" <<'PY'
+"$PY" - "$T/hyper.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b]8;;' in b, b
 PY
@@ -243,12 +270,12 @@ contains "$(cat "$T/stats.out")" 'bytes searched' stats-bytes-searched
 contains "$(cat "$T/stats.out")" 'seconds spent searching' stats-search-time
 
 # JSON output remains valid for arbitrary bytes by using base64-bearing objects.
-python3 - "$T/jsonbytes.txt" <<'PY'
+"$PY" - "$T/jsonbytes.txt" <<'PY'
 import sys
 open(sys.argv[1],'wb').write(b'\xffneedle\n')
 PY
 $PG -a --json -F needle "$T/jsonbytes.txt" > "$T/jsonbytes.out"
-python3 - "$T/jsonbytes.out" <<'PY'
+"$PY" - "$T/jsonbytes.out" <<'PY'
 import json,sys
 rows=[json.loads(x) for x in open(sys.argv[1],'rb').read().splitlines()]
 m=next(x for x in rows if x['type']=='match')
@@ -304,7 +331,7 @@ out="$($PG --files -l "$T/basic")"; contains "$out" 'a.txt' files-mode-resists-s
 # Standard line output highlights matched spans, not just numeric/path prefixes.
 printf 'xxneedleyy\n' > "$T/color-line.txt"
 $PG --color=always -F needle "$T/color-line.txt" > "$T/color-line.out"
-python3 - "$T/color-line.out" <<'PY'
+"$PY" - "$T/color-line.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read()
 assert b'xx' in b and b'yy' in b and b'\x1b[' in b
@@ -335,7 +362,7 @@ eq "$out" $'a.txt\nsub\\b.txt' files-sorted-path-separator
 
 # Binary modes follow ripgrep's Auto / SearchAndSuppress / AsText split.
 mkdir -p "$T/bin"
-python3 - "$T/bin/hay" <<'PY'
+"$PY" - "$T/bin/hay" <<'PY'
 import sys
 open(sys.argv[1],'wb').write(b'before needle\n\x00\nafter needle\n')
 PY
@@ -373,35 +400,35 @@ contains "$zshc" '--one-file-system' generate-zsh-one-filesystem
 # --colors customizes observable ANSI styles, and hyperlink-format=none disables OSC 8.
 printf 'needle\n' > "$T/palette.txt"
 $PG --color=always --colors=match:none -F needle "$T/palette.txt" > "$T/palette-none.out"
-python3 - "$T/palette-none.out" <<'PY'
+"$PY" - "$T/palette-none.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[' not in b, b
 PY
 $PG --color=always --colors=match:none --colors=match:fg:blue -F needle "$T/palette.txt" > "$T/palette-blue.out"
-python3 - "$T/palette-blue.out" <<'PY'
+"$PY" - "$T/palette-blue.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[0m\x1b[34mneedle\x1b[0m' in b, b
 PY
 $PG --color=always --colors=match:none --colors=match:bg:0x33,0x66,0xFF --colors=match:style:bold -F needle "$T/palette.txt" > "$T/palette-rgb.out"
-python3 - "$T/palette-rgb.out" <<'PY'
+"$PY" - "$T/palette-rgb.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'48;2;51;102;255' in b and b'1' in b, b
 PY
 $PG --color=always --hyperlink-format=none -H -F needle "$T/palette.txt" > "$T/hyper-none.out"
-python3 - "$T/hyper-none.out" <<'PY'
+"$PY" - "$T/hyper-none.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b]8;;' not in b, b
 PY
 
 # line/column color types are independently configurable.
 $PG --color=always --colors=match:none --colors=line:none --colors=line:fg:blue -n -F needle "$T/palette.txt" > "$T/palette-line.out"
-python3 - "$T/palette-line.out" <<'PY'
+"$PY" - "$T/palette-line.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b.startswith(b'\x1b[0m\x1b[34m1\x1b[0m:'), b
 PY
 printf 'xxneedle\n' > "$T/palette-column.txt"
 $PG --color=always --colors=match:none --colors=line:none --colors=column:none --colors=column:fg:cyan -n --column -F needle "$T/palette-column.txt" > "$T/palette-column.out"
-python3 - "$T/palette-column.out" <<'PY'
+"$PY" - "$T/palette-column.out" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read(); assert b'\x1b[0m\x1b[36m3\x1b[0m:' in b, b
 PY

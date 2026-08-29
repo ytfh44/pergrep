@@ -6,6 +6,16 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 eq(){ [[ "$1" == "$2" ]] || { printf 'FAIL: %s\nexpected <%s>\ngot <%s>\n' "$3" "$2" "$1" >&2; exit 1; }; }
 contains(){ [[ "$1" == *"$2"* ]] || fail "$3"; }
 
+# Locate a real Python; on Windows the WindowsApps "python3" stub opens the
+# Microsoft Store instead of running.
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+[ -n "$PY" ] || fail "no working python interpreter found"
+
 cat >"$T/sherlock" <<'TXT'
 For the Doctor Watsons of this world, as opposed to the Sherlock
 Holmeses, success in the province of detective work must always
@@ -28,7 +38,7 @@ contains "$out" 'Holmeses, success' pattern-file-2
 
 # NUL path termination in files-with-matches.
 raw="$T/null.out"; $PG --null --files-with-matches Sherlock "$T/sherlock" >"$raw"
-python3 - "$raw" <<'PY'
+"$PY" - "$raw" <<'PY'
 import sys
 b=open(sys.argv[1],'rb').read()
 assert b.endswith(b'\0') and b'Sherlock' not in b

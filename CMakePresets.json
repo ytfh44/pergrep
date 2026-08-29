@@ -1,0 +1,64 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows (MSVC via vcpkg)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "PERGREP_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clang",
+      "displayName": "Windows (clang-cl via vcpkg)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "PERGREP_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "unix",
+      "displayName": "Unix (system ICU/libarchive)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/unix",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PERGREP_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-vcpkg", "configurePreset": "windows-vcpkg" },
+    { "name": "windows-clang", "configurePreset": "windows-clang" },
+    { "name": "unix", "configurePreset": "unix" }
+  ],
+  "testPresets": [
+    { "name": "windows-vcpkg", "configurePreset": "windows-vcpkg", "output": { "outputOnFailure": true } },
+    { "name": "windows-clang", "configurePreset": "windows-clang", "output": { "outputOnFailure": true } },
+    { "name": "unix", "configurePreset": "unix", "output": { "outputOnFailure": true } }
+  ]
+}

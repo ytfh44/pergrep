@@ -1,18 +1,16 @@
 #include "pergrep/pergrep.hpp"
 #include "default_types.hpp"
+#include "platform.hpp"
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <fnmatch.h>
 #include <iomanip>
 #include <functional>
-#include <iconv.h>
 #include <cerrno>
-#include <archive.h>
-#include <archive_entry.h>
 #include <cstdio>
 #include <iostream>
 #include <numeric>
@@ -21,13 +19,28 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
+#include <archive.h>
+#include <archive_entry.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 namespace fs=std::filesystem;
 using namespace pergrep;
+
+// Construct a filesystem path from a UTF-8 narrow string. On Windows the
+// narrow-to-wide conversion is ambiguous (ANSI code page by default), so use
+// the explicit char8_t constructor; on Unix native narrow paths are already
+// UTF-8 in practice.
+inline fs::path to_path(std::string_view s) {
+#ifdef _WIN32
+    return fs::path(std::u8string(s.begin(), s.end()));
+#else
+    return fs::path(std::string(s));
+#endif
+}
 
 namespace {
 struct Args {
@@ -69,7 +82,7 @@ TypeMap effective_type_map(const Args& a) {
 }
 
 
-bool globmatch(std::string pat,std::string path,bool ci){if(ci){std::transform(pat.begin(),pat.end(),pat.begin(),::tolower);std::transform(path.begin(),path.end(),path.begin(),::tolower);}return fnmatch(pat.c_str(),path.c_str(),FNM_PATHNAME)==0||fnmatch(pat.c_str(),fs::path(path).filename().string().c_str(),0)==0;}
+bool globmatch(std::string pat,std::string path,bool ci){if(ci){std::transform(pat.begin(),pat.end(),pat.begin(),::tolower);std::transform(path.begin(),path.end(),path.begin(),::tolower);}return pergrep_cli::platform::fnmatch(pat,path)||pergrep_cli::platform::fnmatch(pat,to_path(path).filename().string());}
 
 std::string need(int&k,int argc,char**argv,std::string_view opt,std::optional<std::string>attached={}){if(attached)return*attached;if(++k>=argc)die("option requires a value: "+std::string(opt));return argv[k];}
 void parse_long(Args&a,std::string arg,int&k,int argc,char**argv){auto eq=arg.find('=');std::string name=arg.substr(2,eq==std::string::npos?std::string::npos:eq-2);std::optional<std::string>val;if(eq!=std::string::npos)val=arg.substr(eq+1);auto v=[&](){return need(k,argc,argv,"--"+name,val);};
@@ -103,7 +116,7 @@ case'A':a.after=(int)num(need(k,argc,argv,"-A",attached()));a.after_explicit=tru
 case'a':a.text=true;break;case'b':a.byte_offset=true;break;case'c':if(!a.files_mode){a.count=true;a.count_matches=false;a.files_with=false;a.files_without=false;}break;case'0':a.null_out=true;break;case'd':a.max_depth=(int)num(need(k,argc,argv,"-d",attached()));return;case'E':a.encoding=need(k,argc,argv,"-E",attached());return;case'e':a.patterns.push_back(need(k,argc,argv,"-e",attached()));return;case'f':a.pattern_files.push_back(need(k,argc,argv,"-f",attached()));return;case'F':a.popt.kind=PatternKind::Fixed;break;case'g':a.globs.push_back(need(k,argc,argv,"-g",attached()));return;case'h':a.short_help=true;break;case'H':a.with_filename=true;a.no_filename=false;break;case'I':a.no_filename=true;a.with_filename=false;break;case'i':a.popt.case_mode=CaseMode::Insensitive;break;case'j':a.threads=(int)num(need(k,argc,argv,"-j",attached()));return;case'l':if(!a.files_mode){a.files_with=true;a.files_without=false;a.count=false;a.count_matches=false;}break;case'L':a.follow=true;break;case'm':a.max_count=num(need(k,argc,argv,"-m",attached()));a.max_count_set=true;return;case'M':a.max_columns=(int)num(need(k,argc,argv,"-M",attached()));return;case'n':a.line_number=true;break;case'N':a.line_number=false;break;case'o':a.only_matching=true;break;case'p':a.pretty=true;a.color="always";a.heading=true;a.line_number=true;break;case'P':a.popt.engine=Engine::Pcre2Compat;a.engine="pcre2";break;case'q':a.quiet=true;break;case'r':a.replacement=need(k,argc,argv,"-r",attached());return;case's':a.popt.case_mode=CaseMode::Sensitive;break;case'S':a.popt.case_mode=CaseMode::Smart;break;case't':a.types.push_back(need(k,argc,argv,"-t",attached()));return;case'T':a.type_not.push_back(need(k,argc,argv,"-T",attached()));return;case'u':++a.unrestricted;a.no_ignore=true;if(a.unrestricted>=2)a.hidden=true;if(a.unrestricted>=3)a.binary=true;break;case'U':a.popt.multiline=true;a.stop_on_nonmatch=false;break;case'v':a.sopt.invert_match=true;break;case'V':a.version=true;break;case'w':a.popt.word=true;a.popt.line=false;break;case'x':a.popt.line=true;a.popt.word=false;break;case'z':a.search_zip=true;break;default:die(std::string("unrecognized flag -")+c);}}
 }
 
-Args parse(int argc,char**argv){Args a;bool positional=false;for(int k=1;k<argc;++k){std::string x=argv[k];if(!positional&&x=="--"){positional=true;continue;}if(!positional&&x.rfind("--",0)==0)parse_long(a,x,k,argc,argv);else if(!positional&&x.size()>1&&x[0]=='-')parse_short(a,x,k,argc,argv);else{if(a.files_mode)a.paths.push_back(x);else if(a.patterns.empty()&&a.pattern_files.empty())a.patterns.push_back(x);else a.paths.push_back(x);}}for(auto&pf:a.pattern_files){std::istream*in=nullptr;std::ifstream f;if(pf=="-")in=&std::cin;else{f.open(pf);if(!f)die("cannot open pattern file: "+pf);in=&f;}std::string s;while(std::getline(*in,s))a.patterns.push_back(s);}if(a.context_seen)a.passthru=false;if(a.only_matching&&a.count){a.count=false;a.count_matches=true;}if(a.paths.empty()){if(!isatty(STDIN_FILENO)){a.paths.push_back("-");a.stdin_haystack=true;}else a.paths.push_back(".");}a.sopt.include_binary=a.text||a.binary||a.unrestricted>=3;if(a.files_with){a.sopt.files_with_matches=true;}if(a.files_without){a.sopt.files_without_match=true;}return a;}
+Args parse(int argc,char**argv){Args a;bool positional=false;for(int k=1;k<argc;++k){std::string x=argv[k];if(!positional&&x=="--"){positional=true;continue;}if(!positional&&x.rfind("--",0)==0)parse_long(a,x,k,argc,argv);else if(!positional&&x.size()>1&&x[0]=='-')parse_short(a,x,k,argc,argv);else{if(a.files_mode)a.paths.push_back(x);else if(a.patterns.empty()&&a.pattern_files.empty())a.patterns.push_back(x);else a.paths.push_back(x);}}for(auto&pf:a.pattern_files){std::istream*in=nullptr;std::ifstream f;if(pf=="-")in=&std::cin;else{f.open(to_path(pf));if(!f)die("cannot open pattern file: "+pf);in=&f;}std::string s;while(std::getline(*in,s))a.patterns.push_back(s);}if(a.context_seen)a.passthru=false;if(a.only_matching&&a.count){a.count=false;a.count_matches=true;}if(a.paths.empty()){if(!pergrep_cli::platform::isatty_stdin()){a.paths.push_back("-");a.stdin_haystack=true;}else a.paths.push_back(".");}a.sopt.include_binary=a.text||a.binary||a.unrestricted>=3;if(a.files_with){a.sopt.files_with_matches=true;}if(a.files_without){a.sopt.files_without_match=true;}return a;}
 
 Args parse_with_config(int argc, char** argv) {
     bool disable=false;
@@ -158,11 +171,22 @@ std::string decode_utf16_bytes(std::string_view in, bool little, bool bom_allowe
     auto emit=[&](std::uint32_t cp){if(cp<=0x7f)out.push_back(char(cp));else if(cp<=0x7ff){out.push_back(char(0xc0|(cp>>6)));out.push_back(char(0x80|(cp&63)));}else if(cp<=0xffff){out.push_back(char(0xe0|(cp>>12)));out.push_back(char(0x80|((cp>>6)&63)));out.push_back(char(0x80|(cp&63)));}else{out.push_back(char(0xf0|(cp>>18)));out.push_back(char(0x80|((cp>>12)&63)));out.push_back(char(0x80|((cp>>6)&63)));out.push_back(char(0x80|(cp&63)));}};
     while(i+1<in.size()){std::uint16_t w=unit(i);i+=2;if(w>=0xd800&&w<=0xdbff&&i+1<in.size()){std::uint16_t w2=unit(i);if(w2>=0xdc00&&w2<=0xdfff){i+=2;emit(0x10000+((w-0xd800)<<10)+(w2-0xdc00));continue;}}if(w>=0xdc00&&w<=0xdfff)emit(0xfffd);else emit(w);}return out;
 }
+#ifdef _WIN32
+std::string iconv_to_utf8(std::string_view in, std::string enc) {
+    // Windows has no iconv; fall back to the system ANSI code page.
+    std::string out;
+    if (!pergrep_cli::platform::ansi_to_utf8(in, out))
+        die("unknown or unsupported encoding: "+enc);
+    if(out.rfind("\xEF\xBB\xBF",0)==0)out.erase(0,3);
+    return out;
+}
+#else
 std::string iconv_to_utf8(std::string_view in, std::string enc) {
     iconv_t cd=iconv_open("UTF-8",enc.c_str());if(cd==(iconv_t)-1)die("unknown or unsupported encoding: "+enc);
     std::string out(std::max<std::size_t>(64,in.size()*4+16),'\0');char* pin=const_cast<char*>(in.data());std::size_t left=in.size(),used=0;
     while(left){char* pout=out.data()+used;std::size_t avail=out.size()-used;auto r=iconv(cd,&pin,&left,&pout,&avail);used=out.size()-avail;if(r!=(size_t)-1)break;if(errno==E2BIG){out.resize(out.size()*2);continue;}iconv_close(cd);die("input is not valid for encoding "+enc);}iconv_close(cd);out.resize(used);if(out.rfind("\xEF\xBB\xBF",0)==0)out.erase(0,3);return out;
 }
+#endif
 std::string decode_input(std::string_view in, std::string enc) {
     auto lower=enc;std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return char(std::tolower(c));});
     if(lower=="auto") {if(in.size()>=2&&(unsigned char)in[0]==0xff&&(unsigned char)in[1]==0xfe)return decode_utf16_bytes(in,true);if(in.size()>=2&&(unsigned char)in[0]==0xfe&&(unsigned char)in[1]==0xff)return decode_utf16_bytes(in,false);return std::string(in);}
@@ -190,6 +214,15 @@ std::vector<std::string> split_command_words(std::string_view command){
     if(out.empty())die("--pre command is empty");
     return out;
 }
+#ifdef _WIN32
+std::string run_preprocessor(const std::string& cmd,const fs::path& path){
+    auto words=split_command_words(cmd);words.push_back(pergrep_cli::platform::path_to_utf8(path));
+    std::string out;
+    if(!pergrep_cli::platform::run_capture(words,std::string_view{},out))
+        die("--pre command failed for "+pergrep_cli::platform::path_to_utf8(path));
+    return out;
+}
+#else
 std::string run_preprocessor(const std::string& cmd,const fs::path& path){
     auto words=split_command_words(cmd);words.push_back(path.string());
     int fds[2];
@@ -209,10 +242,24 @@ std::string run_preprocessor(const std::string& cmd,const fs::path& path){
     if(!WIFEXITED(status)||WEXITSTATUS(status)!=0)die("--pre command failed for "+path.string());
     return out;
 }
-std::string archive_decode_file(const fs::path& path){archive*a=archive_read_new();archive_read_support_filter_all(a);archive_read_support_format_all(a);archive_read_support_format_raw(a);if(archive_read_open_filename(a,path.c_str(),10240)!=ARCHIVE_OK){auto e=archive_error_string(a);std::string m=e?e:"cannot open archive";archive_read_free(a);die("archive decode failed: "+m);}std::string out;archive_entry*ent=nullptr;while(archive_read_next_header(a,&ent)==ARCHIVE_OK){if(archive_entry_filetype(ent)!=AE_IFREG){archive_read_data_skip(a);continue;}char buf[16384];for(;;){la_ssize_t n=archive_read_data(a,buf,sizeof buf);if(n==0)break;if(n<0){auto e=archive_error_string(a);std::string m=e?e:"archive read failed";archive_read_free(a);die(m);}out.append(buf,(size_t)n);}if(!out.empty()&&out.back()!='\n')out.push_back('\n');}archive_read_free(a);return out;}
+#endif
+std::string archive_decode_file(const fs::path& path){archive*a=archive_read_new();archive_read_support_filter_all(a);archive_read_support_format_all(a);archive_read_support_format_raw(a);
+#ifdef _WIN32
+    if(archive_read_open_filename_w(a,path.c_str(),10240)!=ARCHIVE_OK){
+#else
+    if(archive_read_open_filename(a,path.c_str(),10240)!=ARCHIVE_OK){
+#endif
+    auto e=archive_error_string(a);std::string m=e?e:"cannot open archive";archive_read_free(a);die("archive decode failed: "+m);}std::string out;archive_entry*ent=nullptr;while(archive_read_next_header(a,&ent)==ARCHIVE_OK){if(archive_entry_filetype(ent)!=AE_IFREG){archive_read_data_skip(a);continue;}char buf[16384];for(;;){la_ssize_t n=archive_read_data(a,buf,sizeof buf);if(n==0)break;if(n<0){auto e=archive_error_string(a);std::string m=e?e:"archive read failed";archive_read_free(a);die(m);}out.append(buf,(size_t)n);}if(!out.empty()&&out.back()!='\n')out.push_back('\n');}archive_read_free(a);return out;}
 bool pre_applies(const Args&a,std::string_view rel){if(a.pre.empty())return false;if(a.pre_globs.empty())return true;for(auto&g:a.pre_globs)if(globmatch(g,std::string(rel),false))return true;return false;}
 
-std::string cache_path(const fs::path&root){const char*base=getenv("PERGREP_CACHE_DIR");fs::path dir=base?base:(getenv("XDG_CACHE_HOME")?fs::path(getenv("XDG_CACHE_HOME"))/"pergrep":fs::path(getenv("HOME")?getenv("HOME"):".")/".cache/pergrep");auto s=fs::weakly_canonical(root).string();uint64_t h=1469598103934665603ull;for(unsigned char c:s){h^=c;h*=1099511628211ull;}std::ostringstream o;o<<std::hex<<h;return(dir/o.str()/"index.pgi").string();}
+std::string cache_path(const fs::path&root){const char*base=getenv("PERGREP_CACHE_DIR");fs::path dir;
+#ifdef _WIN32
+    if(!base){const char*la=getenv("LOCALAPPDATA");dir=la?to_path(la)/"pergrep":to_path(".")/"pergrep-cache";}
+#else
+    if(!base)dir=(getenv("XDG_CACHE_HOME")?to_path(getenv("XDG_CACHE_HOME"))/"pergrep":to_path(getenv("HOME")?getenv("HOME"):".")/".cache/pergrep");
+#endif
+    if(base)dir=to_path(base);
+    auto s=pergrep_cli::platform::path_to_utf8(fs::weakly_canonical(root));uint64_t h=1469598103934665603ull;for(unsigned char c:s){h^=c;h*=1099511628211ull;}std::ostringstream o;o<<std::hex<<h;return(dir/o.str()/"index.pgi").string();}
 
 struct IgnoreRule { fs::path base; std::string pat; bool neg=false, ci=false, dir_only=false; };
 struct PathSelector { std::string rel; bool directory=false; };
@@ -235,13 +282,19 @@ bool gitignore_rule_match(const IgnoreRule&r,std::string local){
 std::pair<fs::path,std::vector<PathSelector>> resolve_paths(const std::vector<std::string>& paths) {
     std::vector<fs::path> abs, bases;
     for (auto& raw : paths) {
-        std::error_code ec; fs::path p=fs::absolute(raw,ec); if(ec||!fs::exists(p)) die("path does not exist: "+raw);
+        std::error_code ec; fs::path p=fs::absolute(to_path(raw),ec); if(ec||!fs::exists(p)) die("path does not exist: "+raw);
         p=fs::weakly_canonical(p,ec); if(ec) die("cannot resolve path: "+raw); abs.push_back(p); bases.push_back(fs::is_directory(p)?p:p.parent_path());
     }
     fs::path root=bases.front();
     auto is_prefix=[](const fs::path&a,const fs::path&b){auto ia=a.begin(),ib=b.begin();for(;ia!=a.end();++ia,++ib)if(ib==b.end()||*ia!=*ib)return false;return true;};
     while(!root.empty()) { bool ok=true; for(auto&b:bases) ok &= is_prefix(root,b); if(ok) break; root=root.parent_path(); }
-    if(root.empty()) root=fs::path("/");
+    if(root.empty()){
+#ifdef _WIN32
+        root=fs::path("\\");
+#else
+        root=fs::path("/");
+#endif
+    }
     std::vector<PathSelector> sel; for(auto&p:abs){auto rel=fs::relative(p,root).generic_string();if(rel.empty())rel=".";sel.push_back({rel,fs::is_directory(p)});} return {root,sel};
 }
 
@@ -251,8 +304,8 @@ std::vector<IgnoreRule> load_ignore(const fs::path&root,const Args&a){
     auto git_root=[&]()->std::optional<fs::path>{for(fs::path p=fs::absolute(root).lexically_normal();!p.empty();p=p.parent_path()){if(fs::exists(p/".git"))return p;if(p==p.root_path())break;}return std::nullopt;};
     auto gr=git_root();bool vcs_active=a.no_require_git||gr.has_value();
     // Manual ignore files have lower precedence than discovered local ignore files.
-    if(!a.no_ignore_files)for(auto&p:a.ignore_files)read(fs::absolute(p),root,a.ignore_file_ci);
-    if(!a.no_ignore_global&&vcs_active){const char*xdg=getenv("XDG_CONFIG_HOME"),*home=getenv("HOME");fs::path gp=xdg?fs::path(xdg)/"git/ignore":(home?fs::path(home)/".config/git/ignore":fs::path{});if(!gp.empty())read(gp,root,false);}
+    if(!a.no_ignore_files)for(auto&p:a.ignore_files)read(fs::absolute(to_path(p)),root,a.ignore_file_ci);
+    if(!a.no_ignore_global&&vcs_active){const char*xdg=getenv("XDG_CONFIG_HOME"),*home=getenv("HOME");fs::path gp=xdg?to_path(xdg)/"git/ignore":(home?to_path(home)/".config/git/ignore":fs::path{});if(!gp.empty())read(gp,root,false);}
     if(!a.no_ignore_exclude&&gr)read(*gr/".git/info/exclude",*gr,false);
     std::vector<fs::path> discovered;
     if(!a.no_ignore_parent){for(fs::path p=fs::absolute(root).parent_path();!p.empty();p=p.parent_path()){if(!a.no_ignore_dot){if(fs::exists(p/".ignore"))discovered.push_back(p/".ignore");if(fs::exists(p/".rgignore"))discovered.push_back(p/".rgignore");}if(!a.no_ignore_vcs&&vcs_active&&fs::exists(p/".gitignore"))discovered.push_back(p/".gitignore");if(p==p.root_path())break;}}
@@ -274,7 +327,7 @@ bool selector_match(std::string_view path,const std::vector<PathSelector>&sel){
 bool allowed_path(const fs::path&root,std::string path,const FileInfo&fi,const Args&a,const std::vector<IgnoreRule>&ign,const std::vector<PathSelector>&sel,const TypeMap&tm){
     if(!selector_match(path,sel)) return false;
     if(a.max_filesize&&fi.size>a.max_filesize) return false;
-    if(a.one_file_system){struct stat target{};if(::stat((root/path).c_str(),&target)==0){bool same=false;for(const auto&q:sel){bool owns=q.rel=="."||(q.directory&&(path==q.rel||path.rfind(q.rel+"/",0)==0))||(!q.directory&&path==q.rel);if(!owns)continue;fs::path base=q.rel=="."?root:(root/q.rel);if(!q.directory)base=base.parent_path();struct stat bst{};if(::stat(base.c_str(),&bst)==0&&bst.st_dev==target.st_dev){same=true;break;}}if(!same)return false;}}
+    if(a.one_file_system){for(const auto&q:sel){bool owns=q.rel=="."||(q.directory&&(path==q.rel||path.rfind(q.rel+"/",0)==0))||(!q.directory&&path==q.rel);if(!owns)continue;fs::path base=q.rel=="."?root:(root/to_path(q.rel));if(!q.directory)base=base.parent_path();if(!pergrep_cli::platform::same_device(root/to_path(path),base))return false;}}
     bool explicit_file=false;for(const auto& q:sel)if(!q.directory&&q.rel==path){explicit_file=true;break;}
     if(explicit_file)return true;
     if(a.max_depth>=0){
@@ -291,8 +344,8 @@ bool allowed_path(const fs::path&root,std::string path,const FileInfo&fi,const A
         }
         if(!depth_ok)return false;
     }
-    if(!a.hidden){for(auto&part:fs::path(path)){auto q=part.string();if(q.size()>1&&q[0]=='.')return false;}}
-    bool ignored=false;auto full=(fs::absolute(root)/path).lexically_normal();for(auto&r:ign){auto localp=full.lexically_relative(r.base);if(localp.empty())continue;auto local=localp.generic_string();if(local==".."||local.rfind("../",0)==0)continue;if(gitignore_rule_match(r,local))ignored=!r.neg;}if(ignored)return false;
+    if(!a.hidden){for(auto&part:to_path(path)){auto q=part.string();if(q.size()>1&&q[0]=='.')return false;}}
+    bool ignored=false;auto full=(fs::absolute(root)/to_path(path)).lexically_normal();for(auto&r:ign){auto localp=full.lexically_relative(r.base);if(localp.empty())continue;auto local=localp.generic_string();if(local==".."||local.rfind("../",0)==0)continue;if(gitignore_rule_match(r,local))ignored=!r.neg;}if(ignored)return false;
     bool has_pos=false,pos_hit=false;for(auto&g:a.globs){bool neg=!g.empty()&&g[0]=='!';auto pat=neg?g.substr(1):g;if(neg){if(globmatch(pat,path,a.glob_ci))return false;}else{has_pos=true;pos_hit|=globmatch(pat,path,a.glob_ci);}}if(has_pos&&!pos_hit)return false;
     if(!a.iglobs.empty()){bool ok=false;for(auto&g:a.iglobs){bool neg=!g.empty()&&g[0]=='!';auto pat=neg?g.substr(1):g;if(neg&&globmatch(pat,path,true))return false;if(!neg)ok|=globmatch(pat,path,true);}if(std::any_of(a.iglobs.begin(),a.iglobs.end(),[](auto&g){return g.empty()||g[0]!='!';})&&!ok)return false;}
     auto typeok=[&](const std::string& t){auto it=tm.find(t);if(it==tm.end())return false;for(auto&p:it->second)if(globmatch(p,path,false))return true;return false;};auto recognized=[&](){for(const auto&[_,ps]:tm)for(const auto&p:ps)if(globmatch(p,path,false))return true;return false;};if(!a.types.empty()){bool ok=false;for(auto&t:a.types)ok|=(t=="all"?recognized():typeok(t));if(!ok)return false;}for(auto&t:a.type_not)if(t=="all"?recognized():typeok(t))return false;return true;
@@ -360,7 +413,7 @@ std::string base64(std::string_view s) {
     for(std::size_t i=0;i<s.size();i+=3){unsigned v=(unsigned char)s[i]<<16;int n=1;if(i+1<s.size()){v|=(unsigned char)s[i+1]<<8;++n;}if(i+2<s.size()){v|=(unsigned char)s[i+2];++n;}o.push_back(T[(v>>18)&63]);o.push_back(T[(v>>12)&63]);o.push_back(n>1?T[(v>>6)&63]:'=');o.push_back(n>2?T[v&63]:'=');} return o;
 }
 std::string json_data(std::string_view s) { return valid_utf8(s) ? std::string("{\"text\":\"")+json_escape(s)+"\"}" : std::string("{\"bytes\":\"")+base64(s)+"\"}"; }
-bool color_enabled(const Args& a) { return a.color=="always"||a.color=="ansi"||(a.color=="auto"&&isatty(STDOUT_FILENO)); }
+bool color_enabled(const Args& a) { return a.color=="always"||a.color=="ansi"||(a.color=="auto"&&pergrep_cli::platform::isatty_stdout()); }
 
 struct AnsiStyle {
     bool enabled = true;
@@ -459,10 +512,10 @@ std::string ansi_path(std::string_view s,const Args&a){
     std::string p(s);
     if(!a.hyperlink_format.empty() && a.hyperlink_format!="none" && color_enabled(a)){
         std::string target;
-        if(a.hyperlink_format=="default" || a.hyperlink_format=="file") target="file://"+fs::absolute(fs::path(std::string(s))).generic_string();
+        if(a.hyperlink_format=="default" || a.hyperlink_format=="file") target="file://"+fs::absolute(to_path(s)).generic_string();
         else {
             target=a.hyperlink_format;
-            std::string abs=fs::absolute(fs::path(std::string(s))).generic_string();
+            std::string abs=fs::absolute(to_path(s)).generic_string();
             for(std::string key : {"{path}","{path_abs}"}) for(std::size_t pos=0;(pos=target.find(key,pos))!=std::string::npos;) { target.replace(pos,key.size(),abs); pos+=abs.size(); }
             for(std::string key : {"{line}","{column}"}) for(std::size_t pos=0;(pos=target.find(key,pos))!=std::string::npos;) { target.replace(pos,key.size(),"1"); pos+=1; }
         }
@@ -535,7 +588,37 @@ std::vector<std::vector<const Match*>> matches_by_line(
 
 } // namespace
 
+#ifdef _WIN32
+// Windows: command-line arguments arrive as UTF-16; convert them to UTF-8 so
+// paths with non-ANSI characters work. The rest of the CLI is encoding-agnostic.
+int run_main(int argc, char** argv);
+int wmain(int argc, wchar_t** wargv) {
+    // Emit UTF-8 to the console and read stdin as bytes; without this the CRT
+    // and console interpret output through the active ANSI code page.
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+    _setmode(_fileno(stdin), _O_BINARY);
+    ::SetConsoleOutputCP(CP_UTF8);
+    ::SetConsoleCP(CP_UTF8);
+    std::vector<std::string> storage;
+    storage.reserve(static_cast<std::size_t>(argc));
+    for (int i = 0; i < argc; ++i) {
+        int n = ::WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 0) { storage.emplace_back(); continue; }
+        std::string s(static_cast<std::size_t>(n), '\0');
+        ::WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
+        s.pop_back(); // trailing NUL from WideCharToMultiByte
+        storage.push_back(std::move(s));
+    }
+    std::vector<char*> av;
+    av.reserve(storage.size());
+    for (auto& s : storage) av.push_back(s.data());
+    return run_main(argc, av.data());
+}
+int run_main(int argc, char** argv) {
+#else
 int main(int argc, char** argv) {
+#endif
     try {
         auto a = parse_with_config(argc, argv);
         if (a.help || a.short_help) { std::cout << help(); return 0; }
@@ -557,7 +640,7 @@ int main(int argc, char** argv) {
             if(!idx){auto t=std::chrono::steady_clock::now();IndexOptions io;io.follow_symlinks=a.follow;idx=std::make_shared<Index>(Index::build(root,io));if(!a.follow)idx->save(cp);if(a.debug)std::cerr<<"pergrep: built index in "<<std::chrono::duration<double>(std::chrono::steady_clock::now()-t).count()<<"s\n";}
         }
 
-        if(!a.stdin_haystack){bool transform=a.encoding!="auto"||!a.pre.empty()||a.search_zip;if(!transform){for(std::size_t i=0;i<idx->files().size();++i){auto d=idx->content(i);if(d.size()>=2&&(((unsigned char)d[0]==0xff&&(unsigned char)d[1]==0xfe)||((unsigned char)d[0]==0xfe&&(unsigned char)d[1]==0xff))){transform=true;break;}}}if(transform){std::vector<Document> docs;docs.reserve(idx->files().size());for(std::size_t i=0;i<idx->files().size();++i){auto rel=idx->files()[i].path;std::string bytes;if(pre_applies(a,rel))bytes=run_preprocessor(a.pre,root/rel);else if(a.search_zip){std::error_code ec;auto ext=(root/rel).extension().string();if(ext==".gz"||ext==".tgz"||ext==".bz2"||ext==".xz"||ext==".lz4"||ext==".zst"||ext==".zip"||ext==".tar")bytes=archive_decode_file(root/rel);else bytes=std::string(idx->content(i));}else bytes=std::string(idx->content(i));docs.push_back({rel,decode_input(bytes,a.encoding)});}idx=std::make_shared<Index>(Index::from_documents(std::move(docs)));}}
+        if(!a.stdin_haystack){bool transform=a.encoding!="auto"||!a.pre.empty()||a.search_zip;if(!transform){for(std::size_t i=0;i<idx->files().size();++i){auto d=idx->content(i);if(d.size()>=2&&(((unsigned char)d[0]==0xff&&(unsigned char)d[1]==0xfe)||((unsigned char)d[0]==0xfe&&(unsigned char)d[1]==0xff))){transform=true;break;}}}if(transform){std::vector<Document> docs;docs.reserve(idx->files().size());for(std::size_t i=0;i<idx->files().size();++i){auto rel=idx->files()[i].path;auto full=root/to_path(rel);std::string bytes;if(pre_applies(a,rel))bytes=run_preprocessor(a.pre,full);else if(a.search_zip){std::error_code ec;auto ext=full.extension().string();if(ext==".gz"||ext==".tgz"||ext==".bz2"||ext==".xz"||ext==".lz4"||ext==".zst"||ext==".zip"||ext==".tar")bytes=archive_decode_file(full);else bytes=std::string(idx->content(i));}else bytes=std::string(idx->content(i));docs.push_back({rel,decode_input(bytes,a.encoding)});}idx=std::make_shared<Index>(Index::from_documents(std::move(docs)));}}
         auto ignore = a.stdin_haystack ? std::vector<IgnoreRule>{} : load_ignore(root, a);
         auto tm = effective_type_map(a);
         std::vector<uint8_t> allowed(idx->files().size());
@@ -611,14 +694,14 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> order(idx->files().size());
         std::iota(order.begin(), order.end(), 0);
         if(!a.sort.empty()){bool rev=a.sort.rfind("reverse:",0)==0;std::string kind=rev?a.sort.substr(8):a.sort;if(kind=="path:reverse"){kind="path";rev=true;}
-            auto meta=[&](uint32_t id)->std::int64_t{auto path=root/idx->files()[id].path;std::error_code ec;if(kind=="modified")return idx->files()[id].mtime_ns;if(kind=="accessed"){struct stat st{};if(::stat(path.c_str(),&st)!=0)return 0;return (std::int64_t)st.st_atim.tv_sec*1000000000LL+st.st_atim.tv_nsec;}if(kind=="created"){struct stat st{};if(::stat(path.c_str(),&st)!=0)die("creation time unavailable");return (std::int64_t)st.st_ctim.tv_sec*1000000000LL+st.st_ctim.tv_nsec;}return 0;};
+            auto meta=[&](uint32_t id)->std::int64_t{auto path=root/to_path(idx->files()[id].path);std::error_code ec;if(kind=="modified")return idx->files()[id].mtime_ns;if(kind=="accessed")return pergrep_cli::platform::file_time_ns(path,"accessed");if(kind=="created"){auto v=pergrep_cli::platform::file_time_ns(path,"created");if(v==0)die("creation time unavailable");return v;}return 0;};
             if(kind=="path")std::sort(order.begin(),order.end(),[&](auto x,auto y){return rev?idx->files()[x].path>idx->files()[y].path:idx->files()[x].path<idx->files()[y].path;});
             else if(kind=="modified"||kind=="accessed"||kind=="created")std::stable_sort(order.begin(),order.end(),[&](auto x,auto y){auto a1=meta(x),b1=meta(y);return rev?a1>b1:a1<b1;});
             else die("invalid sort kind: "+kind); }
 
         const bool default_show_filename = !a.stdin_haystack && (selectors.size() > 1 || std::any_of(selectors.begin(), selectors.end(), [](const PathSelector& s){ return s.directory; }));
         const bool show_filename = !a.no_filename && (a.with_filename || default_show_filename);
-        const bool heading = show_filename && (a.heading || (!a.no_heading && isatty(STDOUT_FILENO)));
+        const bool heading = show_filename && (a.heading || (!a.no_heading && pergrep_cli::platform::isatty_stdout()));
         if (a.json && (a.files_mode || a.files_with || a.files_without || a.count || a.count_matches))
             die("--json cannot be combined with file/count summary output modes");
 
