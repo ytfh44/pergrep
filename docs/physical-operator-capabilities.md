@@ -134,6 +134,48 @@ versioned query profiles and metric names are in
 [`docs/workload-matrix.md`](workload-matrix.md). Counters alone do not prove a
 scheduler selected the cheapest operator.
 
+## M1.5 planner statistics
+
+Each indexed four-byte window contributes to two intentionally separate
+statistics families:
+
+* `IndexData::qgram_freq[hash & 65535]` is the legacy **hash-bucket
+  occurrence** counter. It counts windows (saturating at `UINT32_MAX`) and is
+  used only by the conservative filter compatibility surface.
+* `IndexData::exact_qgrams` is keyed by the raw four bytes, not the hash.
+  `occurrence_frequency` counts every exact window; `chunk_frequency` counts
+  distinct chunks whose extended view contains the q-gram; and
+  `document_frequency` counts distinct indexed files containing it. These are
+  counts, not probabilities. Their ID vectors make the same counts available
+  for an eligible-file selector without assuming selected files have the
+  global distribution.
+
+For collision safety, `hash_chunk_freq`/`hash_chunk_ids` count distinct chunks
+per legacy hash bucket. A planner signal is `max(exact chunk frequency, hash
+bucket chunk frequency)`, divided by the eligible chunk count. This is an
+upper bound on the chunks that a hash-based filter can emit: collisions can
+widen work, but cannot make the planner reject a true match. A q-gram shorter
+than four bytes has no q-gram selectivity signal and predicts all eligible
+chunks. Estimated verified bytes are candidate chunks times the configured
+chunk size (or all candidate blocks times the same bounded unit); this is a
+work estimate, not a claim about source-byte occurrences or I/O.
+For bounded resource use, exact table construction is enabled up to the
+deterministic 128 MiB corpus cap and one million distinct raw q-grams. Above
+either bound, planner tables are cleared and marked unavailable; planning
+returns selectivity 1.0 (all eligible chunks), while legacy hash filters and
+exact verification remain unchanged. This is intentionally uncalibrated
+fallback behavior, not a reinterpretation of occurrence counts.
+
+The v5/v6 on-disk layout is unchanged. Those versions persist only the legacy
+filter arrays and metadata (v6 additionally persists corpus bytes), so
+`Index::load` deterministically rebuilds exact/chunk/document statistics from
+the loaded corpus when under the cap. Legacy bytes are never reinterpreted as
+exact statistics. The resulting prediction bound is the remaining eligible
+chunks/blocks and extended verifier-slice bytes; Bloom false positives and
+hash collisions may make observations lower than estimates, while
+conservative candidate membership and all exact-match semantics remain
+unchanged.
+
 ## M1.3 PlanKey cross-check
 
 `make_plan_key` copies the pattern expression, all `PatternOptions` fields, all

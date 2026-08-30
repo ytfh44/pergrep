@@ -13,9 +13,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -29,6 +29,10 @@ inline std::uint32_t hash4(const unsigned char* p) noexcept {
 }
 inline unsigned char fold_ascii(unsigned char c) noexcept {
     return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+}
+inline std::uint32_t qgram4_key(const unsigned char* p) noexcept {
+    return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
+           (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
 }
 
 struct QueryDesc {
@@ -225,6 +229,24 @@ struct IndexData {
     };
 using PosDesc = detail::PosDesc;
 
+    // Planner statistics are deliberately separate from qgram_freq. qgram_freq
+    // is the legacy 16-bit hash-bucket occurrence counter used only by the
+    // conservative filters. Planner entries are keyed by the raw four bytes,
+    // so hash collisions cannot merge their exact frequencies.
+    struct QgramStats {
+        std::uint64_t occurrence_frequency = 0; // exact 4-byte windows
+        std::uint64_t chunk_frequency = 0;      // distinct chunks containing it
+        std::uint64_t document_frequency = 0;   // distinct documents containing it
+        std::vector<std::uint32_t> chunk_ids;   // sorted deterministic scope index
+        std::vector<std::uint32_t> document_ids;
+    };
+    std::map<std::uint32_t, QgramStats> exact_qgrams;
+    // Distinct chunks per legacy hash bucket. This is an upper bound for an
+    // exact q-gram's filter candidates and widens estimates under collisions.
+    std::array<std::vector<std::uint32_t>,65536> hash_chunk_ids;
+    std::array<std::uint64_t,65536> hash_chunk_freq{};
+    bool planner_stats_ready = false;
+
     std::filesystem::path root;
     IndexOptions opt;
     std::vector<FileInfo> infos;
@@ -244,20 +266,22 @@ using PosDesc = detail::PosDesc;
         std::uint64_t n = pos.size() + pos_desc.size()*sizeof(PosDesc) + chunks.size()*sizeof(Chunk);
         for (const auto& g : groups) n += g.bits.size()*sizeof(std::uint64_t) + g.gids.size()*sizeof(std::uint32_t);
         n += infos.size()*sizeof(FileInfo) + byte_freq.size()*sizeof(std::uint64_t) + qgram_freq.size()*sizeof(std::uint32_t);
-        for (const auto& f : infos) n += f.path.size();
+        n += hash_chunk_freq.size() * sizeof(std::uint64_t);
+        for (const auto& [key, q] : exact_qgrams)
+            n += sizeof(key) + sizeof(QgramStats) + q.chunk_ids.size()*sizeof(std::uint32_t) +
+                 q.document_ids.size()*sizeof(std::uint32_t);
+        for (const auto& ids : hash_chunk_ids)
+            n += ids.size() * sizeof(std::uint32_t);
         return n;
     }
 };
-// QO-4 cost model & scheduler: estimates selectivity via corpus qgram_freq / byte_freq
-// and chunk pruning rate, then chooses the cheapest verifier. The model is
-// conservative (no false negatives) — it only influences which verifier runs,
-// never whether a candidate is discarded. Current dispatch (kept but documented):
-//   is_pure_literal (multiline || !contains sep) -> Fixed
-//   q.size()>overlap -> whole-file rare-byte scan
-//   icase||word||line -> chunk-level rare-byte
-//   q.size()<=64 -> positional blocks
-//   else -> chunk fallback
-// For regex: branch_mandatory union or mandatory chunk pruning, then per-file regex_find_all.
+
+// QO-4/M1.5 cost model & scheduler: estimates selectivity via exact q-gram
+// chunk/document statistics, widened by legacy hash-bucket chunk counts for
+// collision uncertainty. The model is conservative (no false negatives) — it
+// only influences verifier annotation/planning and never rejects candidates.
+// Candidate units are chunks, positional blocks, and verifier bytes; source
+// q-gram occurrence bytes are not candidate-work proxies.
 enum class VerifierKind : std::uint8_t { FixedRareByte = 0, FixedPositional = 1, RegexChunk = 2, RegexBruteForce = 3 };
 inline const char* to_string(VerifierKind k) noexcept {
     switch (k) {
@@ -282,9 +306,8 @@ struct QueryCost {
 } // namespace pergrep::detail
 
 namespace pergrep {
-// QO-4 cost model: estimate selectivity via IndexData qgram_freq/byte_freq and
-// chunk pruning rate, then choose cheapest verifier. Keeps existing dispatch
-// but adds explicit cost comments and helper chooseVerifier.
+// M1.5 cost model: exact q-gram chunk/document statistics, widened by
+// collision-prone hash-bucket chunk counts; no candidate rejection.
 detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, unsigned char record_separator = '\n');
 detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator = '\n');
 // Internal helper: pick rarest q-gram branch (for tests).

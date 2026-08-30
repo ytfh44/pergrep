@@ -215,6 +215,15 @@ struct SearchStats {
     double estimated_cost = 0.0;
     double plan_regret = 0.0;
     bool verifier_fallback = false;
+    // Planner predictions are candidate-work units, not corpus-byte
+    // occurrence proxies. Bounds are conservative upper bounds widened for
+    // legacy hash collisions; observed values may be lower.
+    std::uint64_t predicted_candidate_chunks = 0;
+    std::uint64_t predicted_candidate_blocks = 0;
+    std::uint64_t predicted_verified_bytes = 0;
+    std::uint64_t prediction_error_bound_chunks = 0;
+    std::uint64_t prediction_error_bound_blocks = 0;
+    std::uint64_t prediction_error_bound_bytes = 0;
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind

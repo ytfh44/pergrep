@@ -19,6 +19,11 @@
 
 int main(void){
     assert(pg_version() != NULL);
+    mkdir_test("test_c_corpus");
+    FILE* fixture = fopen("test_c_corpus/sample.txt", "wb");
+    assert(fixture != NULL);
+    fputs("pergrep fixture content PERGREP fixture content\none two three four five six seven eight nine ten eleven twelve\n", fixture);
+    fclose(fixture);
 
     // pg_index_build error handling without leaks
     {
@@ -115,7 +120,7 @@ int main(void){
     {
         char* err = NULL;
         pg_index_options iopt = pg_index_options_default();
-        pg_index* idx = pg_index_build(".", &iopt, &err);
+        pg_index* idx = pg_index_build("test_c_corpus", &iopt, &err);
         assert(idx != NULL);
         assert(err == NULL);
         assert(pg_index_file_count(idx) > 0);
@@ -152,7 +157,7 @@ int main(void){
     {
         char* err = NULL;
         pg_index_options iopt = pg_index_options_default();
-        pg_index* idx = pg_index_build(".", &iopt, &err);
+        pg_index* idx = pg_index_build("test_c_corpus", &iopt, &err);
         assert(idx != NULL);
         pg_searcher* searcher = pg_searcher_new(idx, &err);
         assert(searcher != NULL);

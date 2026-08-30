@@ -30,6 +30,12 @@ struct QueryTotals {
     std::uint64_t candidate_files = 0;
     std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
+    std::uint64_t predicted_candidate_chunks = 0;
+    std::uint64_t predicted_candidate_blocks = 0;
+    std::uint64_t predicted_verified_bytes = 0;
+    std::uint64_t prediction_error_bound_chunks = 0;
+    std::uint64_t prediction_error_bound_blocks = 0;
+    std::uint64_t prediction_error_bound_bytes = 0;
     std::string verifier = {};
     double estimated_selectivity = 0.0;
     double plan_regret = 0.0;
@@ -63,6 +69,12 @@ struct ScenarioTotals {
     std::uint64_t candidate_files = 0;
     std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
+    std::uint64_t predicted_candidate_chunks = 0;
+    std::uint64_t predicted_candidate_blocks = 0;
+    std::uint64_t predicted_verified_bytes = 0;
+    std::uint64_t prediction_error_bound_chunks = 0;
+    std::uint64_t prediction_error_bound_blocks = 0;
+    std::uint64_t prediction_error_bound_bytes = 0;
     double fallback_rate = 0.0;
     double mean_plan_regret = 0.0;
     double p50_plan_regret = 0.0;
@@ -92,6 +104,12 @@ struct AggregateTotals {
     std::uint64_t candidate_files = 0;
     std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
+    std::uint64_t predicted_candidate_chunks = 0;
+    std::uint64_t predicted_candidate_blocks = 0;
+    std::uint64_t predicted_verified_bytes = 0;
+    std::uint64_t prediction_error_bound_chunks = 0;
+    std::uint64_t prediction_error_bound_blocks = 0;
+    std::uint64_t prediction_error_bound_bytes = 0;
 };
 
 IndexOptions indexed_options() {
@@ -180,6 +198,12 @@ void add_stats(ScenarioTotals& totals, const SearchStats& stats, std::size_t mat
     totals.candidate_files += stats.candidate_files;
     totals.verifier_cpu_ns += stats.verifier_cpu_ns;
     totals.matches += match_count;
+    totals.predicted_candidate_chunks += stats.predicted_candidate_chunks;
+    totals.predicted_candidate_blocks += stats.predicted_candidate_blocks;
+    totals.predicted_verified_bytes += stats.predicted_verified_bytes;
+    totals.prediction_error_bound_chunks += stats.prediction_error_bound_chunks;
+    totals.prediction_error_bound_blocks += stats.prediction_error_bound_blocks;
+    totals.prediction_error_bound_bytes += stats.prediction_error_bound_bytes;
 }
 
 void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_count,
@@ -194,6 +218,12 @@ void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_
     totals.candidate_files += stats.candidate_files;
     totals.verifier_cpu_ns += stats.verifier_cpu_ns;
     totals.matches += match_count;
+    totals.predicted_candidate_chunks += stats.predicted_candidate_chunks;
+    totals.predicted_candidate_blocks += stats.predicted_candidate_blocks;
+    totals.predicted_verified_bytes += stats.predicted_verified_bytes;
+    totals.prediction_error_bound_chunks += stats.prediction_error_bound_chunks;
+    totals.prediction_error_bound_blocks += stats.prediction_error_bound_blocks;
+    totals.prediction_error_bound_bytes += stats.prediction_error_bound_bytes;
     totals.verifier = stats.verifier;
     totals.estimated_selectivity = stats.estimated_selectivity;
     totals.plan_regret = stats.plan_regret;
@@ -558,6 +588,12 @@ int main(int argc, char** argv) {
         aggregate.index_probe_operations += totals.index_probe_operations;
         aggregate.candidate_chunks += totals.candidate_chunks;
         aggregate.candidate_blocks += totals.candidate_blocks;
+        aggregate.predicted_candidate_chunks += totals.predicted_candidate_chunks;
+        aggregate.predicted_candidate_blocks += totals.predicted_candidate_blocks;
+        aggregate.predicted_verified_bytes += totals.predicted_verified_bytes;
+        aggregate.prediction_error_bound_chunks += totals.prediction_error_bound_chunks;
+        aggregate.prediction_error_bound_blocks += totals.prediction_error_bound_blocks;
+        aggregate.prediction_error_bound_bytes += totals.prediction_error_bound_bytes;
         aggregate.candidate_files += totals.candidate_files;
         aggregate.verifier_cpu_ns += totals.verifier_cpu_ns;
         aggregate.matches += totals.matches;
@@ -629,6 +665,12 @@ int main(int argc, char** argv) {
                   << " index_probe_operations=" << totals.index_probe_operations
                   << " candidate_chunks=" << totals.candidate_chunks
                   << " candidate_blocks=" << totals.candidate_blocks
+                  << " predicted_candidate_chunks=" << totals.predicted_candidate_chunks
+                  << " predicted_candidate_blocks=" << totals.predicted_candidate_blocks
+                  << " predicted_verified_kb=" << (double(totals.predicted_verified_bytes) / 1024.0)
+                  << " prediction_error_bound_chunks=" << totals.prediction_error_bound_chunks
+                  << " prediction_error_bound_blocks=" << totals.prediction_error_bound_blocks
+                  << " prediction_error_bound_kb=" << (double(totals.prediction_error_bound_bytes) / 1024.0)
                   << " candidate_files=" << totals.candidate_files
                   << " verifier_cpu_ms=" << (double(totals.verifier_cpu_ns) / 1000000.0)
                   << " fallback_rate=" << totals.fallback_rate
@@ -652,6 +694,12 @@ int main(int argc, char** argv) {
                       << " index_probe_operations=" << query_totals.index_probe_operations
                       << " candidate_chunks=" << query_totals.candidate_chunks
                       << " candidate_blocks=" << query_totals.candidate_blocks
+                      << " predicted_candidate_chunks=" << query_totals.predicted_candidate_chunks
+                      << " predicted_candidate_blocks=" << query_totals.predicted_candidate_blocks
+                      << " predicted_verified_kb=" << (double(query_totals.predicted_verified_bytes) / 1024.0)
+                      << " prediction_error_bound_chunks=" << query_totals.prediction_error_bound_chunks
+                      << " prediction_error_bound_blocks=" << query_totals.prediction_error_bound_blocks
+                      << " prediction_error_bound_kb=" << (double(query_totals.prediction_error_bound_bytes) / 1024.0)
                       << " candidate_files=" << query_totals.candidate_files
                       << " verifier_cpu_ms=" << (double(query_totals.verifier_cpu_ns) / 1000000.0)
                       << " verifier=" << query_totals.verifier
@@ -692,6 +740,12 @@ int main(int argc, char** argv) {
     std::cout << "METRIC index_probe_operations=" << aggregate.index_probe_operations << "\n";
     std::cout << "METRIC candidate_chunks=" << aggregate.candidate_chunks << "\n";
     std::cout << "METRIC candidate_blocks=" << aggregate.candidate_blocks << "\n";
+    std::cout << "METRIC predicted_candidate_chunks=" << aggregate.predicted_candidate_chunks << "\n";
+    std::cout << "METRIC predicted_candidate_blocks=" << aggregate.predicted_candidate_blocks << "\n";
+    std::cout << "METRIC predicted_verified_kb=" << (double(aggregate.predicted_verified_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC prediction_error_bound_chunks=" << aggregate.prediction_error_bound_chunks << "\n";
+    std::cout << "METRIC prediction_error_bound_blocks=" << aggregate.prediction_error_bound_blocks << "\n";
+    std::cout << "METRIC prediction_error_bound_kb=" << (double(aggregate.prediction_error_bound_bytes) / 1024.0) << "\n";
     std::cout << "METRIC candidate_files=" << aggregate.candidate_files << "\n";
     std::cout << "METRIC verifier_cpu_ms=" << (double(aggregate.verifier_cpu_ns) / 1000000.0) << "\n";
     std::cout << "METRIC mean_plan_regret=" << global_shadow.mean_regret << "\n";

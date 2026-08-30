@@ -1,6 +1,6 @@
-# M0.3 Workload and Lifecycle Matrix
+# M0.3/M1.5 Workload and Lifecycle Matrix
 
-**Matrix version: 2** (`kWorkloadMatrixVersion = 2` in `bench/workload_matrix.hpp`)
+**Matrix version: 3** (`kWorkloadMatrixVersion = 3` in `bench/workload_matrix.hpp`)
 
 This is the stable workload contract for benchmark and release-gate work. Later milestones
 may add query or corpus cases to a class, but may not silently redefine a class, phase, or
@@ -76,12 +76,17 @@ Every scenario emits a `SCENARIO` descriptor, a `METRIC scenario=...` line, and 
   (verifier slices, including overlap; legacy `verified_kb` alias), `index_probe_kb`,
   and `index_probe_operations`;
 - **Candidate counts**: `candidate_chunks`, `candidate_blocks`, and `candidate_files`;
+  these are observed filter outputs.
+- **M1.5 planner comparison**: `predicted_candidate_chunks`,
+  `predicted_candidate_blocks`, and `predicted_verified_kb` are deterministic
+  estimates from exact q-gram chunk/document statistics, widened by legacy
+  hash-bucket collisions. `prediction_error_bound_chunks`,
+  `prediction_error_bound_blocks`, and `prediction_error_bound_kb` report the
+  conservative remaining-work bounds used by the planner. Compare predicted
+  and observed fields per query; overlap and Bloom false positives can make
+  observed work lower, never invalidate an exact match.
 - **Verifier/resource timing**: `verifier_cpu_ms` (process CPU time after plan selection);
 - **Result invariant**: `matches` and `correctness=pass` from indexed-vs-reference comparison.
-
-Candidate counts are emitted from the filter stage, while byte counters describe verifier
-source slices and index rows; none of these counters participates in matching or plan
-selection.
 
 Release gates should retain the per-scenario lines rather than relying only on aggregate
 metrics. Aggregate fields remain for compatibility with existing benchmark consumers.

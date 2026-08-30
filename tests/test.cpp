@@ -1,5 +1,6 @@
 #include <pergrep/pergrep.hpp>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -2877,5 +2878,118 @@ int main(){
   }
 
 
+  // M1.5 planner statistics: exact repeated-window, chunk, and document units
+  // remain distinct from the legacy hash-bucket occurrence counter.
+  {
+    IndexOptions o;
+    o.chunk_bytes = 64;
+    o.chunk_overlap = 32;
+    o.positional_block_bytes = 16;
+    auto idx = Index::from_documents({
+      {"a.txt", "aaaaaaaaaaaa"},
+      {"b.txt", "xxxxaaaa"},
+      {"c.txt", "zzzzzzzz"}
+    }, o);
+    auto* data = static_cast<const detail::IndexData*>(idx.debug_index_data());
+    assert(data && data->planner_stats_ready);
+    const auto key = detail::qgram4_key(reinterpret_cast<const unsigned char*>("aaaa"));
+    auto it = data->exact_qgrams.find(key);
+    assert(it != data->exact_qgrams.end());
+    // a.txt has nine windows, b.txt has one; overlap can add chunk windows
+    // but cannot change document frequency.
+    assert(it->second.occurrence_frequency == 10);
+    assert(it->second.document_frequency == 2);
+    assert(it->second.chunk_frequency >= 2);
+    assert(it->second.document_ids.size() == 2);
+    assert(it->second.chunk_ids.size() == it->second.chunk_frequency);
+    const auto bucket = detail::hash4(reinterpret_cast<const unsigned char*>("aaaa")) & 65535u;
+    assert(data->qgram_freq[bucket] == 10);
+    assert(data->hash_chunk_freq[bucket] == data->hash_chunk_ids[bucket].size());
+
+    // Selector-scoped estimates use selected chunk distributions rather than
+    // scaling corpus-byte occurrence counts.
+    Searcher searcher(idx);
+    auto p = Pattern::compile("aaaa", {.kind = PatternKind::Fixed});
+    SearchStats all{}, selected{};
+    (void)searcher.find(p, {}, &all);
+    std::vector<std::uint32_t> only_c{2};
+    SearchOptions scoped;
+    scoped.eligible_file_ids = only_c;
+    (void)searcher.find(p, scoped, &selected);
+    assert(selected.predicted_candidate_chunks <= all.predicted_candidate_chunks);
+    assert(selected.predicted_verified_bytes <= all.predicted_verified_bytes);
+  }
+  // Controlled low-16 hash collision fixture: two distinct raw q-grams share
+  // a legacy bucket, but exact planner entries remain independent.
+  {
+    std::array<std::uint32_t, 65536> seen{};
+    seen.fill(UINT32_MAX);
+    std::uint32_t first = 0, second = 0, bucket = 0;
+    bool found = false;
+    for (std::uint32_t n = 0; n < 65536 && !found; ++n) {
+      std::array<unsigned char, 4> bytes{
+        static_cast<unsigned char>(n), static_cast<unsigned char>(n >> 8), 0xA5, 0x5A
+      };
+      const auto h = detail::hash4(bytes.data()) & 65535u;
+      if (seen[h] != UINT32_MAX) {
+        first = seen[h]; second = n; bucket = h; found = true;
+      } else {
+        seen[h] = n;
+      }
+    }
+    assert(found);
+    auto bytes_for = [](std::uint32_t n) {
+      return std::string{
+        static_cast<char>(n), static_cast<char>(n >> 8),
+        static_cast<char>(0xA5), static_cast<char>(0x5A)
+      };
+    };
+    auto collision_idx = Index::from_documents({
+      {"a.bin", bytes_for(first)}, {"b.bin", bytes_for(second)}
+    });
+    auto* collision_data = static_cast<const detail::IndexData*>(
+      collision_idx.debug_index_data());
+    const auto first_key = detail::qgram4_key(
+      reinterpret_cast<const unsigned char*>(bytes_for(first).data()));
+    const auto second_key = detail::qgram4_key(
+      reinterpret_cast<const unsigned char*>(bytes_for(second).data()));
+    assert(first_key != second_key);
+    assert(collision_data->exact_qgrams.at(first_key).occurrence_frequency == 1);
+    assert(collision_data->exact_qgrams.at(second_key).occurrence_frequency == 1);
+    assert(collision_data->qgram_freq[bucket] == 2);
+  }
+
+
+  // v5/v6 persistence retains legacy filter bytes and safely rebuilds planner
+  // statistics from loaded corpus bytes (without changing the file format).
+  {
+    auto dir = std::filesystem::temp_directory_path() / "pergrep_m15_persist";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir);
+    auto source = dir / "src";
+    auto file5 = dir / "v5.pgi";
+    auto file6 = dir / "v6.pgi";
+    std::filesystem::create_directories(source);
+    std::ofstream(source / "a.txt", std::ios::binary) << "aaaaaa";
+    IndexOptions v5; v5.chunk_bytes = 64; v5.chunk_overlap = 8;
+    auto original = Index::build(source, v5);
+    original.save(file5);
+    v5.persist_corpus = true;
+    auto snapshot = Index::build(source, v5);
+    snapshot.save(file6);
+    auto loaded5 = Index::load(file5);
+    auto loaded6 = Index::load(file6);
+    auto* d5 = static_cast<const detail::IndexData*>(loaded5.debug_index_data());
+    auto* d6 = static_cast<const detail::IndexData*>(loaded6.debug_index_data());
+    assert(d5 && d6 && d5->planner_stats_ready && d6->planner_stats_ready);
+    auto stat5 = d5->exact_qgrams.find(detail::qgram4_key(
+      reinterpret_cast<const unsigned char*>("aaaa")));
+    auto stat6 = d6->exact_qgrams.find(detail::qgram4_key(
+      reinterpret_cast<const unsigned char*>("aaaa")));
+    assert(stat5 != d5->exact_qgrams.end() && stat6 != d6->exact_qgrams.end());
+    assert(stat5->second.occurrence_frequency == stat6->second.occurrence_frequency);
+    std::filesystem::remove_all(dir, ec);
+  }
   return 0;
 }
