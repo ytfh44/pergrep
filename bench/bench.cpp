@@ -14,18 +14,28 @@ namespace {
 
 struct QueryTotals {
     double search_ms = 0.0;
-    std::uint64_t verified_bytes = 0;
+    std::uint64_t logical_unique_bytes = 0;
+    std::uint64_t physically_touched_bytes = 0;
+    std::uint64_t index_probe_bytes = 0;
+    std::uint64_t index_probe_operations = 0;
     std::uint64_t candidate_chunks = 0;
     std::uint64_t candidate_blocks = 0;
+    std::uint64_t candidate_files = 0;
+    std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
 };
 
 struct RunTotals {
     double search_ms = 0.0;
     double build_ms = 0.0;
-    std::uint64_t verified_bytes = 0;
+    std::uint64_t logical_unique_bytes = 0;
+    std::uint64_t physically_touched_bytes = 0;
+    std::uint64_t index_probe_bytes = 0;
+    std::uint64_t index_probe_operations = 0;
     std::uint64_t candidate_chunks = 0;
     std::uint64_t candidate_blocks = 0;
+    std::uint64_t candidate_files = 0;
+    std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
     std::vector<QueryTotals> per_query;
 };
@@ -87,18 +97,28 @@ bool validate_scenario(const WorkloadScenario& scenario, const std::vector<Docum
 }
 
 void add_stats(RunTotals& totals, const SearchStats& stats, std::size_t match_count) {
-    totals.verified_bytes += stats.verified_bytes;
+    totals.logical_unique_bytes += stats.logical_unique_bytes;
+    totals.physically_touched_bytes += stats.physically_touched_bytes;
+    totals.index_probe_bytes += stats.index_probe_bytes;
+    totals.index_probe_operations += stats.index_probe_operations;
     totals.candidate_chunks += stats.candidate_chunks;
     totals.candidate_blocks += stats.candidate_blocks;
+    totals.candidate_files += stats.candidate_files;
+    totals.verifier_cpu_ns += stats.verifier_cpu_ns;
     totals.matches += match_count;
 }
 
 void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_count,
                double elapsed_ms) {
     totals.search_ms += elapsed_ms;
-    totals.verified_bytes += stats.verified_bytes;
+    totals.logical_unique_bytes += stats.logical_unique_bytes;
+    totals.physically_touched_bytes += stats.physically_touched_bytes;
+    totals.index_probe_bytes += stats.index_probe_bytes;
+    totals.index_probe_operations += stats.index_probe_operations;
     totals.candidate_chunks += stats.candidate_chunks;
     totals.candidate_blocks += stats.candidate_blocks;
+    totals.candidate_files += stats.candidate_files;
+    totals.verifier_cpu_ns += stats.verifier_cpu_ns;
     totals.matches += match_count;
 }
 
@@ -193,9 +213,14 @@ int main() {
         const auto totals = measure_scenario(scenario, documents, options);
         aggregate.search_ms += totals.search_ms;
         aggregate.build_ms += totals.build_ms;
-        aggregate.verified_bytes += totals.verified_bytes;
+        aggregate.logical_unique_bytes += totals.logical_unique_bytes;
+        aggregate.physically_touched_bytes += totals.physically_touched_bytes;
+        aggregate.index_probe_bytes += totals.index_probe_bytes;
+        aggregate.index_probe_operations += totals.index_probe_operations;
         aggregate.candidate_chunks += totals.candidate_chunks;
         aggregate.candidate_blocks += totals.candidate_blocks;
+        aggregate.candidate_files += totals.candidate_files;
+        aggregate.verifier_cpu_ns += totals.verifier_cpu_ns;
         aggregate.matches += totals.matches;
 
         const double measured_searches = double(scenario.queries.size() * scenario.iterations);
@@ -208,33 +233,49 @@ int main() {
                   << " transform=" << to_string(scenario.corpus.transform)
                   << " selector=" << to_string(scenario.selector) << " queries=" << scenario.queries.size()
                   << " iterations=" << scenario.iterations << "\n";
-        std::cout << std::fixed << std::setprecision(3);
         std::cout << "METRIC scenario=" << scenario.name << " corpus_bytes=" << corpus_bytes
                   << " index_build_ms=" << totals.build_ms << " search_time_ms=" << totals.search_ms
                   << " search_ms_per_query=" << search_ms_per_query << " throughput_mb_s=" << throughput
-                  << " verified_kb=" << (double(totals.verified_bytes) / 1024.0)
+                  << " logical_unique_kb=" << (double(totals.logical_unique_bytes) / 1024.0)
+                  << " physically_touched_kb=" << (double(totals.physically_touched_bytes) / 1024.0)
+                  << " verified_kb=" << (double(totals.physically_touched_bytes) / 1024.0)
+                  << " index_probe_kb=" << (double(totals.index_probe_bytes) / 1024.0)
+                  << " index_probe_operations=" << totals.index_probe_operations
                   << " candidate_chunks=" << totals.candidate_chunks
-                  << " candidate_blocks=" << totals.candidate_blocks << " matches=" << totals.matches
-                  << " correctness=pass\n";
+                  << " candidate_blocks=" << totals.candidate_blocks
+                  << " candidate_files=" << totals.candidate_files
+                  << " verifier_cpu_ms=" << (double(totals.verifier_cpu_ns) / 1000000.0)
+                  << " matches=" << totals.matches << " correctness=pass\n";
         for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
             const auto& query_totals = totals.per_query[query_index];
             std::cout << "METRIC query=" << scenario.name << "." << scenario.queries[query_index].name
                       << " search_time_ms=" << query_totals.search_ms
-                      << " verified_kb=" << (double(query_totals.verified_bytes) / 1024.0)
+                      << " logical_unique_kb=" << (double(query_totals.logical_unique_bytes) / 1024.0)
+                      << " physically_touched_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
+                      << " verified_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
+                      << " index_probe_kb=" << (double(query_totals.index_probe_bytes) / 1024.0)
+                      << " index_probe_operations=" << query_totals.index_probe_operations
                       << " candidate_chunks=" << query_totals.candidate_chunks
                       << " candidate_blocks=" << query_totals.candidate_blocks
+                      << " candidate_files=" << query_totals.candidate_files
+                      << " verifier_cpu_ms=" << (double(query_totals.verifier_cpu_ns) / 1000000.0)
                       << " matches=" << query_totals.matches << "\n";
         }
     }
-
     const double aggregate_searched_mb = double(aggregate_searched_bytes) / (1024.0 * 1024.0);
-    const double aggregate_throughput = aggregate_searched_mb /
-                                        std::max(1e-9, aggregate.search_ms / 1000.0);
+    const double aggregate_throughput =
+        aggregate_searched_mb / std::max(1e-9, aggregate.search_ms / 1000.0);
     std::cout << "METRIC search_time_ms=" << aggregate.search_ms << "\n";
     std::cout << "METRIC throughput_mb_s=" << aggregate_throughput << "\n";
-    std::cout << "METRIC verified_kb=" << (double(aggregate.verified_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC logical_unique_kb=" << (double(aggregate.logical_unique_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC physically_touched_kb=" << (double(aggregate.physically_touched_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC verified_kb=" << (double(aggregate.physically_touched_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC index_probe_kb=" << (double(aggregate.index_probe_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC index_probe_operations=" << aggregate.index_probe_operations << "\n";
     std::cout << "METRIC candidate_chunks=" << aggregate.candidate_chunks << "\n";
     std::cout << "METRIC candidate_blocks=" << aggregate.candidate_blocks << "\n";
+    std::cout << "METRIC candidate_files=" << aggregate.candidate_files << "\n";
+    std::cout << "METRIC verifier_cpu_ms=" << (double(aggregate.verifier_cpu_ns) / 1000000.0) << "\n";
     std::cout << "METRIC matches_count=" << aggregate.matches << "\n";
     std::cout << "ASI aggregate_corpus_bytes=" << aggregate_corpus_bytes << "\n";
     std::cout << "ASI aggregate_query_profiles=" << aggregate_query_profiles << "\n";
