@@ -13,7 +13,14 @@ using namespace pergrep::benchmark;
 namespace {
 
 struct QueryTotals {
+    std::string name;
+    std::string family;
     double search_ms = 0.0;
+    double cold_search_ms = 0.0;
+    double warm_search_ms = 0.0;
+    double search_p50_ms = 0.0;
+    double search_p95_ms = 0.0;
+    std::vector<double> latencies_ms;
     std::uint64_t logical_unique_bytes = 0;
     std::uint64_t physically_touched_bytes = 0;
     std::uint64_t index_probe_bytes = 0;
@@ -25,9 +32,23 @@ struct QueryTotals {
     std::uint64_t matches = 0;
 };
 
-struct RunTotals {
-    double search_ms = 0.0;
+struct ScenarioTotals {
+    std::string name;
+    std::uint64_t corpus_bytes = 0;
+    std::uint64_t index_bytes = 0;
+    double search_time_ms = 0.0;
     double build_ms = 0.0;
+    double index_save_ms = 0.0;
+    double index_load_ms = 0.0;
+    double freshness_check_ms = 0.0;
+    double cold_search_ms = 0.0;
+    double warm_search_ms = 0.0;
+    double repeated_search_ms = 0.0;
+    double search_p50_ms = 0.0;
+    double search_p95_ms = 0.0;
+    std::uint64_t rss_kb = 0;
+    std::uint64_t peak_rss_kb = 0;
+    std::uint64_t page_faults = 0;
     std::uint64_t logical_unique_bytes = 0;
     std::uint64_t physically_touched_bytes = 0;
     std::uint64_t index_probe_bytes = 0;
@@ -38,6 +59,26 @@ struct RunTotals {
     std::uint64_t verifier_cpu_ns = 0;
     std::uint64_t matches = 0;
     std::vector<QueryTotals> per_query;
+};
+
+struct AggregateTotals {
+    double search_time_ms = 0.0;
+    double build_ms = 0.0;
+    double index_save_ms = 0.0;
+    double index_load_ms = 0.0;
+    double freshness_check_ms = 0.0;
+    double cold_search_ms = 0.0;
+    double warm_search_ms = 0.0;
+    double repeated_search_ms = 0.0;
+    std::uint64_t logical_unique_bytes = 0;
+    std::uint64_t physically_touched_bytes = 0;
+    std::uint64_t index_probe_bytes = 0;
+    std::uint64_t index_probe_operations = 0;
+    std::uint64_t candidate_chunks = 0;
+    std::uint64_t candidate_blocks = 0;
+    std::uint64_t candidate_files = 0;
+    std::uint64_t verifier_cpu_ns = 0;
+    std::uint64_t matches = 0;
 };
 
 IndexOptions indexed_options() {
@@ -71,7 +112,18 @@ bool same_matches(const std::vector<Match>& actual, const std::vector<Match>& ex
 
 bool validate_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
                        const IndexOptions& options, const IndexOptions& ref_options) {
-    auto indexed = Index::from_documents(documents, options);
+    std::unique_ptr<TempDirectory> temp_dir;
+    Index indexed;
+    if (scenario.storage == StorageBackend::Filesystem) {
+        temp_dir = std::make_unique<TempDirectory>("pergrep_val_" + scenario.name);
+        for (const auto& doc : documents) {
+            temp_dir->write_file(doc.path, doc.content);
+        }
+        indexed = Index::build(temp_dir->path(), options);
+    } else {
+        indexed = Index::from_documents(documents, options);
+    }
+
     auto reference = Index::from_documents(documents, ref_options);
     Searcher indexed_searcher(indexed);
     Searcher reference_searcher(reference);
@@ -96,7 +148,7 @@ bool validate_scenario(const WorkloadScenario& scenario, const std::vector<Docum
     return true;
 }
 
-void add_stats(RunTotals& totals, const SearchStats& stats, std::size_t match_count) {
+void add_stats(ScenarioTotals& totals, const SearchStats& stats, std::size_t match_count) {
     totals.logical_unique_bytes += stats.logical_unique_bytes;
     totals.physically_touched_bytes += stats.physically_touched_bytes;
     totals.index_probe_bytes += stats.index_probe_bytes;
@@ -122,65 +174,187 @@ void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_
     totals.matches += match_count;
 }
 
-RunTotals measure_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
-                          const IndexOptions& options) {
+ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
+                               const IndexOptions& options) {
     std::vector<Pattern> patterns;
     patterns.reserve(scenario.queries.size());
     for (const auto& profile : scenario.queries) {
         patterns.push_back(Pattern::compile(profile.expression, profile.pattern_options));
     }
 
-    RunTotals totals;
+    ScenarioTotals totals;
+    totals.name = scenario.name;
     totals.per_query.resize(patterns.size());
-    const auto run_queries = [&](const Index& index, RunTotals& run_totals, bool collect_query_metrics) {
-        Searcher searcher(index);
-        for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
+    for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+        totals.per_query[q].name = scenario.queries[q].name;
+        totals.per_query[q].family = scenario.queries[q].family;
+    }
+
+    std::vector<double> scenario_latencies;
+
+    if (scenario.storage == StorageBackend::Filesystem) {
+        TempDirectory temp_dir("pergrep_bench_fs_" + scenario.name);
+        TempDirectory index_dir("pergrep_bench_idx_" + scenario.name);
+        for (const auto& doc : documents) {
+            temp_dir.write_file(doc.path, doc.content);
+        }
+        const auto index_file = index_dir.path() / "index.pgi";
+        // 1. Build
+        const auto build_start = std::chrono::steady_clock::now();
+        auto index = Index::build(temp_dir.path(), options);
+        const auto build_end = std::chrono::steady_clock::now();
+        totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
+        totals.corpus_bytes = index.corpus_bytes();
+        totals.index_bytes = index.index_bytes();
+
+        // 2. Save
+        const auto save_start = std::chrono::steady_clock::now();
+        index.save(index_file);
+        const auto save_end = std::chrono::steady_clock::now();
+        totals.index_save_ms = std::chrono::duration<double, std::milli>(save_end - save_start).count();
+
+        // 3. Load
+        const auto load_start = std::chrono::steady_clock::now();
+        auto loaded_index = Index::load(index_file);
+        const auto load_end = std::chrono::steady_clock::now();
+        totals.index_load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
+
+        // 4. Freshness
+        const auto fresh_start = std::chrono::steady_clock::now();
+        const bool fresh = loaded_index.fresh();
+        const auto fresh_end = std::chrono::steady_clock::now();
+        totals.freshness_check_ms = std::chrono::duration<double, std::milli>(fresh_end - fresh_start).count();
+        if (!fresh) {
+            std::cerr << "WARNING: fresh() returned false for scenario=" << scenario.name << "\n";
+        }
+
+        Searcher searcher(loaded_index);
+
+        // 5. Cold search pass (first run)
+        for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
             SearchStats stats{};
-            const auto query_start = std::chrono::steady_clock::now();
-            const auto matches = searcher.find(patterns[query_index],
-                                                scenario.queries[query_index].search_options, &stats);
-            const auto query_end = std::chrono::steady_clock::now();
-            const double elapsed_ms =
-                std::chrono::duration<double, std::milli>(query_end - query_start).count();
-            add_stats(run_totals, stats, matches.size());
-            if (collect_query_metrics) {
-                add_stats(run_totals.per_query[query_index], stats, matches.size(), elapsed_ms);
+            const auto q_start = std::chrono::steady_clock::now();
+            const auto matches = searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+            const auto q_end = std::chrono::steady_clock::now();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+            totals.per_query[q].cold_search_ms = elapsed_ms;
+            totals.cold_search_ms += elapsed_ms;
+            scenario_latencies.push_back(elapsed_ms);
+            totals.per_query[q].latencies_ms.push_back(elapsed_ms);
+            add_stats(totals, stats, matches.size());
+            add_stats(totals.per_query[q], stats, matches.size(), elapsed_ms);
+        }
+
+        // 6. Warm search pass
+        for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+            SearchStats stats{};
+            const auto q_start = std::chrono::steady_clock::now();
+            searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+            const auto q_end = std::chrono::steady_clock::now();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+            totals.per_query[q].warm_search_ms = elapsed_ms;
+            totals.warm_search_ms += elapsed_ms;
+        }
+
+        // 7. Repeated search pass
+        const auto repeated_start = std::chrono::steady_clock::now();
+        for (std::size_t iter = 0; iter < scenario.iterations; ++iter) {
+            for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+                SearchStats stats{};
+                const auto q_start = std::chrono::steady_clock::now();
+                const auto matches = searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+                const auto q_end = std::chrono::steady_clock::now();
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+                scenario_latencies.push_back(elapsed_ms);
+                totals.per_query[q].latencies_ms.push_back(elapsed_ms);
+                add_stats(totals, stats, matches.size());
+                add_stats(totals.per_query[q], stats, matches.size(), elapsed_ms);
             }
         }
-    };
+        const auto repeated_end = std::chrono::steady_clock::now();
+        totals.repeated_search_ms =
+            std::chrono::duration<double, std::milli>(repeated_end - repeated_start).count();
 
-    // Cold one-shot scenarios include index construction. Other classes build once, warm once,
-    // and time only repeated searches.
-    if (scenario.include_index_build) {
-        for (std::size_t iteration = 0; iteration < scenario.iterations; ++iteration) {
-            const auto build_start = std::chrono::steady_clock::now();
-            auto index = Index::from_documents(documents, options);
-            const auto build_end = std::chrono::steady_clock::now();
-            totals.build_ms += std::chrono::duration<double, std::milli>(build_end - build_start).count();
+        totals.search_time_ms = (scenario.phase == ScenarioPhase::Cold && scenario.include_index_build)
+                                    ? (totals.cold_search_ms + totals.repeated_search_ms)
+                                    : totals.repeated_search_ms;
+    } else {
+        // InMemory
+        const auto build_start = std::chrono::steady_clock::now();
+        auto index = Index::from_documents(documents, options);
+        const auto build_end = std::chrono::steady_clock::now();
+        totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
+        totals.corpus_bytes = index.corpus_bytes();
+        totals.index_bytes = index.index_bytes();
+        totals.index_save_ms = 0.0;
+        totals.index_load_ms = 0.0;
+        totals.freshness_check_ms = 0.0;
 
-            const auto search_start = std::chrono::steady_clock::now();
-            run_queries(index, totals, true);
-            const auto search_end = std::chrono::steady_clock::now();
-            totals.search_ms += std::chrono::duration<double, std::milli>(search_end - search_start).count();
+        Searcher searcher(index);
+
+        // Cold search pass
+        for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+            SearchStats stats{};
+            const auto q_start = std::chrono::steady_clock::now();
+            const auto matches = searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+            const auto q_end = std::chrono::steady_clock::now();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+            totals.per_query[q].cold_search_ms = elapsed_ms;
+            totals.cold_search_ms += elapsed_ms;
+            scenario_latencies.push_back(elapsed_ms);
+            totals.per_query[q].latencies_ms.push_back(elapsed_ms);
+            add_stats(totals, stats, matches.size());
+            add_stats(totals.per_query[q], stats, matches.size(), elapsed_ms);
         }
-        return totals;
+
+        // Warm search pass
+        for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+            SearchStats stats{};
+            const auto q_start = std::chrono::steady_clock::now();
+            searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+            const auto q_end = std::chrono::steady_clock::now();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+            totals.per_query[q].warm_search_ms = elapsed_ms;
+            totals.warm_search_ms += elapsed_ms;
+        }
+
+        // Repeated search pass
+        const auto repeated_start = std::chrono::steady_clock::now();
+        for (std::size_t iter = 0; iter < scenario.iterations; ++iter) {
+            for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
+                SearchStats stats{};
+                const auto q_start = std::chrono::steady_clock::now();
+                const auto matches = searcher.find(patterns[q], scenario.queries[q].search_options, &stats);
+                const auto q_end = std::chrono::steady_clock::now();
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(q_end - q_start).count();
+                scenario_latencies.push_back(elapsed_ms);
+                totals.per_query[q].latencies_ms.push_back(elapsed_ms);
+                add_stats(totals, stats, matches.size());
+                add_stats(totals.per_query[q], stats, matches.size(), elapsed_ms);
+            }
+        }
+        const auto repeated_end = std::chrono::steady_clock::now();
+        totals.repeated_search_ms =
+            std::chrono::duration<double, std::milli>(repeated_end - repeated_start).count();
+
+        totals.search_time_ms = (scenario.phase == ScenarioPhase::Cold && scenario.include_index_build)
+                                    ? (totals.cold_search_ms + totals.repeated_search_ms)
+                                    : totals.repeated_search_ms;
     }
 
-    const auto build_start = std::chrono::steady_clock::now();
-    auto index = Index::from_documents(documents, options);
-    const auto build_end = std::chrono::steady_clock::now();
-    totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
+    totals.search_p50_ms = calculate_percentile(scenario_latencies, 0.50);
+    totals.search_p95_ms = calculate_percentile(scenario_latencies, 0.95);
 
-    // Warm-up is deliberately outside the measured repeated-search interval.
-    RunTotals warmup_totals;
-    warmup_totals.per_query.resize(patterns.size());
-    run_queries(index, warmup_totals, false);
-    const auto search_start = std::chrono::steady_clock::now();
-    for (std::size_t iteration = 0; iteration < scenario.iterations; ++iteration) {
-        run_queries(index, totals, true);
+    for (auto& q : totals.per_query) {
+        q.search_p50_ms = calculate_percentile(q.latencies_ms, 0.50);
+        q.search_p95_ms = calculate_percentile(q.latencies_ms, 0.95);
     }
-    const auto search_end = std::chrono::steady_clock::now();
-    totals.search_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
+
+    const auto mem = sample_process_stats();
+    totals.rss_kb = mem.current_rss_bytes / 1024ULL;
+    totals.peak_rss_kb = mem.peak_rss_bytes / 1024ULL;
+    totals.page_faults = mem.page_faults;
+
     return totals;
 }
 
@@ -189,10 +363,12 @@ RunTotals measure_scenario(const WorkloadScenario& scenario, const std::vector<D
 int main() {
     const auto matrix = scenarios();
     std::uint64_t aggregate_corpus_bytes = 0;
+    std::uint64_t aggregate_index_bytes = 0;
     std::uint64_t aggregate_searched_bytes = 0;
-    RunTotals aggregate;
+    AggregateTotals aggregate;
     std::size_t aggregate_query_profiles = 0;
     std::size_t aggregate_iterations = 0;
+    std::vector<double> all_global_latencies;
 
     std::cout << "ASI workload_matrix_version=" << kWorkloadMatrixVersion << "\n";
     std::cout << "ASI workload_scenarios=" << matrix.size() << "\n";
@@ -211,8 +387,15 @@ int main() {
         if (!validate_scenario(scenario, documents, options, ref_options)) return 1;
 
         const auto totals = measure_scenario(scenario, documents, options);
-        aggregate.search_ms += totals.search_ms;
+        aggregate_index_bytes += totals.index_bytes;
+        aggregate.search_time_ms += totals.search_time_ms;
         aggregate.build_ms += totals.build_ms;
+        aggregate.index_save_ms += totals.index_save_ms;
+        aggregate.index_load_ms += totals.index_load_ms;
+        aggregate.freshness_check_ms += totals.freshness_check_ms;
+        aggregate.cold_search_ms += totals.cold_search_ms;
+        aggregate.warm_search_ms += totals.warm_search_ms;
+        aggregate.repeated_search_ms += totals.repeated_search_ms;
         aggregate.logical_unique_bytes += totals.logical_unique_bytes;
         aggregate.physically_touched_bytes += totals.physically_touched_bytes;
         aggregate.index_probe_bytes += totals.index_probe_bytes;
@@ -223,19 +406,37 @@ int main() {
         aggregate.verifier_cpu_ns += totals.verifier_cpu_ns;
         aggregate.matches += totals.matches;
 
+        for (const auto& q : totals.per_query) {
+            all_global_latencies.insert(all_global_latencies.end(), q.latencies_ms.begin(), q.latencies_ms.end());
+        }
+
         const double measured_searches = double(scenario.queries.size() * scenario.iterations);
-        const double search_ms_per_query = totals.search_ms / std::max(1.0, measured_searches);
-        const double searched_mb = double(corpus_bytes) * measured_searches / (1024.0 * 1024.0);
-        const double throughput = searched_mb / std::max(1e-9, totals.search_ms / 1000.0);
+        const double search_ms_per_query = totals.search_time_ms / std::max(1.0, measured_searches);
+        const double searched_mb = double(totals.corpus_bytes) * measured_searches / (1024.0 * 1024.0);
+        const double throughput = searched_mb / std::max(1e-9, totals.search_time_ms / 1000.0);
 
         std::cout << "SCENARIO name=" << scenario.name << " class=" << to_string(scenario.workload_class)
-                  << " phase=" << to_string(scenario.phase) << " corpus=" << scenario.corpus.name
-                  << " transform=" << to_string(scenario.corpus.transform)
+                  << " phase=" << to_string(scenario.phase) << " storage=" << to_string(scenario.storage)
+                  << " corpus=" << scenario.corpus.name << " transform=" << to_string(scenario.corpus.transform)
                   << " selector=" << to_string(scenario.selector) << " queries=" << scenario.queries.size()
                   << " iterations=" << scenario.iterations << "\n";
-        std::cout << "METRIC scenario=" << scenario.name << " corpus_bytes=" << corpus_bytes
-                  << " index_build_ms=" << totals.build_ms << " search_time_ms=" << totals.search_ms
-                  << " search_ms_per_query=" << search_ms_per_query << " throughput_mb_s=" << throughput
+        std::cout << "METRIC scenario=" << scenario.name << " corpus_bytes=" << totals.corpus_bytes
+                  << " index_bytes=" << totals.index_bytes
+                  << " index_build_ms=" << totals.build_ms
+                  << " index_save_ms=" << totals.index_save_ms
+                  << " index_load_ms=" << totals.index_load_ms
+                  << " freshness_check_ms=" << totals.freshness_check_ms
+                  << " cold_search_ms=" << totals.cold_search_ms
+                  << " warm_search_ms=" << totals.warm_search_ms
+                  << " repeated_search_ms=" << totals.repeated_search_ms
+                  << " search_time_ms=" << totals.search_time_ms
+                  << " search_ms_per_query=" << search_ms_per_query
+                  << " search_p50_ms=" << totals.search_p50_ms
+                  << " search_p95_ms=" << totals.search_p95_ms
+                  << " throughput_mb_s=" << throughput
+                  << " rss_kb=" << totals.rss_kb
+                  << " peak_rss_kb=" << totals.peak_rss_kb
+                  << " page_faults=" << totals.page_faults
                   << " logical_unique_kb=" << (double(totals.logical_unique_bytes) / 1024.0)
                   << " physically_touched_kb=" << (double(totals.physically_touched_bytes) / 1024.0)
                   << " verified_kb=" << (double(totals.physically_touched_bytes) / 1024.0)
@@ -249,7 +450,12 @@ int main() {
         for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
             const auto& query_totals = totals.per_query[query_index];
             std::cout << "METRIC query=" << scenario.name << "." << scenario.queries[query_index].name
+                      << " family=" << query_totals.family
                       << " search_time_ms=" << query_totals.search_ms
+                      << " cold_search_ms=" << query_totals.cold_search_ms
+                      << " warm_search_ms=" << query_totals.warm_search_ms
+                      << " search_p50_ms=" << query_totals.search_p50_ms
+                      << " search_p95_ms=" << query_totals.search_p95_ms
                       << " logical_unique_kb=" << (double(query_totals.logical_unique_bytes) / 1024.0)
                       << " physically_touched_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
                       << " verified_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
@@ -264,9 +470,25 @@ int main() {
     }
     const double aggregate_searched_mb = double(aggregate_searched_bytes) / (1024.0 * 1024.0);
     const double aggregate_throughput =
-        aggregate_searched_mb / std::max(1e-9, aggregate.search_ms / 1000.0);
-    std::cout << "METRIC search_time_ms=" << aggregate.search_ms << "\n";
+        aggregate_searched_mb / std::max(1e-9, aggregate.search_time_ms / 1000.0);
+    const double aggregate_p50 = calculate_percentile(all_global_latencies, 0.50);
+    const double aggregate_p95 = calculate_percentile(all_global_latencies, 0.95);
+    const auto final_mem = sample_process_stats();
+
+    std::cout << "METRIC search_time_ms=" << aggregate.search_time_ms << "\n";
     std::cout << "METRIC throughput_mb_s=" << aggregate_throughput << "\n";
+    std::cout << "METRIC index_build_ms=" << aggregate.build_ms << "\n";
+    std::cout << "METRIC index_save_ms=" << aggregate.index_save_ms << "\n";
+    std::cout << "METRIC index_load_ms=" << aggregate.index_load_ms << "\n";
+    std::cout << "METRIC freshness_check_ms=" << aggregate.freshness_check_ms << "\n";
+    std::cout << "METRIC cold_search_ms=" << aggregate.cold_search_ms << "\n";
+    std::cout << "METRIC warm_search_ms=" << aggregate.warm_search_ms << "\n";
+    std::cout << "METRIC repeated_search_ms=" << aggregate.repeated_search_ms << "\n";
+    std::cout << "METRIC search_p50_ms=" << aggregate_p50 << "\n";
+    std::cout << "METRIC search_p95_ms=" << aggregate_p95 << "\n";
+    std::cout << "METRIC rss_kb=" << (final_mem.current_rss_bytes / 1024ULL) << "\n";
+    std::cout << "METRIC peak_rss_kb=" << (final_mem.peak_rss_bytes / 1024ULL) << "\n";
+    std::cout << "METRIC page_faults=" << final_mem.page_faults << "\n";
     std::cout << "METRIC logical_unique_kb=" << (double(aggregate.logical_unique_bytes) / 1024.0) << "\n";
     std::cout << "METRIC physically_touched_kb=" << (double(aggregate.physically_touched_bytes) / 1024.0) << "\n";
     std::cout << "METRIC verified_kb=" << (double(aggregate.physically_touched_bytes) / 1024.0) << "\n";
@@ -278,6 +500,7 @@ int main() {
     std::cout << "METRIC verifier_cpu_ms=" << (double(aggregate.verifier_cpu_ns) / 1000000.0) << "\n";
     std::cout << "METRIC matches_count=" << aggregate.matches << "\n";
     std::cout << "ASI aggregate_corpus_bytes=" << aggregate_corpus_bytes << "\n";
+    std::cout << "ASI aggregate_index_bytes=" << aggregate_index_bytes << "\n";
     std::cout << "ASI aggregate_query_profiles=" << aggregate_query_profiles << "\n";
     std::cout << "ASI aggregate_iterations=" << aggregate_iterations << "\n";
     return 0;

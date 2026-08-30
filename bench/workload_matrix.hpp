@@ -3,24 +3,46 @@
 #include <pergrep/pergrep.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#include <process.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#elif defined(__linux__) || defined(__unix__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 namespace pergrep::benchmark {
 
-// M0.1 workload contract. Increment only when class or measurement semantics change.
-inline constexpr std::uint32_t kWorkloadMatrixVersion = 1;
+// M0.3 workload contract. Increment only when class or measurement semantics change.
+inline constexpr std::uint32_t kWorkloadMatrixVersion = 2;
 
 // The classes are intentionally closed: later milestones may add cases, but must not
 // silently change what a class measures.
 enum class WorkloadClass { OneShot, WarmRepeated, InteractiveLargeRepository, BatchMultiPattern };
 enum class ScenarioPhase { Cold, Warm, Repeated, FilteredScope, TransformedInput };
 enum class InputTransform { Native, CrLf, NulRecords };
+enum class StorageBackend { InMemory, Filesystem };
 
 enum class ScopeSelector { AllFiles, CppFiles, EveryOtherFile };
 
@@ -49,8 +71,16 @@ struct WorkloadScenario {
     std::size_t iterations = 1;
     bool include_index_build = false;
     ScopeSelector selector = ScopeSelector::AllFiles;
+    StorageBackend storage = StorageBackend::InMemory;
 };
 
+inline const char* to_string(StorageBackend value) noexcept {
+    switch (value) {
+        case StorageBackend::InMemory: return "in-memory";
+        case StorageBackend::Filesystem: return "filesystem";
+    }
+    return "unknown";
+}
 inline const char* to_string(WorkloadClass value) noexcept {
     switch (value) {
         case WorkloadClass::OneShot: return "one-shot";
@@ -149,24 +179,151 @@ inline std::vector<WorkloadScenario> scenarios() {
 
     return {
         {"oneshot.cold.rare-short", WorkloadClass::OneShot, ScenarioPhase::Cold, small,
-         {rare_short}, 1, true, ScopeSelector::AllFiles},
+         {rare_short}, 1, true, ScopeSelector::AllFiles, StorageBackend::InMemory},
         {"oneshot.filtered-scope.common-and-alternation", WorkloadClass::OneShot,
          ScenarioPhase::FilteredScope, small, {common_short, alternation}, 1, true,
-         ScopeSelector::CppFiles},
+         ScopeSelector::CppFiles, StorageBackend::InMemory},
         {"oneshot.transformed.crlf", WorkloadClass::OneShot, ScenarioPhase::TransformedInput,
-         transformed_crlf, {line}, 1, true, ScopeSelector::AllFiles},
+         transformed_crlf, {line}, 1, true, ScopeSelector::AllFiles, StorageBackend::InMemory},
         {"oneshot.transformed.nul", WorkloadClass::OneShot, ScenarioPhase::TransformedInput,
-         transformed_nul, {nul}, 1, true, ScopeSelector::AllFiles},
+         transformed_nul, {nul}, 1, true, ScopeSelector::AllFiles, StorageBackend::InMemory},
         {"warm-repeated.medium.rare-long-unicode", WorkloadClass::WarmRepeated,
-         ScenarioPhase::Warm, medium, {rare_long, unicode, bounded}, 8, false, ScopeSelector::AllFiles},
+         ScenarioPhase::Warm, medium, {rare_long, unicode, bounded}, 8, false, ScopeSelector::AllFiles,
+         StorageBackend::InMemory},
         {"interactive.large-repository.filtered", WorkloadClass::InteractiveLargeRepository,
          ScenarioPhase::Repeated, large, {prefix, unbounded, unicode, line}, 3, false,
-         ScopeSelector::CppFiles},
+         ScopeSelector::CppFiles, StorageBackend::InMemory},
         {"batch.multi-pattern.mixed", WorkloadClass::BatchMultiPattern, ScenarioPhase::Repeated,
          medium, {common_short, rare_short, alternation, bounded, overlap, unbounded}, 2, false,
-         ScopeSelector::AllFiles},
+         ScopeSelector::AllFiles, StorageBackend::InMemory},
+        {"filesystem.cold.roundtrip", WorkloadClass::OneShot, ScenarioPhase::Cold, small,
+         {rare_short, common_short}, 1, true, ScopeSelector::AllFiles, StorageBackend::Filesystem},
+        {"filesystem.warm-repeated.medium", WorkloadClass::WarmRepeated, ScenarioPhase::Warm,
+         medium, {rare_long, bounded}, 4, false, ScopeSelector::AllFiles, StorageBackend::Filesystem},
     };
 }
+
+struct ProcessStats {
+    std::uint64_t current_rss_bytes = 0;
+    std::uint64_t peak_rss_bytes = 0;
+    std::uint64_t page_faults = 0;
+    bool supported = false;
+};
+
+inline ProcessStats sample_process_stats() {
+    ProcessStats stats{};
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(),
+                               reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                               sizeof(pmc))) {
+        stats.current_rss_bytes = static_cast<std::uint64_t>(pmc.WorkingSetSize);
+        stats.peak_rss_bytes = static_cast<std::uint64_t>(pmc.PeakWorkingSetSize);
+        stats.page_faults = static_cast<std::uint64_t>(pmc.PageFaultCount);
+        stats.supported = true;
+    }
+#elif defined(__APPLE__)
+    struct rusage ru{};
+    if (::getrusage(RUSAGE_SELF, &ru) == 0) {
+        stats.peak_rss_bytes = static_cast<std::uint64_t>(ru.ru_maxrss);
+        stats.page_faults = static_cast<std::uint64_t>(ru.ru_minflt + ru.ru_majflt);
+        stats.supported = true;
+    }
+    mach_task_basic_info info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (::task_info(::mach_task_self(), MACH_TASK_BASIC_INFO,
+                    reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        stats.current_rss_bytes = static_cast<std::uint64_t>(info.resident_size);
+    } else {
+        stats.current_rss_bytes = stats.peak_rss_bytes;
+    }
+#elif defined(__linux__) || defined(__unix__)
+    struct rusage ru{};
+    if (::getrusage(RUSAGE_SELF, &ru) == 0) {
+        stats.peak_rss_bytes = static_cast<std::uint64_t>(ru.ru_maxrss) * 1024ULL;
+        stats.page_faults = static_cast<std::uint64_t>(ru.ru_minflt + ru.ru_majflt);
+        stats.supported = true;
+    }
+    std::ifstream statm("/proc/self/statm");
+    if (statm) {
+        unsigned long size_pages = 0, resident_pages = 0;
+        if (statm >> size_pages >> resident_pages) {
+            long page_size = ::sysconf(_SC_PAGESIZE);
+            if (page_size > 0) {
+                stats.current_rss_bytes = static_cast<std::uint64_t>(resident_pages) * static_cast<std::uint64_t>(page_size);
+            }
+        }
+    }
+    if (stats.current_rss_bytes == 0) {
+        stats.current_rss_bytes = stats.peak_rss_bytes;
+    }
+#else
+    stats.supported = false;
+#endif
+    return stats;
+}
+
+inline double calculate_percentile(std::vector<double> samples, double p) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    if (samples.size() == 1) return samples[0];
+    const double rank = p * static_cast<double>(samples.size() - 1);
+    const std::size_t lower = static_cast<std::size_t>(std::floor(rank));
+    const std::size_t upper = static_cast<std::size_t>(std::ceil(rank));
+    const double weight = rank - static_cast<double>(lower);
+    if (upper >= samples.size()) return samples.back();
+    return samples[lower] * (1.0 - weight) + samples[upper] * weight;
+}
+
+class TempDirectory {
+public:
+    explicit TempDirectory(std::string_view prefix) {
+        static std::atomic<std::uint64_t> counter{0};
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto id = counter.fetch_add(1);
+        path_ = std::filesystem::temp_directory_path() /
+                (std::string(prefix) + "_" + std::to_string(now) + "_" + std::to_string(id));
+        std::filesystem::create_directories(path_);
+    }
+
+    ~TempDirectory() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    TempDirectory(const TempDirectory&) = delete;
+    TempDirectory& operator=(const TempDirectory&) = delete;
+    TempDirectory(TempDirectory&& other) noexcept : path_(std::move(other.path_)) {
+        other.path_.clear();
+    }
+    TempDirectory& operator=(TempDirectory&& other) noexcept {
+        if (this != &other) {
+            std::error_code ec;
+            if (!path_.empty()) std::filesystem::remove_all(path_, ec);
+            path_ = std::move(other.path_);
+            other.path_.clear();
+        }
+        return *this;
+    }
+
+    const std::filesystem::path& path() const noexcept { return path_; }
+
+    void write_file(const std::string& relative_path, std::string_view content) const {
+        const auto full_path = path_ / relative_path;
+        if (!full_path.parent_path().empty()) {
+            std::filesystem::create_directories(full_path.parent_path());
+        }
+        std::ofstream out(full_path, std::ios::binary);
+        if (!out) {
+            throw std::runtime_error("failed to create temp file: " + full_path.string());
+        }
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        out.flush();
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 inline std::vector<Document> generate_corpus(const CorpusProfile& profile) {
     static const std::vector<std::string_view> dictionary = {
