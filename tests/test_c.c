@@ -1,8 +1,21 @@
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include <pergrep/pergrep_c.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir_test(p) _mkdir(p)
+#define rmdir_test(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define mkdir_test(p) mkdir(p, 0755)
+#define rmdir_test(p) rmdir(p)
+#endif
 
 int main(void){
     assert(pg_version() != NULL);
@@ -185,6 +198,97 @@ int main(void){
 
         pg_searcher_free(searcher);
         pg_index_free(idx);
+    }
+
+    // M0.8: pg_index_is_snapshot and C API corruption handling
+    {
+        // 1. pg_index_is_snapshot with NULL pointer
+        assert(pg_index_is_snapshot(NULL) == 0);
+
+        mkdir_test("test_c_corpus");
+        FILE* f_sample = fopen("test_c_corpus/sample.txt", "wb");
+        assert(f_sample != NULL);
+        fputs("hello C API snapshot test payload\nsecond line\n", f_sample);
+        fclose(f_sample);
+
+        char* err = NULL;
+        pg_index_options iopt = pg_index_options_default();
+        pg_index* idx = pg_index_build("test_c_corpus", &iopt, &err);
+        assert(idx != NULL);
+        assert(err == NULL);
+
+        // Default build is source-backed (is_snapshot == 0)
+        assert(pg_index_is_snapshot(idx) == 0);
+
+        // Save and load via C API
+        int save_rc = pg_index_save(idx, "test_c_idx_v5.bin", &err);
+        assert(save_rc == 1);
+        assert(err == NULL);
+
+        pg_index* loaded = pg_index_load("test_c_idx_v5.bin", &err);
+        assert(loaded != NULL);
+        assert(err == NULL);
+        assert(pg_index_is_snapshot(loaded) == 0);
+
+        pg_index_free(loaded);
+        pg_index_free(idx);
+        remove("test_c_idx_v5.bin");
+        remove("test_c_corpus/sample.txt");
+        rmdir_test("test_c_corpus");
+        // 2. Corrupted index loading via C API
+        // (a) Bad magic
+        {
+            FILE* f = fopen("test_c_bad_magic.bin", "wb");
+            assert(f != NULL);
+            const char bad_magic[16] = "BADMAGIC\0\5\0\0\0";
+            fwrite(bad_magic, 1, 16, f);
+            fclose(f);
+
+            err = NULL;
+            pg_index* bad_idx = pg_index_load("test_c_bad_magic.bin", &err);
+            assert(bad_idx == NULL);
+            assert(err != NULL);
+            assert(strstr(err, "truncated") != NULL || strstr(err, "cannot open") != NULL);
+            pg_error_free(err);
+            remove("test_c_bad_magic.bin");
+        }
+
+        // (b) Truncated file (< 12 bytes)
+        {
+            FILE* f = fopen("test_c_trunc.bin", "wb");
+            assert(f != NULL);
+            const char trunc_hdr[8] = "PERGREP";
+            fwrite(trunc_hdr, 1, 8, f);
+            fclose(f);
+
+            err = NULL;
+            pg_index* bad_idx = pg_index_load("test_c_trunc.bin", &err);
+            assert(bad_idx == NULL);
+            assert(err != NULL);
+            assert(strstr(err, "truncated") != NULL);
+            pg_error_free(err);
+            remove("test_c_trunc.bin");
+        }
+
+        // (c) Unsupported version (version 99)
+        {
+            FILE* f = fopen("test_c_bad_ver.bin", "wb");
+            assert(f != NULL);
+            unsigned char bad_ver_hdr[12] = {
+                'P', 'E', 'R', 'G', 'R', 'E', 'P', '\0',
+                99, 0, 0, 0
+            };
+            fwrite(bad_ver_hdr, 1, 12, f);
+            fclose(f);
+
+            err = NULL;
+            pg_index* bad_idx = pg_index_load("test_c_bad_ver.bin", &err);
+            assert(bad_idx == NULL);
+            assert(err != NULL);
+            assert(strstr(err, "unsupported pergrep index version") != NULL);
+            pg_error_free(err);
+            remove("test_c_bad_ver.bin");
+        }
     }
 
     printf("All C API tests passed cleanly.\n");
