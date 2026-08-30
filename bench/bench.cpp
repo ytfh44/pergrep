@@ -1,196 +1,243 @@
-#include <pergrep/pergrep.hpp>
+#include "workload_matrix.hpp"
+
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <random>
-#include <string>
 #include <vector>
+
 using namespace pergrep;
+using namespace pergrep::benchmark;
 
-// Synthetic deterministic corpus generator (~1 MB total corpus)
-static std::vector<Document> generate_benchmark_corpus() {
-    std::mt19937 rng(1337);
-    const std::vector<std::string> dict = {
-        "function", "return", "int", "double", "float", "string", "vector",
-        "class", "struct", "template", "typename", "public", "private",
-        "protected", "virtual", "override", "const", "static", "constexpr",
-        "namespace", "using", "include", "pragma", "define", "ifdef", "endif",
-        "error", "warning", "info", "debug", "critical", "alert", "panic",
-        "connection", "socket", "listener", "buffer", "packet", "stream",
-        "request", "response", "header", "payload", "status", "timeout",
-        "success", "failure", "retry", "abort", "exception", "handler"
-    };
+namespace {
 
-    std::vector<Document> docs;
-    docs.reserve(10);
-
-    for (int doc_idx = 0; doc_idx < 10; ++doc_idx) {
-        std::string content;
-        content.reserve(100 * 1024);
-        size_t line_len = 0;
-        while (content.size() < 100 * 1024) {
-            uint32_t r = rng();
-            if (r % 15 == 0) {
-                if (r % 60 == 0) content += " 0x" + std::to_string(r & 0xFFFF) + " ";
-                else if (r % 45 == 0) content += " ID_" + std::to_string(r % 100000) + " ";
-                else if (r % 30 == 0) content += " connection_reset_by_peer ";
-                else content += " std::vector<int> ";
-            } else {
-                content += dict[r % dict.size()] + " ";
-            }
-            line_len += 10;
-            if (line_len >= 80) {
-                content += "\n";
-                line_len = 0;
-            }
-        }
-        docs.push_back({"doc_" + std::to_string(doc_idx) + ".cpp", std::move(content)});
-    }
-    return docs;
-}
-
-struct BenchCase {
-    std::string name;
-    std::string pattern;
-    PatternOptions popt;
-    SearchOptions sopt;
+struct QueryTotals {
+    double search_ms = 0.0;
+    std::uint64_t verified_bytes = 0;
+    std::uint64_t candidate_chunks = 0;
+    std::uint64_t candidate_blocks = 0;
+    std::uint64_t matches = 0;
 };
 
-int main() {
-    auto docs = generate_benchmark_corpus();
-    uint64_t total_corpus_bytes = 0;
-    for (const auto& d : docs) total_corpus_bytes += d.content.size();
+struct RunTotals {
+    double search_ms = 0.0;
+    double build_ms = 0.0;
+    std::uint64_t verified_bytes = 0;
+    std::uint64_t candidate_chunks = 0;
+    std::uint64_t candidate_blocks = 0;
+    std::uint64_t matches = 0;
+    std::vector<QueryTotals> per_query;
+};
 
-    IndexOptions opt;
-    opt.chunk_bytes = 32768;
-    opt.chunk_overlap = 128;
-    opt.positional_block_bytes = 256;
-    opt.positional_budget_ratio = 0.5;
+IndexOptions indexed_options() {
+    IndexOptions options;
+    options.chunk_bytes = 32768;
+    options.chunk_overlap = 128;
+    options.positional_block_bytes = 256;
+    options.positional_budget_ratio = 0.5;
+    return options;
+}
 
-    auto index = Index::from_documents(docs, opt);
-    Searcher searcher(index);
+IndexOptions reference_options(std::uint64_t corpus_bytes) {
+    IndexOptions options;
+    options.chunk_bytes = std::min<std::uint64_t>(std::uint64_t(1) << 20, corpus_bytes + 1024);
+    if (options.chunk_bytes < 64) options.chunk_bytes = 64;
+    options.chunk_overlap = options.chunk_bytes / 2;
+    options.positional_block_bytes = 256;
+    return options;
+}
 
-    // Reference whole-corpus brute force searcher: single chunk per file.
-    // Must respect IndexOptions bounds (chunk_overlap <= chunk_bytes/2, block <= 1MiB).
-    IndexOptions ref_opt;
-    ref_opt.chunk_bytes = std::min<uint64_t>(uint64_t(1) << 20, total_corpus_bytes + 1024);
-    if (ref_opt.chunk_bytes < 64) ref_opt.chunk_bytes = 64;
-    ref_opt.chunk_overlap = ref_opt.chunk_bytes / 2;
-    ref_opt.positional_block_bytes = 256;
-    auto ref_index = Index::from_documents(docs, ref_opt);
-    Searcher ref_searcher(ref_index);
-    std::vector<BenchCase> cases = {
-        // Flavor 1: Multi-literal alternation (Disjunctions)
-        {"alt_common", "error|warning|fatal|critical|alert|panic", {}, {}},
-        {"alt_protocols", "socket|listener|stream|payload|response", {}, {}},
-        {"alt_keywords", "constexpr|override|typename|template", {}, {}},
+bool same_matches(const std::vector<Match>& actual, const std::vector<Match>& expected) {
+    if (actual.size() != expected.size()) return false;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (actual[i].file_id != expected[i].file_id || actual[i].start != expected[i].start ||
+            actual[i].end != expected[i].end) {
+            return false;
+        }
+    }
+    return true;
+}
 
-        // Flavor 2: Fixed prefix / suffix / anchor patterns
-        {"prefix_var", "connection_[a-z_]+", {}, {}},
-        {"prefix_id", "ID_[0-9]+", {}, {}},
-        {"hex_literal", "0x[0-9a-fA-F]{4}", {}, {}},
+bool validate_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
+                       const IndexOptions& options, const IndexOptions& ref_options) {
+    auto indexed = Index::from_documents(documents, options);
+    auto reference = Index::from_documents(documents, ref_options);
+    Searcher indexed_searcher(indexed);
+    Searcher reference_searcher(reference);
 
-        // Flavor 3: Pure literal-equivalent regex
-        {"lit_scoped", "std::vector", {}, {}},
-        {"lit_escaped", "class\\s+struct", {}, {}},
+    for (const auto& profile : scenario.queries) {
+        auto pattern = Pattern::compile(profile.expression, profile.pattern_options);
+        const auto actual = indexed_searcher.find(pattern, profile.search_options);
+        const auto expected = reference_searcher.find(pattern, profile.search_options);
+        if (!same_matches(actual, expected)) {
+            std::cerr << "CORRECTNESS ERROR scenario=" << scenario.name << " query=" << profile.name
+                      << " expected=" << expected.size() << " got=" << actual.size() << "\n";
+            return false;
+        }
+        const auto actual_files = indexed_searcher.files(pattern, profile.search_options);
+        const auto expected_files = reference_searcher.files(pattern, profile.search_options);
+        if (actual_files != expected_files) {
+            std::cerr << "CORRECTNESS ERROR scenario=" << scenario.name << " query=" << profile.name
+                      << " file selection differs\n";
+            return false;
+        }
+    }
+    return true;
+}
 
-        // Flavor 4: Case-insensitive regex search
-        {"icase_term", "connection_reset_by_peer", {.case_mode = CaseMode::Insensitive}, {}},
-        {"icase_alt", "error|fatal|warning", {.case_mode = CaseMode::Insensitive}, {}},
+void add_stats(RunTotals& totals, const SearchStats& stats, std::size_t match_count) {
+    totals.verified_bytes += stats.verified_bytes;
+    totals.candidate_chunks += stats.candidate_chunks;
+    totals.candidate_blocks += stats.candidate_blocks;
+    totals.matches += match_count;
+}
 
-        // Flavor 5: Bounded repetitions and character classes
-        {"bounded_digits", "[0-9]{4,6}", {}, {}},
-        {"word_boundary", "\\bhandler\\b", {}, {}},
-        {"line_anchor", "^.*timeout.*$", {}, {}}
+void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_count,
+               double elapsed_ms) {
+    totals.search_ms += elapsed_ms;
+    totals.verified_bytes += stats.verified_bytes;
+    totals.candidate_chunks += stats.candidate_chunks;
+    totals.candidate_blocks += stats.candidate_blocks;
+    totals.matches += match_count;
+}
+
+RunTotals measure_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
+                          const IndexOptions& options) {
+    std::vector<Pattern> patterns;
+    patterns.reserve(scenario.queries.size());
+    for (const auto& profile : scenario.queries) {
+        patterns.push_back(Pattern::compile(profile.expression, profile.pattern_options));
+    }
+
+    RunTotals totals;
+    totals.per_query.resize(patterns.size());
+    const auto run_queries = [&](const Index& index, RunTotals& run_totals, bool collect_query_metrics) {
+        Searcher searcher(index);
+        for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
+            SearchStats stats{};
+            const auto query_start = std::chrono::steady_clock::now();
+            const auto matches = searcher.find(patterns[query_index],
+                                                scenario.queries[query_index].search_options, &stats);
+            const auto query_end = std::chrono::steady_clock::now();
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(query_end - query_start).count();
+            add_stats(run_totals, stats, matches.size());
+            if (collect_query_metrics) {
+                add_stats(run_totals.per_query[query_index], stats, matches.size(), elapsed_ms);
+            }
+        }
     };
 
-    // Warm-up
-    for (const auto& c : cases) {
-        auto pat = Pattern::compile(c.pattern, c.popt);
-        (void)searcher.find(pat, c.sopt);
-    }
+    // Cold one-shot scenarios include index construction. Other classes build once, warm once,
+    // and time only repeated searches.
+    if (scenario.include_index_build) {
+        for (std::size_t iteration = 0; iteration < scenario.iterations; ++iteration) {
+            const auto build_start = std::chrono::steady_clock::now();
+            auto index = Index::from_documents(documents, options);
+            const auto build_end = std::chrono::steady_clock::now();
+            totals.build_ms += std::chrono::duration<double, std::milli>(build_end - build_start).count();
 
-    // Correctness validation pass: exact agreement between indexed and brute-force
-    for (const auto& c : cases) {
-        auto pat = Pattern::compile(c.pattern, c.popt);
-        auto actual = searcher.find(pat, c.sopt);
-        auto expected = ref_searcher.find(pat, c.sopt);
-        if (actual.size() != expected.size()) {
-            std::cerr << "CORRECTNESS ERROR on case: " << c.name << " expected " << expected.size()
-                      << " matches but got " << actual.size() << "\n";
-            return 1;
+            const auto search_start = std::chrono::steady_clock::now();
+            run_queries(index, totals, true);
+            const auto search_end = std::chrono::steady_clock::now();
+            totals.search_ms += std::chrono::duration<double, std::milli>(search_end - search_start).count();
         }
-        for (size_t i = 0; i < expected.size(); ++i) {
-            if (actual[i].file_id != expected[i].file_id ||
-                actual[i].start != expected[i].start ||
-                actual[i].end != expected[i].end) {
-                std::cerr << "CORRECTNESS MISMATCH on case: " << c.name << " at match " << i << "\n";
-                return 1;
-            }
+        return totals;
+    }
+
+    const auto build_start = std::chrono::steady_clock::now();
+    auto index = Index::from_documents(documents, options);
+    const auto build_end = std::chrono::steady_clock::now();
+    totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
+
+    // Warm-up is deliberately outside the measured repeated-search interval.
+    RunTotals warmup_totals;
+    warmup_totals.per_query.resize(patterns.size());
+    run_queries(index, warmup_totals, false);
+    const auto search_start = std::chrono::steady_clock::now();
+    for (std::size_t iteration = 0; iteration < scenario.iterations; ++iteration) {
+        run_queries(index, totals, true);
+    }
+    const auto search_end = std::chrono::steady_clock::now();
+    totals.search_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
+    return totals;
+}
+
+} // namespace
+
+int main() {
+    const auto matrix = scenarios();
+    std::uint64_t aggregate_corpus_bytes = 0;
+    std::uint64_t aggregate_searched_bytes = 0;
+    RunTotals aggregate;
+    std::size_t aggregate_query_profiles = 0;
+    std::size_t aggregate_iterations = 0;
+
+    std::cout << "ASI workload_matrix_version=" << kWorkloadMatrixVersion << "\n";
+    std::cout << "ASI workload_scenarios=" << matrix.size() << "\n";
+
+    for (const auto& scenario : matrix) {
+        const auto documents = materialize_documents(scenario);
+        std::uint64_t corpus_bytes = 0;
+        for (const auto& document : documents) corpus_bytes += document.content.size();
+        aggregate_corpus_bytes += corpus_bytes;
+        aggregate_searched_bytes += corpus_bytes * scenario.queries.size() * scenario.iterations;
+        aggregate_query_profiles += scenario.queries.size();
+        aggregate_iterations += scenario.iterations;
+
+        const auto options = indexed_options();
+        const auto ref_options = reference_options(corpus_bytes);
+        if (!validate_scenario(scenario, documents, options, ref_options)) return 1;
+
+        const auto totals = measure_scenario(scenario, documents, options);
+        aggregate.search_ms += totals.search_ms;
+        aggregate.build_ms += totals.build_ms;
+        aggregate.verified_bytes += totals.verified_bytes;
+        aggregate.candidate_chunks += totals.candidate_chunks;
+        aggregate.candidate_blocks += totals.candidate_blocks;
+        aggregate.matches += totals.matches;
+
+        const double measured_searches = double(scenario.queries.size() * scenario.iterations);
+        const double search_ms_per_query = totals.search_ms / std::max(1.0, measured_searches);
+        const double searched_mb = double(corpus_bytes) * measured_searches / (1024.0 * 1024.0);
+        const double throughput = searched_mb / std::max(1e-9, totals.search_ms / 1000.0);
+
+        std::cout << "SCENARIO name=" << scenario.name << " class=" << to_string(scenario.workload_class)
+                  << " phase=" << to_string(scenario.phase) << " corpus=" << scenario.corpus.name
+                  << " transform=" << to_string(scenario.corpus.transform)
+                  << " selector=" << to_string(scenario.selector) << " queries=" << scenario.queries.size()
+                  << " iterations=" << scenario.iterations << "\n";
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "METRIC scenario=" << scenario.name << " corpus_bytes=" << corpus_bytes
+                  << " index_build_ms=" << totals.build_ms << " search_time_ms=" << totals.search_ms
+                  << " search_ms_per_query=" << search_ms_per_query << " throughput_mb_s=" << throughput
+                  << " verified_kb=" << (double(totals.verified_bytes) / 1024.0)
+                  << " candidate_chunks=" << totals.candidate_chunks
+                  << " candidate_blocks=" << totals.candidate_blocks << " matches=" << totals.matches
+                  << " correctness=pass\n";
+        for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
+            const auto& query_totals = totals.per_query[query_index];
+            std::cout << "METRIC query=" << scenario.name << "." << scenario.queries[query_index].name
+                      << " search_time_ms=" << query_totals.search_ms
+                      << " verified_kb=" << (double(query_totals.verified_bytes) / 1024.0)
+                      << " candidate_chunks=" << query_totals.candidate_chunks
+                      << " candidate_blocks=" << query_totals.candidate_blocks
+                      << " matches=" << query_totals.matches << "\n";
         }
     }
 
-    // Benchmark loop (multiple iterations for stable timing)
-    const int ITERATIONS = 5;
-    uint64_t total_verified_bytes = 0;
-    uint64_t total_candidate_chunks = 0;
-    uint64_t total_matches = 0;
-    // Per-flavor candidate_chunks logging for QO-2 rarity analysis + QO-4 cost model verifier
-    std::vector<uint64_t> per_case_candidate_chunks(cases.size(), 0);
-    std::vector<std::string> per_case_verifier(cases.size());
-    std::vector<double> per_case_selectivity(cases.size(), 0.0);
-    std::vector<uint64_t> per_case_blocks(cases.size(), 0);
-
-    auto t0 = std::chrono::steady_clock::now();
-    for (int iter = 0; iter < ITERATIONS; ++iter) {
-        for (size_t ci = 0; ci < cases.size(); ++ci) {
-            const auto& c = cases[ci];
-            auto pat = Pattern::compile(c.pattern, c.popt);
-            SearchStats stats{};
-            auto ms = searcher.find(pat, c.sopt, &stats);
-            total_verified_bytes += stats.verified_bytes;
-            total_candidate_chunks += stats.candidate_chunks;
-            per_case_candidate_chunks[ci] += stats.candidate_chunks;
-            per_case_blocks[ci] += stats.candidate_blocks;
-            // QO-4 cost model: capture verifier and selectivity chosen by estimateCost/chooseVerifier
-            if (iter == 0) {
-                per_case_verifier[ci] = stats.verifier.empty() ? "Unknown" : stats.verifier;
-                per_case_selectivity[ci] = stats.estimated_selectivity;
-            }
-            total_matches += ms.size();
-        }
-    }
-    auto t1 = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double avg_ms = total_ms / ITERATIONS;
-    double corpus_mb = double(total_corpus_bytes) / (1024.0 * 1024.0);
-    double total_searched_mb = corpus_mb * cases.size() * ITERATIONS;
-    double throughput = total_searched_mb / (total_ms / 1000.0);
-
-    double total_possible_chunks = double(index.corpus_bytes() / opt.chunk_bytes) * cases.size() * ITERATIONS;
-    double pruned_pct = 100.0 * (1.0 - std::min(1.0, double(total_candidate_chunks) / std::max(1.0, total_possible_chunks)));
-
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "METRIC search_time_ms=" << avg_ms << "\n";
-    std::cout << "METRIC throughput_mb_s=" << throughput << "\n";
-    std::cout << "METRIC pruned_chunks_pct=" << pruned_pct << "\n";
-    std::cout << "METRIC verified_kb=" << (double(total_verified_bytes) / 1024.0 / ITERATIONS) << "\n";
-    std::cout << "METRIC matches_count=" << (total_matches / ITERATIONS) << "\n";
-    std::cout << "ASI cases_count=" << cases.size() << "\n";
-    std::cout << "ASI corpus_size_mb=" << corpus_mb << "\n";
-    // Per-flavor candidate_chunks (averaged over iterations) for rarity planner visibility + QO-4 verifier
-    for (size_t ci = 0; ci < cases.size(); ++ci) {
-        uint64_t avg_cc = per_case_candidate_chunks[ci] / ITERATIONS;
-        uint64_t avg_blocks = per_case_blocks[ci] / ITERATIONS;
-        std::cout << "METRIC candidate_chunks[" << cases[ci].name << "]=" << avg_cc << "\n";
-        std::cout << "METRIC candidate_blocks[" << cases[ci].name << "]=" << avg_blocks << "\n";
-        std::cout << "METRIC verifier[" << cases[ci].name << "]=" << per_case_verifier[ci] << "\n";
-        std::cout << "METRIC selectivity[" << cases[ci].name << "]=" << std::fixed << std::setprecision(6) << per_case_selectivity[ci] << "\n";
-        // is_pure_literal dispatch check: lit_scoped / lit_escaped should be Fixed* (pure literal fast path)
-        // when (multiline || !contains sep) holds; bench ensures per-flavor candidate_chunks measured.
-    }
+    const double aggregate_searched_mb = double(aggregate_searched_bytes) / (1024.0 * 1024.0);
+    const double aggregate_throughput = aggregate_searched_mb /
+                                        std::max(1e-9, aggregate.search_ms / 1000.0);
+    std::cout << "METRIC search_time_ms=" << aggregate.search_ms << "\n";
+    std::cout << "METRIC throughput_mb_s=" << aggregate_throughput << "\n";
+    std::cout << "METRIC verified_kb=" << (double(aggregate.verified_bytes) / 1024.0) << "\n";
+    std::cout << "METRIC candidate_chunks=" << aggregate.candidate_chunks << "\n";
+    std::cout << "METRIC candidate_blocks=" << aggregate.candidate_blocks << "\n";
+    std::cout << "METRIC matches_count=" << aggregate.matches << "\n";
+    std::cout << "ASI aggregate_corpus_bytes=" << aggregate_corpus_bytes << "\n";
+    std::cout << "ASI aggregate_query_profiles=" << aggregate_query_profiles << "\n";
+    std::cout << "ASI aggregate_iterations=" << aggregate_iterations << "\n";
     return 0;
 }
