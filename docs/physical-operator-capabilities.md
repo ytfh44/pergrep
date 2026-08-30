@@ -7,13 +7,12 @@ an exact verification with the stated semantics. `FixedChunk` is an internal
 shape, not a public `VerifierKind`; its `SearchStats::verifier` value is
 `FixedRareByte`.
 
-## Important distinction: estimates are not dispatch
+## Estimates, guarded dispatch, and fallback
 
-`Searcher::find` currently computes a `PlanKey` and calls `estimateCost(PlanKey,
-IndexData)`. The result populates `SearchStats::verifier`,
-`estimated_selectivity`, and `estimated_cost`, but it does **not** choose a
-branch in `find`. Actual execution still follows the hard-coded order below
-(`src/search.cpp:1350-1654`):
+Searcher::find computes a complete PlanKey and calls estimateCost(PlanKey,
+IndexData). M1.7 uses that estimate for physical dispatch only when the explicit
+M1.7 guard below proves that all candidate operators have identical semantics.
+Every other query retains the established hard-coded order:
 
 1. `invert_match` is a record-enumeration wrapper around fixed or regex exact
    checks.
@@ -28,14 +27,48 @@ branch in `find`. Actual execution still follows the hard-coded order below
 6. A regex that is a pure, sensitive, non-extended literal is converted to the
    fixed path when `multiline` is set or the literal does not contain the
    requested `SearchOptions::record_separator` (`src/search.cpp:1588-1594`).
-   This conversion is also applied to capture-bearing literal-shaped regexes;
-   because the fixed path has no captures, such patterns are not a supported
-   capture-preserving capability and must not be treated as equivalent to the
-   general regex path. Other regexes use branch-mandatory/mandatory chunk
-   pruning when available, otherwise the unpruned candidate set.
-estimates candidate chunks/blocks and abstract cost. It is not cost-based
-physical dispatch yet. M1.3 makes the estimate input explicit; it does not
-change this hard-coded execution order.
+   Capture-bearing literal-shaped regexes are excluded from this conversion so
+   their captures remain owned by the general regex path. Other regexes use
+   branch-mandatory/mandatory chunk pruning when available, otherwise the
+   unpruned candidate set.
+Regexes still use branch-mandatory/mandatory pruning when available, otherwise
+the unpruned candidate set. The guarded fixed dispatcher never applies to regex
+conversion, capture-bearing patterns, or any multi-pattern path.
+## M1.7 guarded cost-based fixed dispatch
+
+M1.7 enables physical selection only for a deliberately narrow, provably equivalent
+contract. Searcher::find builds the complete PlanKey; the guard requires all of:
+
+- a direct fixed pattern with 4--64 bytes, no cross-chunk possibility
+  (4 <= q.size() <= 64 and q.size() <= chunk_overlap);
+- sensitive matching, with word, line, multiline, dotall, crlf disabled,
+  Unicode enabled, and the default fixed engine;
+- newline records, unlimited non-overlapping positive matches, no file-polarity
+  wrapper, no inversion, no eligible-file selector, and binary inclusion disabled;
+- a PlanKey whose IndexOptions exactly match the live index, with planner statistics
+  ready, non-empty positional data, a positive positional block size/q-gram budget,
+  and no binary files in the corpus.
+
+Any failed predicate is a conservative fallback to the pre-M1.7 length/option
+branches. Estimates never decide candidate membership: q-gram and Bloom filters
+remain supersets, and exact verification remains owned by the existing operators.
+For a guarded query, calibrated M1.6 candidate-work units rank positional-block,
+chunk-level rare-byte, and whole-file rare-byte backends. Ties retain the existing
+positional preference. Whole-file selection is safe in this guard because the
+literal is short and no boundary or scope semantics are active; literals that can
+cross a chunk boundary are never admitted. The calibration is intentionally static
+and tied to the M1.6 shadow units (probe/enumeration plus verification bytes); if
+planner statistics or capability identity is unavailable, selection is disabled.
+
+SearchStats::physical_operator reports the concrete backend
+(FixedPositional, FixedChunk, FixedRareByteWholeFile, or a wrapper label),
+while guarded_dispatch_used distinguishes a guarded choice from fallback.
+verifier remains the stable public verifier kind (FixedRareByte covers both
+rare-byte shapes), and verifier_fallback is true for fixed queries outside the
+guarded contract. Bench query metrics print both fields. Rollback is therefore a
+configuration/dispatch guard change: disable the guard or fall back to the existing
+branch without changing match order, captures, offsets, overlap/max-count,
+record-separator, binary, or selector semantics.
 
 ### Wrapper semantics that affect every row
 
@@ -114,11 +147,12 @@ The public C++ counters have the following stable meanings (`pergrep.hpp:180-217
   in-memory candidate indexes.
 - `matches` is the final `find` output count. `verifier_cpu_ns` is process CPU
   time measured around candidate generation and exact verification.
-- `verifier`, `estimated_selectivity`, and `estimated_cost` are cost-model
-  annotations. `verifier_fallback` is set for invert mode, the
-  `RegexBruteForce` estimate, and fixed literals longer than overlap; it is not
-  a universal marker for every conservative branch (for example fixed
-  `word`/`line` chunk fallback is not marked fallback).
+- physical_operator and guarded_dispatch_used expose the concrete backend and
+  whether M1.7 selection ran. verifier remains the stable enum label
+  (FixedRareByte covers chunk and whole-file anchor scans).
+- verifier_fallback is true for fixed searches outside the explicit M1.7 guard,
+  invert wrappers, and RegexBruteForce. It is false only for a guarded fixed
+  choice; guarded_dispatch_used is the direct choice/fallback indicator.
 - `plan_regret` is populated from M0.7's chosen-plan record. In `find`, the
   chosen candidate is observed and alternatives generated by
   `estimate_all_candidate_plans` are not counterfactually executed, so this

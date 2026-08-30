@@ -35,6 +35,8 @@ struct QueryTotals {
     std::uint64_t predicted_verified_bytes = 0;
     std::uint64_t prediction_error_bound_chunks = 0;
     std::uint64_t prediction_error_bound_blocks = 0;
+    std::string physical_operator = {};
+    bool guarded_dispatch_used = false;
     std::uint64_t prediction_error_bound_bytes = 0;
     std::string verifier = {};
     double estimated_selectivity = 0.0;
@@ -243,9 +245,11 @@ void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_
     totals.prediction_error_bound_blocks += stats.prediction_error_bound_blocks;
     totals.prediction_error_bound_bytes += stats.prediction_error_bound_bytes;
     totals.verifier = stats.verifier;
+    totals.physical_operator = stats.physical_operator;
+    totals.guarded_dispatch_used = stats.guarded_dispatch_used;
     totals.estimated_selectivity = stats.estimated_selectivity;
     totals.plan_regret = stats.plan_regret;
-    totals.is_fallback = (stats.verifier == "RegexBruteForce");
+    totals.is_fallback = stats.verifier_fallback;
 }
 
 ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vector<Document>& documents,
@@ -796,6 +800,8 @@ int main(int argc, char** argv) {
                       << " candidate_files=" << query_totals.candidate_files
                       << " verifier_cpu_ms=" << (double(query_totals.verifier_cpu_ns) / 1000000.0)
                       << " verifier=" << query_totals.verifier
+                      << " physical_operator=" << query_totals.physical_operator
+                      << " guarded_dispatch=" << (query_totals.guarded_dispatch_used ? "used" : "fallback")
                       << " estimated_selectivity=" << query_totals.estimated_selectivity
                       << " plan_regret=" << query_totals.plan_regret
                       << " prediction_error=" << query_totals.prediction_error

@@ -283,6 +283,9 @@ using PosDesc = detail::PosDesc;
 // Candidate units are chunks, positional blocks, and verifier bytes; source
 // q-gram occurrence bytes are not candidate-work proxies.
 enum class VerifierKind : std::uint8_t { FixedRareByte = 0, FixedPositional = 1, RegexChunk = 2, RegexBruteForce = 3 };
+// Physical backend selected for guarded fixed-string dispatch. FixedRareByte
+// remains the public verifier label for both chunk and whole-file anchor scans.
+enum class FixedPhysicalOperator : std::uint8_t { WholeFile = 0, Chunk = 1, PositionalBlock = 2 };
 inline const char* to_string(VerifierKind k) noexcept {
     switch (k) {
         case VerifierKind::FixedRareByte: return "FixedRareByte";
@@ -298,7 +301,9 @@ struct QueryCost {
     std::uint64_t estimated_candidate_blocks = 0;
     std::uint64_t estimated_verified_bytes = 0;
     VerifierKind verifier = VerifierKind::FixedRareByte;
-    double cost = 0.0; // abstract cost: verified_bytes + 100 * candidate_chunks (tunable)
+    FixedPhysicalOperator fixed_operator = FixedPhysicalOperator::WholeFile;
+    bool guarded_dispatch = false;
+    double cost = 0.0; // calibrated candidate-work estimate
 };
 // Forward-declare pergrep::Pattern for cost estimation (defined in pergrep.hpp).
 

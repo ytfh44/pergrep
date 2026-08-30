@@ -21,6 +21,16 @@
 namespace pergrep {
 using detail::QueryDesc;
 namespace {
+// Recursive pure-literal regex conversion calls find again with a Fixed
+// Pattern. Keep the M1.7 guard exclusive to direct Fixed searches.
+thread_local bool suppress_guarded_fixed_dispatch = false;
+struct FixedDispatchSuppression {
+    bool previous;
+    FixedDispatchSuppression() noexcept : previous(suppress_guarded_fixed_dispatch) {
+        suppress_guarded_fixed_dispatch = true;
+    }
+    ~FixedDispatchSuppression() { suppress_guarded_fixed_dispatch = previous; }
+};
 struct StatsRecorder {
     SearchStats* stats = nullptr;
     const detail::IndexData& index;
@@ -563,6 +573,73 @@ static double estimate_branch_selectivity_impl(
     return std::min(sum, 1.0);
 }
 
+// M1.7 guarded fixed dispatch. The guard is deliberately narrower than the
+// exact matchers: only the q-gram/positional contract shared by all three
+// physical backends is admitted. Any uncertainty leaves the established
+// length/option dispatch untouched.
+static bool fixed_guard_eligible(const PlanKey& key, const detail::IndexData& I) {
+    const auto& po = key.pattern_options;
+    const auto& io = key.index_options;
+    const auto qlen = key.pattern_expression.size();
+    if (po.kind != PatternKind::Fixed || qlen < 4 || qlen > 64 || qlen > io.chunk_overlap) return false;
+    if (po.case_mode != CaseMode::Sensitive || po.word || po.line || po.multiline || po.dotall || po.crlf ||
+        !po.unicode || po.engine != Engine::Default) return false;
+    if (key.overlapping || key.invert_match || key.files_with_matches || key.files_without_match ||
+        key.max_matches != 0 || key.record_separator != '\n' || key.include_binary ||
+        !key.eligible_file_ids.empty()) return false;
+    // A PlanKey must describe this exact index. This prevents a stale or
+    // synthetic key from selecting an operator whose layout differs.
+    if (io.chunk_bytes != I.opt.chunk_bytes || io.chunk_overlap != I.opt.chunk_overlap ||
+        io.positional_block_bytes != I.opt.positional_block_bytes ||
+        io.positional_budget_ratio != I.opt.positional_budget_ratio || io.planned_qgrams != I.opt.planned_qgrams ||
+        io.include_hidden != I.opt.include_hidden || io.follow_symlinks != I.opt.follow_symlinks ||
+        io.persist_corpus != I.opt.persist_corpus) return false;
+    if (!I.planner_stats_ready || I.pos_block == 0 || io.planned_qgrams == 0 ||
+        I.pos_desc.size() != I.chunks.size() || I.pos.empty()) return false;
+    // Excluding binary inputs makes the binary policy invariant for every
+    // candidate backend. Callers that opt into binary or have binary files use
+    // the existing dispatch instead.
+    for (const auto& info : I.infos) if (info.binary) return false;
+    return true;
+}
+
+struct FixedPlanCosts {
+    double positional = 0.0;
+    double chunk = 0.0;
+    double whole_file = 0.0;
+    std::uint64_t chunks = 0;
+    std::uint64_t blocks = 0;
+    std::uint64_t positional_bytes = 0;
+    std::uint64_t chunk_bytes = 0;
+    std::uint64_t whole_bytes = 0;
+};
+
+static FixedPlanCosts fixed_plan_costs(const PlanKey& key, const detail::IndexData& I) {
+    FixedPlanCosts c;
+    const std::span<const std::uint32_t> scope(key.eligible_file_ids.data(), key.eligible_file_ids.size());
+    const auto total_chunks = scoped_chunk_count(I, scope);
+    const auto total_blocks = [&] {
+        std::uint64_t n = 0;
+        for (std::size_t i = 0; i < I.pos_desc.size(); ++i) {
+            if (i < I.chunks.size() && scope_contains(scope, I.chunks[i].file_id)) n += I.pos_desc[i].blocks;
+        }
+        return n;
+    }();
+    const auto sel = estimate_literal_selectivity_impl(key.pattern_expression, I, scope);
+    c.chunks = total_chunks ? static_cast<std::uint64_t>(sel * total_chunks) : 0;
+    if (c.chunks == 0 && sel < 1.0 && total_chunks > 0) c.chunks = 1;
+    c.blocks = total_blocks ? static_cast<std::uint64_t>(sel * total_blocks) : 0;
+    if (c.blocks == 0 && sel < 1.0 && total_blocks > 0) c.blocks = 1;
+    c.positional_bytes = c.blocks * (I.pos_block + 64);
+    c.chunk_bytes = c.chunks * I.opt.chunk_bytes;
+    c.whole_bytes = scoped_extended_bytes(I, scope);
+    // Coefficients are calibrated to M1.6 shadow units: index probes and
+    // candidate enumeration are charged separately from source verification.
+    c.positional = 0.5 * double(c.positional_bytes) + 50.0 * double(c.blocks) + 10.0 * double(c.chunks);
+    c.chunk = double(c.chunk_bytes) + 100.0 * double(c.chunks);
+    c.whole_file = double(c.whole_bytes) + 100.0 * double(c.chunks);
+    return c;
+}
 } // namespace
 // M1.3 PlanKey implementation
 namespace {
@@ -718,6 +795,15 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
             (q.size() > I.opt.chunk_overlap || icase)
                 ? scoped_extended_bytes(I, {})
                 : qc.estimated_candidate_chunks * I.opt.chunk_bytes;
+        if (p.is_fixed()) {
+            PlanKey key;
+            key.pattern_expression = p.impl_->expr;
+            key.pattern_options = p.impl_->opt;
+            key.record_separator = record_separator;
+            key.index_options = I.opt;
+            auto guarded = estimateCost(key, I);
+            if (guarded.guarded_dispatch) return guarded;
+        }
         // Branching similar to actual dispatch but with cost annotation
         // Cost model: FixedPositional cheaper when many blocks can be pruned (sel small)
         // and q small enough for positional (<=64) without word/line/icase.
@@ -745,7 +831,7 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
     }
     // Regex patterns
     // is_pure_literal fast path: (multiline || !contains sep) matches actual find() dispatch to Fixed
-    if (p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
+    if (p.impl_->re.query_ir.is_pure_literal && p.impl_->re.groups == 0 && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
         bool sep_in_lit = p.impl_->re.query_ir.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
         if (p.impl_->opt.multiline || !sep_in_lit) {
             PatternOptions fopt = p.impl_->opt;
@@ -814,28 +900,59 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
         if (q.size() > Kopt.chunk_overlap || icase) sel = 1.0;
         qc.selectivity = sel;
         qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
-        if (qc.estimated_candidate_chunks==0 && sel < 1.0 && total_chunks>0) qc.estimated_candidate_chunks = 1;
+        if (qc.estimated_candidate_chunks == 0 && sel < 1.0 && total_chunks > 0) qc.estimated_candidate_chunks = 1;
         qc.estimated_verified_bytes =
             (q.size() > Kopt.chunk_overlap || icase)
                 ? scoped_extended_bytes(I, scope)
-                : qc.estimated_candidate_chunks * I.opt.chunk_bytes;
+                : qc.estimated_candidate_chunks * Kopt.chunk_bytes;
+
+        if (fixed_guard_eligible(key, I)) {
+            const auto costs = fixed_plan_costs(key, I);
+            qc.guarded_dispatch = true;
+            if (costs.whole_file < costs.chunk && costs.whole_file < costs.positional) {
+                qc.verifier = detail::VerifierKind::FixedRareByte;
+                qc.fixed_operator = detail::FixedPhysicalOperator::WholeFile;
+                qc.estimated_candidate_blocks = 0;
+                qc.estimated_verified_bytes = costs.whole_bytes;
+                qc.cost = costs.whole_file;
+            } else if (costs.chunk < costs.positional) {
+                qc.verifier = detail::VerifierKind::FixedRareByte;
+                qc.fixed_operator = detail::FixedPhysicalOperator::Chunk;
+                qc.estimated_candidate_blocks = 0;
+                qc.estimated_verified_bytes = costs.chunk_bytes;
+                qc.cost = costs.chunk;
+            } else {
+                qc.verifier = detail::VerifierKind::FixedPositional;
+                qc.fixed_operator = detail::FixedPhysicalOperator::PositionalBlock;
+                qc.estimated_candidate_blocks = costs.blocks;
+                qc.estimated_verified_bytes = costs.positional_bytes;
+                qc.cost = costs.positional;
+            }
+            return qc;
+        }
+
+        // Outside the guarded M1.7 contract preserve the established estimate
+        // labels, even when execution has to use a conservative fallback.
         if (q.size() > Kopt.chunk_overlap) {
             qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.fixed_operator = detail::FixedPhysicalOperator::WholeFile;
             qc.estimated_candidate_blocks = 0;
             qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
         } else if (icase || key.pattern_options.word || key.pattern_options.line) {
             qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.fixed_operator = detail::FixedPhysicalOperator::Chunk;
             qc.estimated_candidate_blocks = 0;
             qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
         } else if (q.size() <= 64) {
             qc.verifier = detail::VerifierKind::FixedPositional;
+            qc.fixed_operator = detail::FixedPhysicalOperator::PositionalBlock;
             qc.estimated_candidate_blocks = static_cast<uint64_t>(sel * double(total_blocks));
-            if (qc.estimated_candidate_blocks==0 && sel < 1.0 && total_blocks>0) qc.estimated_candidate_blocks = 1;
-            qc.estimated_verified_bytes =
-                qc.estimated_candidate_blocks * (I.pos_block + 64);
+            if (qc.estimated_candidate_blocks == 0 && sel < 1.0 && total_blocks > 0) qc.estimated_candidate_blocks = 1;
+            qc.estimated_verified_bytes = qc.estimated_candidate_blocks * (I.pos_block + 64);
             qc.cost = double(qc.estimated_verified_bytes) * 0.5 + 50.0 * double(qc.estimated_candidate_blocks) + 10.0 * double(qc.estimated_candidate_chunks);
         } else {
             qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.fixed_operator = detail::FixedPhysicalOperator::Chunk;
             qc.estimated_candidate_blocks = 0;
             qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
         }
@@ -843,8 +960,7 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
         if (key.overlapping) qc.cost += 500.0;
         if (key.max_matches != 0) qc.cost = std::min(qc.cost, double(key.max_matches * 1024));
         if (!key.eligible_file_ids.empty()) {
-            const double ratio = double(total_chunks) /
-                                 double(std::max<std::size_t>(I.chunks.size(), 1));
+            const double ratio = double(total_chunks) / double(std::max<std::size_t>(I.chunks.size(), 1));
             qc.cost *= (0.5 + 0.5 * ratio);
         }
         qc.cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
@@ -858,7 +974,7 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(total_chunks);
         return qc;
     }
-    if (tmp.impl_->re.query_ir.is_pure_literal && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
+    if (tmp.impl_->re.query_ir.is_pure_literal && tmp.impl_->re.groups == 0 && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
         bool sep_in_lit = tmp.impl_->re.query_ir.exact_literal.find(static_cast<char>(sep)) != std::string::npos;
         if (key.pattern_options.multiline || !sep_in_lit) {
             PatternOptions fopt = key.pattern_options; fopt.kind = PatternKind::Fixed;
@@ -906,63 +1022,19 @@ namespace detail {
 std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
     std::vector<PlanCandidateMetrics> candidates;
     const auto total_chunks = I.chunks.size();
-    const auto total_blocks = [&]{
-        size_t n = 0; for (const auto& d : I.pos_desc) n += d.blocks; return n;
-    }();
 
     auto chosen_cost = estimateCost(p, I, record_separator);
 
     if (p.is_fixed()) {
-        auto q = std::string_view(p.expression());
-        bool icase = (p.options().case_mode == CaseMode::Insensitive);
-        double sel = detail::estimate_literal_selectivity(q, I);
-        uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
-        if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
-        uint64_t est_bytes = est_chunks * I.opt.chunk_bytes;
-
-        // Candidate 1: FixedRareByte
-        {
-            PlanCandidateMetrics c;
-            c.name = "FixedRareByte";
-            c.verifier = pergrep::VerifierKind::FixedRareByte;
-            c.predicted_selectivity = sel;
-            c.predicted_cost = double(est_bytes) + 100.0 * double(est_chunks);
-            c.is_fallback = (q.size() > I.opt.chunk_overlap);
-            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedRareByte);
-            c.actual_observed = false;
-            candidates.push_back(c);
-        }
-
-        // Candidate 2: FixedPositional (if eligible)
-        if (q.size() <= 64 && !icase && !p.options().word && !p.options().line) {
-            PlanCandidateMetrics c;
-            c.name = "FixedPositional";
-            c.verifier = pergrep::VerifierKind::FixedPositional;
-            c.predicted_selectivity = sel;
-            uint64_t est_blocks = static_cast<uint64_t>(sel * double(total_blocks));
-            if (est_blocks == 0 && sel < 1.0 && total_blocks > 0) est_blocks = 1;
-            c.predicted_cost = double(est_bytes) * 0.5 + 50.0 * double(est_blocks) + 10.0 * double(est_chunks);
-            c.is_fallback = false;
-            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedPositional);
-            c.actual_observed = false;
-            candidates.push_back(c);
-        }
-
-        // Candidate 3: RegexBruteForce (fallback scan)
-        {
-            PlanCandidateMetrics c;
-            c.name = "RegexBruteForce";
-            c.verifier = pergrep::VerifierKind::RegexBruteForce;
-            c.predicted_selectivity = 1.0;
-            c.predicted_cost = double(total_chunks * I.opt.chunk_bytes) + 200.0 * double(total_chunks);
-            c.is_fallback = true;
-            c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
-            c.actual_observed = false;
-            candidates.push_back(c);
-        }
+        PlanKey key;
+        key.pattern_expression = p.expression();
+        key.pattern_options = p.options();
+        key.record_separator = record_separator;
+        key.index_options = I.opt;
+        return estimate_all_candidate_plans(key, I);
     } else {
         // Regex patterns
-        if (p.impl_ && p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
+        if (p.impl_ && p.impl_->re.query_ir.is_pure_literal && p.impl_->re.groups == 0 && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
             bool sep_in_lit = p.impl_->re.query_ir.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
             if (p.impl_->opt.multiline || !sep_in_lit) {
                 PatternOptions fopt = p.impl_->opt;
@@ -1005,34 +1077,50 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
 namespace detail {
 std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& key, const IndexData& I) {
     std::vector<PlanCandidateMetrics> candidates;
-    const auto total_chunks = I.chunks.size();
-    const auto total_blocks = [&]{ size_t n=0; for(auto& d:I.pos_desc) n+=d.blocks; return n; }();
+    const std::span<const std::uint32_t> scope(key.eligible_file_ids.data(), key.eligible_file_ids.size());
+    const auto total_chunks = scoped_chunk_count(I, scope);
+    const auto total_blocks = [&]{
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < I.pos_desc.size(); ++i)
+            if (i < I.chunks.size() && scope_contains(scope, I.chunks[i].file_id)) n += I.pos_desc[i].blocks;
+        return n;
+    }();
     auto chosen_cost = estimateCost(key, I);
     bool is_fixed = (key.pattern_options.kind == PatternKind::Fixed);
     if (is_fixed) {
         auto q = std::string_view(key.pattern_expression);
-        bool icase = (key.pattern_options.case_mode == CaseMode::Insensitive);
-        double sel = detail::estimate_literal_selectivity(q, I);
-        uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
+        const bool icase = (key.pattern_options.case_mode == CaseMode::Insensitive);
+        const double sel = estimate_literal_selectivity_impl(q, I, scope);
+        const bool guarded = fixed_guard_eligible(key, I);
+        FixedPlanCosts costs;
+        if (guarded) costs = fixed_plan_costs(key, I);
+        std::uint64_t est_chunks = total_chunks ? static_cast<std::uint64_t>(sel * total_chunks) : total_chunks;
         if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
-        uint64_t est_bytes = est_chunks * I.opt.chunk_bytes;
+        const double est_bytes = guarded ? double(std::min(costs.chunk_bytes, costs.whole_bytes)) : double(est_chunks) * I.opt.chunk_bytes;
         {
-            PlanCandidateMetrics c; c.name="FixedRareByte"; c.verifier=pergrep::VerifierKind::FixedRareByte;
-            c.predicted_selectivity=sel; c.predicted_cost=double(est_bytes)+100.0*double(est_chunks);
-            c.is_fallback=(q.size() > key.index_options.chunk_overlap);
-            c.chosen=(chosen_cost.verifier==detail::VerifierKind::FixedRareByte); c.actual_observed=false; candidates.push_back(c);
+            PlanCandidateMetrics c; c.name = "FixedRareByte"; c.verifier = pergrep::VerifierKind::FixedRareByte;
+            c.predicted_selectivity = sel;
+            c.predicted_cost = guarded ? std::min(costs.chunk, costs.whole_file) : est_bytes + 100.0 * est_chunks;
+            c.is_fallback = !guarded && (q.size() > key.index_options.chunk_overlap || icase || key.pattern_options.word || key.pattern_options.line);
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedRareByte);
+            c.actual_observed = false; candidates.push_back(c);
         }
-        if (q.size() <= 64 && !icase && !key.pattern_options.word && !key.pattern_options.line) {
-            PlanCandidateMetrics c; c.name="FixedPositional"; c.verifier=pergrep::VerifierKind::FixedPositional;
-            c.predicted_selectivity=sel; uint64_t est_blocks=static_cast<uint64_t>(sel*double(total_blocks));
-            if (est_blocks==0 && sel < 1.0 && total_blocks>0) est_blocks=1;
-            c.predicted_cost=double(est_bytes)*0.5+50.0*double(est_blocks)+10.0*double(est_chunks);
-            c.is_fallback=false; c.chosen=(chosen_cost.verifier==detail::VerifierKind::FixedPositional); c.actual_observed=false; candidates.push_back(c);
+        if ((guarded || (q.size() <= 64 && !icase && !key.pattern_options.word && !key.pattern_options.line))) {
+            PlanCandidateMetrics c; c.name = "FixedPositional"; c.verifier = pergrep::VerifierKind::FixedPositional;
+            c.predicted_selectivity = sel;
+            std::uint64_t est_blocks = static_cast<std::uint64_t>(sel * double(total_blocks));
+            if (est_blocks == 0 && sel < 1.0 && total_blocks > 0) est_blocks = 1;
+            const auto positional_bytes = guarded ? costs.positional_bytes : est_blocks * (I.pos_block + 64);
+            c.predicted_cost = guarded ? costs.positional : double(positional_bytes) * 0.5 + 50.0 * double(est_blocks) + 10.0 * est_chunks;
+            c.is_fallback = false;
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedPositional);
+            c.actual_observed = false; candidates.push_back(c);
         }
         {
-            PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
-            c.predicted_cost=double(total_chunks * I.opt.chunk_bytes)+200.0*double(total_chunks);
-            c.is_fallback=true; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexBruteForce); c.actual_observed=false; candidates.push_back(c);
+            PlanCandidateMetrics c; c.name = "RegexBruteForce"; c.verifier = pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_cost = double(total_chunks * I.opt.chunk_bytes) + 200.0 * double(total_chunks);
+            c.is_fallback = true; c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
+            c.actual_observed = false; candidates.push_back(c);
         }
     } else {
         Pattern tmp; try { tmp = Pattern::compile(key.pattern_expression, key.pattern_options); } catch(...) {
@@ -1041,7 +1129,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& ke
             c.is_fallback=true; c.chosen=true; c.actual_observed=false; candidates.push_back(c);
             return candidates;
         }
-        if (tmp.impl_->re.query_ir.is_pure_literal && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
+        if (tmp.impl_->re.query_ir.is_pure_literal && tmp.impl_->re.groups == 0 && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
             bool sep_in_lit = tmp.impl_->re.query_ir.exact_literal.find(static_cast<char>(key.record_separator)) != std::string::npos;
             if (key.pattern_options.multiline || !sep_in_lit) {
                 PatternOptions fopt = key.pattern_options; fopt.kind = PatternKind::Fixed;
@@ -1451,8 +1539,22 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     // conservative hash-bucket bounds are never used to reject candidates.
     PlanKey plan_key = make_plan_key(p, opt, I.opt, 0);
     auto qc = estimateCost(plan_key, I);
+    const bool guarded_fixed_dispatch = !suppress_guarded_fixed_dispatch && p.is_fixed() &&
+                                        qc.guarded_dispatch && fixed_guard_eligible(plan_key, I);
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
+        stats->guarded_dispatch_used = guarded_fixed_dispatch;
+        if (!p.is_fixed()) {
+            stats->physical_operator = stats->verifier;
+        } else if (opt.invert_match) {
+            stats->physical_operator = "FixedRecordWrapper";
+        } else if (qc.fixed_operator == detail::FixedPhysicalOperator::PositionalBlock) {
+            stats->physical_operator = "FixedPositional";
+        } else if (qc.fixed_operator == detail::FixedPhysicalOperator::Chunk) {
+            stats->physical_operator = "FixedChunk";
+        } else {
+            stats->physical_operator = "FixedRareByteWholeFile";
+        }
         stats->plan_key_hash = plan_key.hash();
         stats->semantic_mode = semantic_mode_key(plan_key);
         stats->estimated_selectivity = qc.selectivity;
@@ -1516,8 +1618,10 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         bool icase = (p.impl_->opt.case_mode == CaseMode::Insensitive);
 
         // Safe cross-chunk fallback: literals longer than chunk_overlap may straddle two chunks.
-        // Chunk-level pruning would miss such matches (no single chunk contains the full literal).
-        if (q.size() > I.opt.chunk_overlap) {
+        // Whole-file rare-byte verification is safe for the guarded contract too;
+        // it is selected only when its calibrated estimate beats both indexed paths.
+        if (q.size() > I.opt.chunk_overlap ||
+            (guarded_fixed_dispatch && qc.fixed_operator == detail::FixedPhysicalOperator::WholeFile)) {
             auto cv = chunk_candidates(I, q, &accounting);
             accounting.note_candidates(cv);
             std::vector<uint32_t> files;
@@ -1573,8 +1677,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         //   literal's q-grams appear inside the block, not whether the surrounding characters satisfy
         //   the word/line predicate. Block boundaries do not align with record boundaries, so
         //   pruning at block granularity would be unsafe. Chunk-level pruning is conservative and
-        //   defers word/line checks to exact verification.
-        } else if (icase || p.impl_->opt.word || p.impl_->opt.line) {
+        } else if (icase || p.impl_->opt.word || p.impl_->opt.line ||
+                   (guarded_fixed_dispatch && qc.fixed_operator == detail::FixedPhysicalOperator::Chunk)) {
             auto cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
             accounting.note_candidates(cv);
             std::unordered_set<uint32_t> done_chunks;
@@ -1711,11 +1815,12 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
         }
     } else {
-        if (p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended &&
+        if (p.impl_->re.query_ir.is_pure_literal && p.impl_->re.groups == 0 && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended &&
             (p.impl_->opt.multiline || p.impl_->re.query_ir.exact_literal.find(static_cast<char>(opt.record_separator)) == std::string::npos)) {
             PatternOptions fopt = p.impl_->opt;
             fopt.kind = PatternKind::Fixed;
             auto fixed_pat = Pattern::compile(p.impl_->re.query_ir.exact_literal, fopt);
+            FixedDispatchSuppression suppress;
             return find(fixed_pat, opt, stats);
         }
         std::string lit;
@@ -1793,9 +1898,9 @@ done:
                                             static_cast<long double>(CLOCKS_PER_SEC));
         }
         const bool is_fallback_path = opt.invert_match || (qc.verifier == detail::VerifierKind::RegexBruteForce) ||
-                                      (p.is_fixed() && p.expression().size() > I.opt.chunk_overlap);
+                                      (p.is_fixed() && !guarded_fixed_dispatch);
         stats->verifier_fallback = is_fallback_path;
-        auto candidates = detail::estimate_all_candidate_plans(p, I, opt.record_separator);
+        auto candidates = detail::estimate_all_candidate_plans(plan_key, I);
         PlanCandidateMetrics chosen;
         chosen.name = stats->verifier;
         chosen.verifier = static_cast<VerifierKind>(qc.verifier);
