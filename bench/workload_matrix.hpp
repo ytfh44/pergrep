@@ -34,9 +34,9 @@
 #endif
 namespace pergrep::benchmark {
 
-// M1.5: candidate prediction metrics were added; increment when class or
-// measurement semantics change.
-inline constexpr std::uint32_t kWorkloadMatrixVersion = 3;
+// M1.5/M1.6: candidate predictions and shadow observation metrics are versioned;
+// increment when workload classes or measurement semantics change.
+inline constexpr std::uint32_t kWorkloadMatrixVersion = 4;
 
 // The classes are intentionally closed: later milestones may add cases, but must not
 // silently change what a class measures.

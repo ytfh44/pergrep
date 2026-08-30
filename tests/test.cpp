@@ -2991,5 +2991,216 @@ int main(){
     assert(stat5->second.occurrence_frequency == stat6->second.occurrence_frequency);
     std::filesystem::remove_all(dir, ec);
   }
+
+  // M1.6: Deterministic shadow planner, regret logging, and counterfactual isolation
+  {
+    std::cerr << "M1.6 shadow planner and regret logging\n" << std::flush;
+    auto idx = Index::from_documents({
+      {"f1.txt", "int main() { alpha beta RARE_X_12345 gamma; return 0; }\n"},
+      {"f2.txt", "struct Item { int alpha; double beta; };\n"},
+      {"f3.bin", "BINARY\0DATA\0RARE_X_12345\0TAIL"}
+    });
+    Searcher s(idx);
+
+    // 1. Candidate enumeration ordering is deterministic across keys
+    {
+      auto p_fixed = Pattern::compile("RARE_X_12345", {.kind = PatternKind::Fixed});
+      auto cands1 = estimate_candidate_plans(p_fixed, idx);
+      auto cands2 = estimate_candidate_plans(p_fixed, idx);
+      assert(!cands1.empty() && cands1.size() == cands2.size());
+      for (std::size_t i = 0; i < cands1.size(); ++i) {
+        assert(cands1[i].verifier == cands2[i].verifier);
+        assert(cands1[i].name == cands2[i].name);
+        assert(cands1[i].predicted_cost == cands2[i].predicted_cost);
+      }
+    }
+
+    // 2. Default dispatch is non-mutating and matching results are unchanged
+    {
+      auto p_fixed = Pattern::compile("RARE_X_12345", {.kind = PatternKind::Fixed});
+      SearchStats stats_first{};
+      auto matches_first = s.find(p_fixed, {}, &stats_first);
+
+      SearchStats stats_second{};
+      auto matches_second = s.find(p_fixed, {}, &stats_second);
+
+      assert(matches_first.size() == 1);
+      assert(matches_second.size() == 1);
+      assert(matches_first[0].file_id == matches_second[0].file_id);
+      assert(matches_first[0].start == matches_second[0].start);
+      assert(matches_first[0].end == matches_second[0].end);
+      assert(stats_first.verifier == stats_second.verifier);
+      assert(stats_first.measured_cost == stats_second.measured_cost);
+      assert(stats_first.plan_key_hash == stats_second.plan_key_hash);
+      assert(stats_first.semantic_mode == stats_second.semantic_mode);
+    }
+
+    // 3. Observed vs counterfactual candidates: counterfactuals never generate regret
+    {
+      PlanCandidateMetrics chosen;
+      chosen.name = "FixedPositional";
+      chosen.verifier = VerifierKind::FixedPositional;
+      chosen.predicted_cost = 100.0;
+      chosen.actual_cost = 120.0;
+      chosen.chosen = true;
+      chosen.actual_observed = true;
+      chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
+
+      PlanCandidateMetrics counterfactual;
+      counterfactual.name = "FixedRareByte";
+      counterfactual.verifier = VerifierKind::FixedRareByte;
+      counterfactual.predicted_cost = 80.0;
+      counterfactual.actual_cost = 50.0; // hypothetical/stale lower cost
+      counterfactual.chosen = false;
+      counterfactual.actual_observed = false;
+      counterfactual.observation = PlanCandidateMetrics::ObservationStatus::CounterfactualEstimate;
+
+      auto reg = compute_plan_regret(chosen, {chosen, counterfactual}, "q_counterfactual");
+      assert(!reg.is_suboptimal);
+      assert(reg.absolute_regret == 0.0);
+      assert(reg.relative_regret == 0.0);
+      assert(reg.optimal_plan == chosen.name);
+      assert(reg.observed_candidate_count == 1);
+      assert(reg.candidate_count == 2);
+      assert(!reg.observed_fallback_loss);
+    }
+
+    // 4. Measured chosen plan losing to an actual measured fallback produces fallback loss
+    {
+      PlanCandidateMetrics chosen;
+      chosen.name = "FixedPositional";
+      chosen.verifier = VerifierKind::FixedPositional;
+      chosen.predicted_cost = 100.0;
+      chosen.actual_cost = 200.0;
+      chosen.chosen = true;
+      chosen.is_fallback = false;
+      chosen.actual_observed = true;
+      chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
+
+      PlanCandidateMetrics measured_fallback;
+      measured_fallback.name = "RegexBruteForce";
+      measured_fallback.verifier = VerifierKind::RegexBruteForce;
+      measured_fallback.predicted_cost = 180.0;
+      measured_fallback.actual_cost = 150.0;
+      measured_fallback.chosen = false;
+      measured_fallback.is_fallback = true;
+      measured_fallback.actual_observed = true;
+      measured_fallback.observation = PlanCandidateMetrics::ObservationStatus::Observed;
+
+      auto reg = compute_plan_regret(chosen, {chosen, measured_fallback}, "q_fallback_loss");
+      assert(reg.is_suboptimal);
+      assert(reg.absolute_regret == 50.0);
+      assert(reg.observed_fallback_loss);
+      assert(reg.optimal_plan == "RegexBruteForce");
+      assert(reg.observed_candidate_count == 2);
+    }
+
+    // 5. Deterministic repeated report output & semantic mode grouping
+    {
+      PlanKey key1 = make_plan_key(Pattern::compile("foo"), {}, idx);
+      PlanKey key2 = make_plan_key(Pattern::compile("foo", {.kind = PatternKind::Fixed}), {}, idx);
+      PlanKey key_overlap = make_plan_key(Pattern::compile("foo"), {.overlapping = true, .max_matches = 5}, idx);
+      PlanKey key_inv = make_plan_key(Pattern::compile("foo"), {.invert_match = true}, idx);
+      PlanKey key_files = make_plan_key(Pattern::compile("foo"), {.files_with_matches = true}, idx);
+      PlanKey key_nul = make_plan_key(Pattern::compile("foo"), {.record_separator = '\0'}, idx);
+      PlanKey key_crlf = make_plan_key(Pattern::compile("foo", {.crlf = true}), {}, idx);
+
+      assert(key1 != key2);
+      assert(key1 != key_overlap);
+      assert(key1 != key_inv);
+      assert(key1 != key_files);
+      assert(key1 != key_nul);
+      assert(key1 != key_crlf);
+
+      std::string sm1 = semantic_mode_key(key1);
+      std::string sm2 = semantic_mode_key(key2);
+      std::string sm_ov = semantic_mode_key(key_overlap);
+      assert(sm1 != sm2);
+      assert(sm1 != sm_ov);
+      assert(sm1 == semantic_mode_key(key1));
+
+      PlanRegret rA;
+      rA.workload_key = "workload-B";
+      rA.semantic_mode = sm1;
+      rA.query_name = "qB";
+      rA.relative_regret = 0.10;
+      rA.is_suboptimal = true;
+      rA.observed_candidate_count = 2;
+
+      PlanRegret rB;
+      rB.workload_key = "workload-A";
+      rB.semantic_mode = sm1;
+      rB.query_name = "qA";
+      rB.relative_regret = 0.0;
+      rB.is_suboptimal = false;
+      rB.observed_candidate_count = 1;
+
+      auto rep1 = evaluate_shadow_plans({rA, rB});
+      auto rep2 = evaluate_shadow_plans({rB, rA});
+
+      assert(rep1.total_queries == 2);
+      assert(rep1.suboptimal_plan_count == 1);
+      assert(rep1.observed_query_count == 2);
+      assert(rep1.query_regrets.size() == 2);
+      assert(rep2.query_regrets.size() == 2);
+
+      // Report order is canonicalized by (workload_key, semantic_mode, query_name)
+      assert(rep1.query_regrets[0].query_name == "qA");
+      assert(rep1.query_regrets[1].query_name == "qB");
+      assert(rep2.query_regrets[0].query_name == "qA");
+      assert(rep2.query_regrets[1].query_name == "qB");
+      assert(rep1.groups.size() == rep2.groups.size());
+      assert(rep1.groups[0].workload_key == "workload-A");
+      assert(rep1.groups[1].workload_key == "workload-B");
+    }
+
+    // 6. Probes, verification bytes, CPU time, and explicit unavailable metrics
+    {
+      SearchStats stats{};
+      auto pat = Pattern::compile("alpha");
+      s.find(pat, {}, &stats);
+      assert(stats.physically_touched_bytes > 0);
+      assert(stats.verified_bytes == stats.physically_touched_bytes);
+      assert(stats.index_probe_operations > 0);
+      assert(stats.measured_cost > 0.0);
+      assert(!stats.allocation_metrics_available);
+      assert(!stats.page_fault_metrics_available);
+      assert(stats.allocation_count == 0);
+      assert(stats.page_faults == 0);
+    }
+
+    // 7. Differential comparison with reference documents index
+    {
+      Index ref = Index::from_documents({
+        {"f1.txt", "int main() { alpha beta RARE_X_12345 gamma; return 0; }\n"},
+        {"f2.txt", "struct Item { int alpha; double beta; };\n"},
+        {"f3.bin", "BINARY\0DATA\0RARE_X_12345\0TAIL"}
+      }, {.chunk_bytes = 1024 * 1024, .chunk_overlap = 512 * 1024});
+      Searcher s_ref(ref);
+
+      auto test_query = [&](const Pattern& p, SearchOptions opt) {
+        SearchStats stats_idx{};
+        SearchStats stats_ref{};
+        auto actual = s.find(p, opt, &stats_idx);
+        auto expected = s_ref.find(p, opt, &stats_ref);
+        assert(actual.size() == expected.size());
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+          assert(actual[i].file_id == expected[i].file_id);
+          assert(actual[i].start == expected[i].start);
+          assert(actual[i].end == expected[i].end);
+        }
+        auto files_act = s.files(p, opt);
+        auto files_exp = s_ref.files(p, opt);
+        assert(files_act == files_exp);
+      };
+
+      test_query(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {});
+      test_query(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {.overlapping = true});
+      test_query(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {.max_matches = 1});
+      test_query(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {.invert_match = true});
+      test_query(Pattern::compile("RARE_X_12345"), {.include_binary = true, .record_separator = '\0'});
+    }
+  }
+
   return 0;
 }

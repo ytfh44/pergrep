@@ -159,6 +159,10 @@ PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_option
                       const Index& index, std::uint64_t transformed_input_identity = 0);
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options,
                       const IndexOptions& index_options, std::uint64_t transformed_input_identity = 0);
+// Canonical identity used by shadow reports and workload aggregation. It is
+// derived from every PlanKey field (including semantic flags and capabilities)
+// and is independent of pointer addresses or execution order.
+std::string semantic_mode_key(const PlanKey& key);
 
 
 struct Capture {
@@ -187,9 +191,11 @@ struct Match {
 // `candidate_blocks` retain their legacy names and map directly to the new
 // candidate chunk/block counts; `verified_bytes` maps to
 // `physically_touched_bytes`. `verifier_cpu_ns` is process CPU time spent in
-// candidate generation and exact verification after plan selection. Allocation
-// and page-fault timing is intentionally not reported because this API has no
-// portable per-search measurement for either event.
+// verifier_cpu_ns is process CPU time spent in candidate generation and exact
+// verification after plan selection. Allocation and page-fault counters are
+// C++-only optional metrics: the availability bits are false when the platform
+// cannot collect a per-search value, and zero must not be interpreted as measured
+// zero work.
 // The C API intentionally exposes only its historical four-field prefix until
 // a size-aware statistics entry point is added; these extended fields are
 // currently C++ and benchmark-only.
@@ -211,7 +217,10 @@ struct SearchStats {
     // and RegexBruteForce for regex with no pruning. Used for per-flavor
     // logging in bench/bench.cpp and tests. Values correspond to detail::VerifierKind.
     std::string verifier = {};
+    std::uint64_t plan_key_hash = 0;
+    std::string semantic_mode = {};
     double estimated_selectivity = 0.0;
+    double measured_cost = 0.0;
     double estimated_cost = 0.0;
     double plan_regret = 0.0;
     bool verifier_fallback = false;
@@ -224,6 +233,11 @@ struct SearchStats {
     std::uint64_t prediction_error_bound_chunks = 0;
     std::uint64_t prediction_error_bound_blocks = 0;
     std::uint64_t prediction_error_bound_bytes = 0;
+    std::uint64_t allocation_count = 0;
+    std::uint64_t allocation_bytes = 0;
+    std::uint64_t page_faults = 0;
+    bool allocation_metrics_available = false;
+    bool page_fault_metrics_available = false;
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
@@ -253,9 +267,37 @@ struct PlanCandidateMetrics {
     bool is_fallback = false;
     bool chosen = false;
     bool actual_observed = false;
+    // Explicit observation state prevents estimates for unexecuted alternatives
+    // from being mistaken for measurements. actual_observed is retained for
+    // source compatibility and is equivalent to Observed when true.
+    enum class ObservationStatus : std::uint8_t { Unobserved = 0, Observed = 1, CounterfactualEstimate = 2 };
+    ObservationStatus observation = ObservationStatus::Unobserved;
+    std::uint64_t actual_index_probe_bytes = 0;
+    std::uint64_t actual_index_probe_operations = 0;
+    std::uint64_t actual_verification_bytes = 0;
+    std::uint64_t actual_verifier_cpu_ns = 0;
+    std::uint64_t actual_allocation_count = 0;
+    std::uint64_t actual_allocation_bytes = 0;
+    std::uint64_t actual_page_faults = 0;
+    bool allocation_metrics_available = false;
+    bool page_fault_metrics_available = false;
 };
+inline const char* to_string(PlanCandidateMetrics::ObservationStatus status) noexcept {
+    switch (status) {
+        case PlanCandidateMetrics::ObservationStatus::Unobserved: return "unobserved";
+        case PlanCandidateMetrics::ObservationStatus::Observed: return "observed";
+        case PlanCandidateMetrics::ObservationStatus::CounterfactualEstimate: return "counterfactual-estimate";
+    }
+    return "unknown";
+}
 
 struct PlanRegret {
+    std::string workload_key;
+    std::string semantic_mode;
+    std::uint64_t plan_key_hash = 0;
+    std::size_t candidate_count = 0;
+    std::size_t observed_candidate_count = 0;
+    bool observed_fallback_loss = false;
     std::string query_name;
     std::string chosen_plan;
     std::string optimal_plan;
@@ -272,6 +314,14 @@ struct PlanRegret {
     std::size_t rank_inversions = 0;
     std::vector<PlanCandidateMetrics> candidates;
 };
+struct ShadowPlanGroupMetrics {
+    std::string workload_key;
+    std::string semantic_mode;
+    std::size_t query_count = 0;
+    std::size_t observed_query_count = 0;
+    std::size_t suboptimal_plan_count = 0;
+    double mean_regret = 0.0;
+};
 
 struct ShadowPlanReport {
     std::size_t total_queries = 0;
@@ -285,6 +335,9 @@ struct ShadowPlanReport {
     double mean_prediction_error = 0.0;
     double p95_prediction_error = 0.0;
     double total_excess_cost = 0.0;
+    std::size_t observed_query_count = 0;
+    std::size_t measured_fallback_loss_count = 0;
+    std::vector<ShadowPlanGroupMetrics> groups;
     std::vector<PlanRegret> query_regrets;
 };
 
