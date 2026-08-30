@@ -6,9 +6,10 @@
 
 ## Already Shipped (v5)
 
-- `RegexProgram { mandatory, prefixes, branch_mandatory, is_pure_literal }` extracted in `src/regex.cpp`
-- `nfa_search` prefix jump + `search.cpp` multi-branch union pruning + pure-literal fast path
+- `RegexProgram::query_ir` is the canonical optimizer-facing representation (`mandatory`, `branch_mandatory`, `prefixes`, `is_pure_literal`, and `exact_literal`), built once during parsing.
+- Legacy `RegexProgram` metadata members remain synchronized compatibility views for existing internal callers; planner and verifier code reads `query_ir` only.
 - `bench/workload_matrix.hpp` + `docs/workload-matrix.md`: versioned M0.1 workload/product-mode matrix (four closed classes, deterministic corpus/query profiles, lifecycle phases, and decision rule)
+- `nfa_search` prefix jump + `search.cpp` multi-branch union pruning + pure-literal fast path
 - Persistent index `v5` field-by-field serialization + `IndexOptions` upper/lower bound validation
 
 ## Decomposition into Scoped Autoresearch Subtasks

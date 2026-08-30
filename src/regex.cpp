@@ -220,13 +220,7 @@ public:
     RegexProgram parse() {
         auto n = alt(); if (i_ != s_.size()) fail("unexpected trailing input");
         RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_;
-        // Build QueryIR via pure helpers and mirror into RegexProgram for compatibility.
-        auto ir = analyze_query(p.ast, p.extended);
-        p.mandatory = ir.mandatory;
-        p.prefixes = ir.prefixes;
-        p.branch_mandatory = ir.branch_mandatory;
-        p.is_pure_literal = ir.is_pure_literal;
-        p.exact_literal = ir.exact_literal;
+        p.install_query_ir(analyze_query(p.ast, p.extended));
         return p;
     }
 private:
@@ -408,80 +402,6 @@ private:
         }
         fail("unclosed character class");
     }
-    static std::vector<std::string> mandatory(const std::shared_ptr<RegexNode>& n) {
-        using K=RegexNode::Kind;if(!n)return{};if(n->kind==K::Literal)return(n->literal.empty()||n->icase)?std::vector<std::string>{}:std::vector<std::string>{n->literal};
-        if(n->kind==K::Group)return mandatory(n->children[0]);
-        if(n->kind==K::LookAhead||n->kind==K::LookBehind){if(!n->negative)return mandatory(n->children[0]);else return{};}
-        if(n->kind==K::Repeat){if(n->min==0)return{};return mandatory(n->children[0]);}
-        if(n->kind==K::Concat){std::vector<std::string>out;std::string run;for(auto&c:n->children){if(c->kind==K::Literal&&!c->icase)run+=c->literal;else{if(!run.empty()){out.push_back(run);run.clear();}auto m=mandatory(c);out.insert(out.end(),m.begin(),m.end());}}if(!run.empty())out.push_back(run);return out;}
-        if(n->kind==K::Alt){if(n->children.empty())return{};auto acc=mandatory(n->children[0]);for(size_t i=1;i<n->children.size();++i){auto cur=mandatory(n->children[i]);std::vector<std::string>next;for(auto&a:acc)if(std::find(cur.begin(),cur.end(),a)!=cur.end())next.push_back(a);acc.swap(next);}return acc;}return{};
-    }
-    // Prefix extraction: per-branch literal prefix when known. Unwraps Group and Repeat(min>0).
-    static std::vector<std::string> extract_prefixes(const std::shared_ptr<RegexNode>& n) {
-        using K = RegexNode::Kind;
-        if (!n) return {};
-        if (n->kind == K::Literal) {
-            if (!n->literal.empty() && !n->icase) return {n->literal};
-            return {};
-        }
-        if (n->kind == K::Group) return extract_prefixes(n->children[0]);
-        if (n->kind == K::Repeat) {
-            if (n->min > 0) return extract_prefixes(n->children[0]);
-            return {};
-        }
-        if (n->kind == K::Concat) {
-            if (!n->children.empty()) return extract_prefixes(n->children.front());
-            return {};
-        }
-        if (n->kind == K::Alt) {
-            std::vector<std::string> out;
-            for (const auto& c : n->children) {
-                auto p = extract_prefixes(c);
-                if (p.empty()) return {};
-                out.insert(out.end(), p.begin(), p.end());
-            }
-            std::sort(out.begin(), out.end());
-            out.erase(std::unique(out.begin(), out.end()), out.end());
-            return out;
-        }
-        return {};
-    }
-    // Branch mandatory: per-branch lists for union pruning. Unwraps outer Group.
-    static std::vector<std::vector<std::string>> extract_branch_mandatory(const std::shared_ptr<RegexNode>& n) {
-        using K = RegexNode::Kind;
-        if (!n) return {};
-        const RegexNode* cur = n.get();
-        std::shared_ptr<RegexNode> cur_sp = n;
-        while (cur && cur->kind == K::Group) { cur_sp = cur->children[0]; cur = cur_sp.get(); }
-        if (!cur || cur->kind != K::Alt) return {};
-        std::vector<std::vector<std::string>> out;
-        for (const auto& c : cur_sp->children) {
-            auto m = mandatory(c);
-            if (m.empty()) return {};
-            out.push_back(std::move(m));
-        }
-        return out;
-    }
-    static bool check_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& lit) {
-        using K = RegexNode::Kind;
-        if (!n) return false;
-        if (n->kind == K::Literal) {
-            if (!n->icase) { lit = n->literal; return true; }
-            return false;
-        }
-        if (n->kind == K::Group) return check_pure_literal(n->children[0], lit);
-        if (n->kind == K::Concat) {
-            std::string run;
-            for (const auto& c : n->children) {
-                std::string sub;
-                if (!check_pure_literal(c, sub)) return false;
-                run += sub;
-            }
-            lit = run;
-            return true;
-        }
-        return false;
-    }
 };
 
 
@@ -630,12 +550,12 @@ bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&
     std::size_t best_end = 0;
     std::size_t pos = from;
     for (;;) {
-        if (cur.empty() && !best && !p.prefixes.empty() && pos < text.size()) {
+        if (cur.empty() && !best && !p.query_ir.prefixes.empty() && pos < text.size()) {
             std::size_t next_jump = std::string_view::npos;
-            if (p.prefixes.size() == 1) {
-                next_jump = text.find(p.prefixes[0], pos);
+            if (p.query_ir.prefixes.size() == 1) {
+                next_jump = text.find(p.query_ir.prefixes[0], pos);
             } else {
-                for (const auto& pref : p.prefixes) {
+                for (const auto& pref : p.query_ir.prefixes) {
                     auto cand = text.find(pref, pos);
                     if (cand != std::string_view::npos) {
                         if (next_jump == std::string_view::npos || cand < next_jump) {
@@ -787,7 +707,8 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
 
 } // namespace
 
-// Pure QueryIR helpers — also used by Parser statics above.
+// Canonical QueryIR extraction helpers. All optimizer metadata is built here
+// and installed into RegexProgram once by Parser::parse().
 std::vector<std::string> query_mandatory(const std::shared_ptr<RegexNode>& n) {
     using K = RegexNode::Kind;
     if (!n) return {};
@@ -947,5 +868,5 @@ Pattern Pattern::compile(std::string e,PatternOptions o){
     if(o.kind==PatternKind::Regex)i->re=detail::parse_regex(i->expr,i->opt);
     return Pattern(i);
 }
-const std::string&Pattern::expression()const noexcept{return impl_->expr;}const PatternOptions&Pattern::options()const noexcept{return impl_->opt;}bool Pattern::is_fixed()const noexcept{return impl_->opt.kind==PatternKind::Fixed;}std::vector<std::string>Pattern::mandatory_literals()const{if(is_fixed())return{impl_->expr};return impl_->re.mandatory;}
+const std::string&Pattern::expression()const noexcept{return impl_->expr;}const PatternOptions&Pattern::options()const noexcept{return impl_->opt;}bool Pattern::is_fixed()const noexcept{return impl_->opt.kind==PatternKind::Fixed;}std::vector<std::string>Pattern::mandatory_literals()const{if(is_fixed())return{impl_->expr};return impl_->re.query_ir.mandatory;}
 }

@@ -939,6 +939,33 @@ int main(){
       };
       assert(norm(got) == norm(expect));
     };
+    auto check_ir_access_paths = [&](std::string pat, PatternOptions opt) {
+      auto prog = parse_regex(pat, opt);
+      assert(prog.mandatory == prog.query_ir.mandatory);
+      assert(prog.prefixes == prog.query_ir.prefixes);
+      assert(prog.branch_mandatory == prog.query_ir.branch_mandatory);
+      assert(prog.is_pure_literal == prog.query_ir.is_pure_literal);
+      assert(prog.exact_literal == prog.query_ir.exact_literal);
+      assert(&prog.ir() == &prog.query_ir);
+    };
+    // Canonical QueryIR and compatibility views agree across nested groups.
+    check_ir_access_paths("((foo)(bar))", {});
+    // Alternation keeps both global and per-branch metadata in one IR.
+    check_ir_access_paths("((foo)|(barbaz))", {});
+    // Scoped flags affect extraction at the AST nodes where they apply.
+    {
+      PatternOptions o; o.case_mode = CaseMode::Insensitive;
+      check_ir_access_paths("FOO(?-i:bar)", o);
+    }
+    // Extended VM patterns retain conservative metadata but are not pure.
+    {
+      PatternOptions o; o.engine = Engine::Pcre2Compat;
+      check_ir_access_paths(R"((ab)\1)", o);
+      check_ir_access_paths(R"((?!FORBIDDEN)needle)", o);
+    }
+    // Empty and no-mandatory patterns are explicit zero cases, not stale data.
+    check_ir_access_paths("", {});
+    check_ir_access_paths("foo|.*", {});
     // extract_prefixes: foo|bar -> {foo,bar}
     check_prefixes("foo|bar", {}, {"foo","bar"});
     // case-insensitive -> empty (icase literals do not contribute)
