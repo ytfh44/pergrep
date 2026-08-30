@@ -122,3 +122,6 @@ evaluation, target workload thresholds, regression limits, fallback-rate caps, a
 This rule keeps execution optimizations (M0.3/QO-1..QO-4) distinct from storage and
 freshness work (M9/QO-5), while allowing later milestones to consume the same deterministic
 profiles and release-gate output.
+
+## Objective dimensions (M1.8)
+Workload rows should declare `exhaustive`, `first-hit`, or `ordered-prefix` objective separately from the workload class. First-hit latency is time to the first ordered selected result, not time to candidate discovery; no-hit rows record no first-hit event. Bounded rows are valid only when indexed traversal proves `(file_id, offset)` order. Quiet uses first-hit; files-with/without retains file polarity and file order.

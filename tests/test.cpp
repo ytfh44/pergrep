@@ -403,6 +403,109 @@ int main(){
     SearchOptions opt_inv; opt_inv.invert_match = true;
     auto m_inv = s.find(p, opt_inv);
     assert(!m_inv.empty());
+
+    SearchStats exhaustive_stats{}, first_stats{}, prefix_stats{};
+    auto exhaustive = s.find(p, {}, &exhaustive_stats);
+    SearchOptions first_opt;
+    first_opt.objective = SearchObjective::FirstHit;
+    auto first = s.find(p, first_opt, &first_stats);
+    SearchOptions prefix_opt;
+    prefix_opt.objective = SearchObjective::OrderedPrefix;
+    prefix_opt.max_matches = 2;
+    auto prefix = s.find(p, prefix_opt, &prefix_stats);
+    assert(exhaustive.size() == 2 && !exhaustive_stats.early_stopped);
+    assert(first.size() == 1 && first[0].file_id == exhaustive[0].file_id && first[0].start == exhaustive[0].start);
+    assert(first_stats.objective == "first-hit" && first_stats.early_stopped && first_stats.first_hit_observed);
+    assert(prefix.size() == 2 && prefix[0].file_id == exhaustive[0].file_id && prefix[1].file_id == exhaustive[1].file_id);
+    assert(prefix_stats.objective == "ordered-prefix" && prefix_stats.early_stopped);
+    auto regex = Pattern::compile("a+");
+    auto regex_all = s.find(regex);
+    auto regex_first = s.find(regex, first_opt);
+    assert(!regex_all.empty() && regex_first.size() == 1);
+    assert(regex_first.front().file_id == regex_all.front().file_id && regex_first.front().start == regex_all.front().start && regex_first.front().end == regex_all.front().end);
+    const auto exhaustive_key = make_plan_key(p, SearchOptions{}, idx);
+    const auto first_key = make_plan_key(p, first_opt, idx);
+    assert(exhaustive_key != first_key && exhaustive_key.hash() != first_key.hash());
+
+    SearchOptions first_with;
+    first_with.objective = SearchObjective::FirstHit;
+    first_with.files_with_matches = true;
+    auto first_file = s.files(p, first_with);
+    assert(first_file.size() == 1 && first_file[0] == 0);
+    SearchOptions first_without = first_with;
+    first_without.files_with_matches = false;
+    first_without.files_without_match = true;
+    auto first_missing = s.files(p, first_without);
+    assert(first_missing.size() == 1 && first_missing[0] == 1);
+
+    SearchStats cancelled_stats{};
+    SearchOptions cancelled;
+    cancelled.should_cancel = [] { return true; };
+    auto cancelled_matches = s.find(p, cancelled, &cancelled_stats);
+    assert(cancelled_matches.empty() && cancelled_stats.early_stopped && cancelled_stats.cancellation_requested);
+    assert(s.find(p, cancelled).empty());
+    assert(s.files(p, cancelled).empty());
+
+    const std::vector<Document> objective_docs = {
+      {"first.txt", "aaaaa\r\nneedle\r\n"},
+      {"second.txt", "none\r\nneedle\r\n"},
+      {"third.txt", "none\r\n"}
+    };
+    IndexOptions objective_index_options;
+    objective_index_options.chunk_bytes = 64;
+    objective_index_options.chunk_overlap = 32;
+    auto objective_indexed_idx = Index::from_documents(objective_docs, objective_index_options);
+    auto objective_reference_idx = Index::from_documents(objective_docs);
+    Searcher objective_indexed(objective_indexed_idx), objective_reference(objective_reference_idx);
+    auto compare_objective = [&](const Pattern& query, SearchOptions options) {
+      const auto expected_all = objective_reference.find(query, options);
+      const auto actual_all = objective_indexed.find(query, options);
+      assert(actual_all.size() == expected_all.size());
+      for (std::size_t i = 0; i < expected_all.size(); ++i)
+        assert(actual_all[i].file_id == expected_all[i].file_id && actual_all[i].start == expected_all[i].start && actual_all[i].end == expected_all[i].end);
+      SearchOptions first = options;
+      first.objective = SearchObjective::FirstHit;
+      const auto expected_first = objective_reference.find(query, first);
+      const auto actual_first = objective_indexed.find(query, first);
+      assert(actual_first.size() == expected_first.size());
+      if (!expected_first.empty()) assert(actual_first.front().file_id == expected_first.front().file_id && actual_first.front().start == expected_first.front().start);
+      SearchOptions prefix = options;
+      prefix.objective = SearchObjective::OrderedPrefix;
+      prefix.max_matches = 2;
+      const auto expected_prefix = objective_reference.find(query, prefix);
+      const auto actual_prefix = objective_indexed.find(query, prefix);
+      assert(actual_prefix.size() == expected_prefix.size());
+      for (std::size_t i = 0; i < expected_prefix.size(); ++i) assert(actual_prefix[i].file_id == expected_prefix[i].file_id && actual_prefix[i].start == expected_prefix[i].start);
+    };
+    auto overlap_query = Pattern::compile("aa", {.kind = PatternKind::Fixed});
+    SearchOptions overlap_options;
+    overlap_options.overlapping = true;
+    compare_objective(overlap_query, overlap_options);
+    auto crlf_query = Pattern::compile("needle", {.kind = PatternKind::Fixed, .crlf = true});
+    SearchOptions crlf_options;
+    crlf_options.record_separator = '\n';
+    compare_objective(crlf_query, crlf_options);
+    const std::vector<Document> nul_docs = {{"nul.bin", std::string("miss\0needle\0tail", 17)}};
+    auto nul_indexed = Index::from_documents(nul_docs, objective_index_options);
+    auto nul_reference = Index::from_documents(nul_docs);
+    Searcher nul_s(nul_indexed), nul_r(nul_reference);
+    auto nul_query = Pattern::compile("needle", {.kind = PatternKind::Fixed});
+    SearchOptions nul_options;
+    nul_options.record_separator = '\0';
+    nul_options.include_binary = true;
+    nul_options.objective = SearchObjective::FirstHit;
+    auto nul_first = nul_s.find(nul_query, nul_options);
+    auto nul_expected = nul_r.find(nul_query, nul_options);
+    assert(nul_first.size() == nul_expected.size() && (nul_first.empty() || nul_first.front().start == nul_expected.front().start));
+    SearchOptions scoped_objective;
+    const std::vector<uint32_t> objective_scope{2, 1};
+    scoped_objective.eligible_file_ids = objective_scope;
+    compare_objective(Pattern::compile("needle", {.kind = PatternKind::Fixed}), scoped_objective);
+    SearchOptions scoped_first = scoped_objective;
+    scoped_first.objective = SearchObjective::FirstHit;
+    scoped_first.files_with_matches = true;
+    assert(objective_indexed.files(Pattern::compile("needle", {.kind = PatternKind::Fixed}), scoped_first) == std::vector<std::uint32_t>{1});
+    compare_objective(Pattern::compile("absent", {.kind = PatternKind::Fixed}), SearchOptions{});
   }
   // Eligible file-ID scopes constrain candidate generation, exact verification,
   // file polarity, inversion, and canonical search statistics.

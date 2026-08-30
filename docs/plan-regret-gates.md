@@ -239,3 +239,6 @@ without treating machine-dependent baseline drift as a build failure. Pass
 `--enforce-gate` to make the process status actionable: `0` means PASS/WARN,
 `1` means FAIL, and `2` means ROLLBACK. Correctness failures always produce
 ROLLBACK in the report and an enforcing invocation returns nonzero.
+
+## Objective-aware accounting (M1.8)
+Plan regret compares like objectives only: exhaustive runs are not mixed with `FirstHit` or `OrderedPrefix` runs. `time_to_first_hit_ns` measures execution start to the first selected result, while `early_stop_reason` distinguishes `first-hit`, `max-matches`, and cooperative `cancellation`. An absent cancellation callback means no cancellation is requested; no candidate reordering is permitted unless `candidate_order_preserved` is true.

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -112,6 +113,20 @@ private:
     friend class Searcher;
 };
 
+// Search execution objective. Exhaustive preserves the complete ordered result set.
+// FirstHit permits a cooperative stop after the first ordered result (or first
+// selected file result in files-with/without mode). OrderedPrefix permits stopping
+// after max_matches while retaining the traversal order.
+enum class SearchObjective : std::uint8_t { Exhaustive = 0, FirstHit = 1, OrderedPrefix = 2 };
+inline const char* to_string(SearchObjective value) noexcept {
+    switch (value) {
+        case SearchObjective::Exhaustive: return "exhaustive";
+        case SearchObjective::FirstHit: return "first-hit";
+        case SearchObjective::OrderedPrefix: return "ordered-prefix";
+    }
+    return "unknown";
+}
+
 struct SearchOptions {
     bool overlapping = false;
     bool invert_match = false;
@@ -123,14 +138,19 @@ struct SearchOptions {
     // Optional eligible file-ID scope. An empty span means all indexed files.
     // Callers must keep the referenced IDs alive for the duration of the search.
     std::span<const std::uint32_t> eligible_file_ids = {};
+    // Optional cooperative cancellation hook. It is consulted only at safe
+    // candidate/record boundaries; absent means no cancellation is possible.
+    std::function<bool()> should_cancel = {};
+    SearchObjective objective = SearchObjective::Exhaustive;
 };
 
 // M1.3 PlanKey: explicit, deterministic plan input. Captures all semantic
 // inputs that influence planning/cost/selection so a plan estimated for one
 // contract is never reused for another. Includes:
 //   - PatternOptions fields (kind, case_mode, engine, word, line, multiline, dotall, unicode, crlf)
-//   - SearchOptions fields (overlapping, invert_match, files_with/without_match,
+//   - SearchOptions fields (objective, overlapping, invert_match, files_with/without_match,
 //     max_matches, record_separator, include_binary, eligible_file_ids)
+//   - cancellation callbacks are execution-only and are never part of a plan key
 //   - Index capabilities (chunk_bytes, chunk_overlap, positional_block_bytes,
 //     positional_budget_ratio, planned_qgrams, include_hidden, follow_symlinks,
 //     persist_corpus, pos_block)
@@ -150,6 +170,7 @@ struct PlanKey {
     std::vector<std::uint32_t> eligible_file_ids; // sorted, deduped
     IndexOptions index_options;
     std::uint64_t transformed_input_identity = 0;
+    SearchObjective objective = SearchObjective::Exhaustive;
     bool operator==(const PlanKey& o) const noexcept;
     bool operator!=(const PlanKey& o) const noexcept { return !(*this == o); }
     std::uint64_t hash() const noexcept; // deterministic 64-bit FNV-1a
@@ -243,6 +264,16 @@ struct SearchStats {
     std::uint64_t page_faults = 0;
     bool allocation_metrics_available = false;
     bool page_fault_metrics_available = false;
+    // M1.8 objective-aware execution telemetry. These fields are C++-only; the
+    // C ABI continues to expose its historical size-stable statistics prefix.
+    std::string objective = "exhaustive";
+    std::string candidate_order = "file-id,offset";
+    std::string early_stop_reason = {};
+    std::uint64_t time_to_first_hit_ns = 0;
+    bool first_hit_observed = false;
+    bool early_stopped = false;
+    bool candidate_order_preserved = true;
+    bool cancellation_requested = false;
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind

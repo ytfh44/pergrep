@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -658,6 +659,7 @@ inline uint64_t double_bits(double d) noexcept {
 }
 } // namespace
 bool PlanKey::operator==(const PlanKey& o) const noexcept {
+    if (objective != o.objective) return false;
     if (pattern_expression != o.pattern_expression) return false;
     if (pattern_options.kind != o.pattern_options.kind) return false;
     if (pattern_options.case_mode != o.pattern_options.case_mode) return false;
@@ -689,6 +691,7 @@ bool PlanKey::operator==(const PlanKey& o) const noexcept {
 }
 std::uint64_t PlanKey::hash() const noexcept {
     uint64_t h = 14695981039346656037ULL;
+    h = fnv_mix(h, static_cast<uint64_t>(objective));
     h = fnv_mix_str(h, pattern_expression);
     h = fnv_mix(h, static_cast<uint64_t>(pattern_options.kind));
     h = fnv_mix(h, static_cast<uint64_t>(pattern_options.case_mode));
@@ -733,6 +736,7 @@ PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_option
     PlanKey k;
     k.pattern_expression = pattern.expression();
     k.pattern_options = pattern.options();
+    k.objective = search_options.objective;
     k.overlapping = search_options.overlapping;
     k.invert_match = search_options.invert_match;
     k.files_with_matches = search_options.files_with_matches;
@@ -1524,8 +1528,24 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
+    std::vector<std::uint32_t> normalized_scope;
+    if (!opt.eligible_file_ids.empty()) {
+        normalized_scope.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
+        std::sort(normalized_scope.begin(), normalized_scope.end());
+        normalized_scope.erase(std::unique(normalized_scope.begin(), normalized_scope.end()), normalized_scope.end());
+        opt.eligible_file_ids = normalized_scope;
+    }
     StatsRecorder accounting(stats, I, opt.eligible_file_ids);
+    if (stats) {
+        const auto effective_objective =
+            opt.objective == SearchObjective::Exhaustive && opt.max_matches != 0
+                ? SearchObjective::OrderedPrefix : opt.objective;
+        stats->objective = to_string(effective_objective);
+        stats->candidate_order = "file-id,offset";
+        stats->candidate_order_preserved = true;
+    }
     std::vector<Match> out;
+    const auto search_start = std::chrono::steady_clock::now();
     const auto total_blocks = [&] {
         std::size_t n = 0;
         for (std::size_t ci = 0; ci < I.pos_desc.size(); ++ci)
@@ -1574,16 +1594,42 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             scoped_bytes >= qc.estimated_verified_bytes
                 ? scoped_bytes - qc.estimated_verified_bytes : 0;
     }
+    bool cancellation_requested = false;
     const auto verifier_start = stats ? std::clock() : std::clock_t(0);
+    const bool first_hit_objective = opt.objective == SearchObjective::FirstHit;
+    const auto record_first_hit = [&]() {
+        if (!stats || stats->first_hit_observed || out.empty()) return;
+        stats->first_hit_observed = true;
+        stats->time_to_first_hit_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - search_start).count());
+    };
+    const auto stop_requested = [&]() {
+        if (opt.should_cancel && opt.should_cancel()) {
+            cancellation_requested = true;
+            if (stats) {
+                stats->cancellation_requested = true;
+                stats->early_stopped = true;
+                stats->early_stop_reason = "cancellation";
+            }
+            return true;
+        }
+        return false;
+    };
+    const auto result_bound_reached = [&]() {
+        return first_hit_objective || (opt.max_matches != 0 && out.size() >= opt.max_matches);
+    };
+    if (stop_requested()) goto done;
     if (opt.invert_match) {
         accounting.note_all_chunks();
         for (uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+            if (stop_requested()) goto done;
             if (!accounting.allows(fid)) continue;
             if (!opt.include_binary && I.infos[fid].binary) continue;
             const auto& data = I.loaded[fid].data;
             accounting.touch(fid, 0, data.size());
             std::size_t b = 0;
             while (b < data.size() || (b == 0 && data.empty())) {
+                if (stop_requested()) goto done;
                 auto e = data.find(static_cast<char>(opt.record_separator), b);
                 bool term = (e != std::string::npos);
                 if (!term) e = data.size();
@@ -1604,7 +1650,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 }
                 if (!matched) {
                     out.push_back(Match{fid, b, logical_e, {}});
-                    if (opt.max_matches && out.size() >= opt.max_matches) goto done;
+                    record_first_hit();
+                    if (result_bound_reached()) {
+                        if (stats) {
+                            stats->early_stopped = true;
+                            stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                        }
+                        goto done;
+                    }
                 }
                 if (!term) break;
                 b = e + 1;
@@ -1632,6 +1685,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             size_t a = choose_rare_byte(I, q);
             for (auto fid : files) {
+                if (stop_requested()) goto done;
                 if (!opt.include_binary && I.infos[fid].binary) continue;
                 const auto& data = I.loaded[fid].data;
                 accounting.touch(fid, 0, data.size());
@@ -1663,7 +1717,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     }
                     if (ok) {
                         out.push_back(Match{fid, abs, abs_end, {}});
-                        if (opt.max_matches && out.size() >= opt.max_matches) goto done;
+                        record_first_hit();
+                    if (result_bound_reached()) {
+                        if (stats) {
+                            stats->early_stopped = true;
+                            stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                        }
+                        goto done;
+                    }
                     }
                     pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                 }
@@ -1729,7 +1790,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                                 n = abs + std::max<size_t>(1, local_end - x);
                             }
                             out.push_back(Match{z.file_id, abs, abs_end, {}});
-                            if (opt.max_matches && out.size() >= opt.max_matches) goto done;
+                            record_first_hit();
+                    if (result_bound_reached()) {
+                        if (stats) {
+                            stats->early_stopped = true;
+                            stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                        }
+                        goto done;
+                    }
                         }
                         pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                     }
@@ -1747,6 +1815,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             auto blocks = fixed_candidate_blocks(I, q, &accounting);
             std::unordered_map<uint32_t, uint64_t> next;
             for (auto [ci, bi] : blocks) {
+                if (stop_requested()) goto done;
                 auto z = I.chunks[ci];
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
                 uint32_t rb = bi * I.pos_block;
@@ -1773,7 +1842,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         n = abs + std::max<size_t>(1, local_end - x);
                     }
                     out.push_back(Match{z.file_id, abs, abs_end, {}});
-                    if (opt.max_matches && out.size() >= opt.max_matches) goto done;
+                    record_first_hit();
+                    if (result_bound_reached()) {
+                        if (stats) {
+                            stats->early_stopped = true;
+                            stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                        }
+                        goto done;
+                    }
                     pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                 }
             }
@@ -1795,6 +1871,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 accounting.touch(z.file_id, z.core_begin, z.ext_end);
                 size_t pos = 0;
                 while (pos < z.core_end - z.core_begin) {
+                    if (stop_requested()) goto done;
                     size_t local_end = 0;
                     auto x = anchor_find(v, q, a, pos, z.core_end - z.core_begin, false, &local_end);
                     if (x == std::string_view::npos) break;
@@ -1809,7 +1886,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         n = abs + std::max<size_t>(1, local_end - x);
                     }
                     out.push_back(Match{z.file_id, abs, abs_end, {}});
-                    if (opt.max_matches && out.size() >= opt.max_matches) goto done;
+                    record_first_hit();
+                    if (result_bound_reached()) {
+                        if (stats) {
+                            stats->early_stopped = true;
+                            stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                        }
+                        goto done;
+                    }
                     pos = x + (opt.overlapping ? 1 : std::max<size_t>(1, local_end - x));
                 }
             }
@@ -1854,18 +1938,28 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
         }
         for (auto fid : files) {
+            if (stop_requested()) goto done;
             if (!opt.include_binary && I.infos[fid].binary) continue;
             auto const& data = I.loaded[fid].data;
             if (!lit.empty() && lit.size() < 4 && p.impl_->opt.case_mode == CaseMode::Sensitive &&
                 data.find(lit) == std::string::npos) continue;
             accounting.touch(fid, 0, data.size());
-            const auto remain = [&]() { return opt.max_matches ? opt.max_matches - out.size() : 0; };
+            const auto remain = [&]() { return first_hit_objective ? std::size_t{1} : (opt.max_matches ? opt.max_matches - out.size() : 0); };
             if (p.impl_->opt.multiline) {
                 auto ms = detail::regex_find_all(p.impl_->re, data, p.impl_->opt, opt.overlapping, fid, 0, remain(), opt.record_separator);
                 out.insert(out.end(), ms.begin(), ms.end());
+                record_first_hit();
+                if (result_bound_reached()) {
+                    if (stats) {
+                        stats->early_stopped = true;
+                        stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                    }
+                    goto done;
+                }
             } else {
                 std::size_t b = 0;
                 while (b < data.size() || (b == 0 && data.empty())) {
+                    if (stop_requested()) goto done;
                     auto e = data.find(static_cast<char>(opt.record_separator), b);
                     bool term = (e != std::string::npos);
                     if (!term) e = data.size();
@@ -1875,6 +1969,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     auto rec = std::string_view(data).substr(b, logical_e - b);
                     auto ms = detail::regex_find_all(p.impl_->re, rec, p.impl_->opt, opt.overlapping, fid, b, remain(), opt.record_separator);
                     out.insert(out.end(), ms.begin(), ms.end());
+                record_first_hit();
+                if (result_bound_reached()) {
+                    if (stats) {
+                        stats->early_stopped = true;
+                        stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                    }
+                    goto done;
+                }
                     if (opt.max_matches && out.size() >= opt.max_matches) break;
                     if (!term) break;
                     b = e + 1;
@@ -1885,6 +1987,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     }
 
 done:
+    if (cancellation_requested) out.clear();
     if (opt.max_matches && out.size() > opt.max_matches) {
         out.resize(opt.max_matches);
     }
@@ -1958,9 +2061,75 @@ done:
 std::vector<uint32_t> Searcher::files(const Pattern& p, SearchOptions opt, SearchStats* stats) const {
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     auto& I = *index_->impl_;
+    std::vector<std::uint32_t> normalized_file_scope;
+    if (!opt.eligible_file_ids.empty()) {
+        normalized_file_scope.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
+        std::sort(normalized_file_scope.begin(), normalized_file_scope.end());
+        normalized_file_scope.erase(std::unique(normalized_file_scope.begin(), normalized_file_scope.end()), normalized_file_scope.end());
+        opt.eligible_file_ids = normalized_file_scope;
+    }
+    if (stats) {
+        *stats = {};
+        stats->objective = opt.objective == SearchObjective::FirstHit ? "first-hit" :
+                           opt.objective == SearchObjective::OrderedPrefix ? "ordered-prefix" : "exhaustive";
+        stats->candidate_order = "file-id";
+        stats->candidate_order_preserved = true;
+    }
+    // A first-hit file query must retain file order. Probe each eligible file
+    // with a one-file scope; this is intentionally conservative and never
+    // reorders candidates based on hit probability.
+    if (opt.objective == SearchObjective::FirstHit) {
+        for (uint32_t fid = 0; fid < I.infos.size(); ++fid) {
+            if (opt.should_cancel && opt.should_cancel()) {
+                if (stats) { stats->cancellation_requested = true; stats->early_stopped = true; stats->early_stop_reason = "cancellation"; }
+                return {};
+            }
+            if (!opt.eligible_file_ids.empty() && !scope_contains(opt.eligible_file_ids, fid)) continue;
+            if (!opt.include_binary && I.infos[fid].binary) continue;
+            const std::uint32_t only_id = fid;
+            auto one = opt;
+            one.eligible_file_ids = std::span<const std::uint32_t>(&only_id, 1);
+            one.files_with_matches = false;
+            one.files_without_match = false;
+            one.max_matches = 0;
+            SearchStats one_stats;
+            auto ms = find(p, one, &one_stats);
+            if (one_stats.cancellation_requested) {
+                if (stats) *stats = one_stats;
+                return {};
+            }
+            const bool selected = opt.files_without_match ? ms.empty() : !ms.empty();
+            if (selected) {
+                if (stats) {
+                    *stats = one_stats;
+                    stats->objective = "first-hit";
+                    stats->candidate_order = "file-id";
+                    stats->candidate_order_preserved = true;
+                    stats->early_stopped = true;
+                    stats->early_stop_reason = "first-file-result";
+                }
+                return {fid};
+            }
+        }
+        return {};
+    }
     auto find_opt = opt;
+    // File selection needs the complete per-file hit map; max_matches bounds
+    // the returned file list below, not the discovery scan.
+    find_opt.objective = SearchObjective::Exhaustive;
     find_opt.max_matches = 0;
-    auto ms = find(p, find_opt, stats);
+    SearchStats discovery_stats;
+    SearchStats* discovery_stats_out = stats ? stats : &discovery_stats;
+    auto ms = find(p, find_opt, discovery_stats_out);
+    if (discovery_stats_out->cancellation_requested) {
+        if (stats && discovery_stats_out != stats) *stats = *discovery_stats_out;
+        return {};
+    }
+    if (stats) {
+        stats->objective = to_string(opt.objective);
+        stats->candidate_order = "file-id";
+        stats->candidate_order_preserved = true;
+    }
     std::vector<uint8_t> eligible(I.infos.size(), 1);
     if (!opt.eligible_file_ids.empty()) {
         std::fill(eligible.begin(), eligible.end(), 0);

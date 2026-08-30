@@ -26,7 +26,7 @@ Every other query retains the established hard-coded order:
    verification.
 6. A regex that is a pure, sensitive, non-extended literal is converted to the
    fixed path when `multiline` is set or the literal does not contain the
-   requested `SearchOptions::record_separator` (`src/search.cpp:1588-1594`).
+   requested `SearchOptions::record_separator` (`src/search.cpp:1891-1897`).
    Capture-bearing literal-shaped regexes are excluded from this conversion so
    their captures remain owned by the general regex path. Other regexes use
    branch-mandatory/mandatory chunk pruning when available, otherwise the
@@ -216,12 +216,13 @@ unchanged.
 semantic `SearchOptions` fields (including `record_separator`, binary policy,
 max count, invert/files flags, and sorted/deduplicated eligible IDs), the
 `IndexOptions` capability fields, and `transformed_input_identity`
-(`pergrep.hpp:128-161`; equality/hash implementation in
-`search.cpp:535-619`). Distinct keys therefore force a fresh estimate; no plan
-cache is present in this milestone. The internal `IndexData::pos_block` is a
-derived runtime value (`internal.hpp:240`) rather than an independently hashed
-PlanKey field. Corpus frequency arrays, current file metadata, and freshness are
-inputs to execution/estimation but are not PlanKey members.
+   (`pergrep.hpp:130-176`; equality/hash implementation in
+   `search.cpp:661-724`).
+Distinct keys therefore force a fresh estimate; no plan cache is present in this
+milestone. The internal `IndexData::pos_block` is a derived runtime value
+(`internal.hpp:240`) rather than an independently hashed PlanKey field. Corpus
+frequency arrays, current file metadata, and freshness are inputs to
+execution/estimation but are not PlanKey members.
 
 This key is a correctness boundary for future caching, not a promise of
 cost-based dispatch. Any future scheduler must preserve the current exact
@@ -245,3 +246,6 @@ The implementation evidence for this inventory is:
 When a scheduler is added, update this document in the same change as its
 trigger predicates and correctness gates; do not infer a newly available plan
 from cost-model candidate metrics alone.
+
+## Objective-aware execution (M1.8)
+All operators default to exhaustive ordered traversal. `FirstHit` and `OrderedPrefix` may stop only on the proven file/offset order; they must not select candidates by estimated hit probability. `SearchStats` records the objective, preserved candidate order, stop reason, cancellation state, and first-hit timing. An absent cancellation callback means no cancellation is requested; multi-worker cancellation is out of scope.
