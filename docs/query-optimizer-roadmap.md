@@ -50,6 +50,13 @@
 - **Metrics**: `fresh()` traversal time, `load` peak memory
 - **Branch**: `autoresearch/qo-5-corpus`
 
+### M1.3 — PlanKey (Execution Flags and Scope in Plan Key)
+- **Scope**: `include/pergrep/pergrep.hpp` (`PlanKey`), `src/search.cpp` (`make_plan_key`, `estimateCost`/`chooseVerifier`/`estimate_all_candidate_plans` overloads, `Searcher::find` routing), `docs`
+- **Deliverable**: Explicit `PlanKey` capturing all semantic inputs: `PatternOptions` fields, `SearchOptions` fields (`overlapping`, `invert_match`, `files_with/without_match`, `max_matches`, `record_separator`, `include_binary`, `eligible_file_ids` sorted deduped), `IndexOptions` capabilities (`chunk_bytes`, `chunk_overlap`, `positional_block_bytes`, `positional_budget_ratio`, `planned_qgrams`, `include_hidden`, `follow_symlinks`, `persist_corpus`), and `transformed_input_identity`. Deterministic FNV-64 `hash()` and `operator==`, `std::hash` specialization, and explicit selection/caching contract (distinct keys never reuse cached plan; no default newline/overlap/positive-match assumptions).
+- **Correctness**: Plan selection routed through `PlanKey`-based cost model; distinct keys force recompute/fallback. Exact AST/NFA/VM execution unchanged.
+- **Tests**: Deterministic distinctness for each semantic input (NUL vs LF, overlap, max_matches, invert/files, binary, eligible ids, index options, PatternOptions fields, transformed identity) and `std::hash` stability.
+- **Branch**: `autoresearch/m1.3-plan-key` (M1.3)
+
 ## Interleaving with BugFix
 
 ```

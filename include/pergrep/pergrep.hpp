@@ -11,10 +11,10 @@
 #include <vector>
 
 namespace pergrep {
+struct PlanKey;
 class Pattern;
 struct PlanCandidateMetrics;
-namespace detail { struct IndexData; struct QueryCost; enum class VerifierKind : std::uint8_t; std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern&, const IndexData&, unsigned char record_separator = '\n'); }
-
+namespace detail { struct IndexData; struct QueryCost; enum class VerifierKind : std::uint8_t; std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern&, const IndexData&, unsigned char record_separator = '\n'); std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey&, const IndexData&); }
 enum class PatternKind { Regex, Fixed };
 enum class CaseMode { Sensitive, Insensitive, Smart };
 enum class Engine { Default, Pcre2Compat, Auto };
@@ -48,6 +48,9 @@ private:
     friend detail::VerifierKind chooseVerifier(const Pattern&, const detail::IndexData&, unsigned char);
     friend std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string>>&, const detail::IndexData&);
     friend std::vector<PlanCandidateMetrics> detail::estimate_all_candidate_plans(const Pattern&, const detail::IndexData&, unsigned char);
+    friend detail::QueryCost estimateCost(const PlanKey&, const detail::IndexData&);
+    friend detail::VerifierKind chooseVerifier(const PlanKey&, const detail::IndexData&);
+    friend std::vector<PlanCandidateMetrics> detail::estimate_all_candidate_plans(const PlanKey&, const detail::IndexData&);
 };
 
 struct IndexOptions {
@@ -121,6 +124,42 @@ struct SearchOptions {
     // Callers must keep the referenced IDs alive for the duration of the search.
     std::span<const std::uint32_t> eligible_file_ids = {};
 };
+
+// M1.3 PlanKey: explicit, deterministic plan input. Captures all semantic
+// inputs that influence planning/cost/selection so a plan estimated for one
+// contract is never reused for another. Includes:
+//   - PatternOptions fields (kind, case_mode, engine, word, line, multiline, dotall, unicode, crlf)
+//   - SearchOptions fields (overlapping, invert_match, files_with/without_match,
+//     max_matches, record_separator, include_binary, eligible_file_ids)
+//   - Index capabilities (chunk_bytes, chunk_overlap, positional_block_bytes,
+//     positional_budget_ratio, planned_qgrams, include_hidden, follow_symlinks,
+//     persist_corpus, pos_block)
+//   - transformed-input identity (hash of corpus preprocessing pipeline / encoding).
+// No path assumes default newline, non-overlap, or positive matching.
+// Equality and hash are deterministic (FNV-64, sorted eligible IDs, bitwise double).
+struct PlanKey {
+    std::string pattern_expression;
+    PatternOptions pattern_options;
+    bool overlapping = false;
+    bool invert_match = false;
+    bool files_with_matches = false;
+    bool files_without_match = false;
+    bool include_binary = false;
+    std::uint64_t max_matches = 0;
+    unsigned char record_separator = '\n';
+    std::vector<std::uint32_t> eligible_file_ids; // sorted, deduped
+    IndexOptions index_options;
+    std::uint64_t transformed_input_identity = 0;
+    bool operator==(const PlanKey& o) const noexcept;
+    bool operator!=(const PlanKey& o) const noexcept { return !(*this == o); }
+    std::uint64_t hash() const noexcept; // deterministic 64-bit FNV-1a
+};
+
+PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options,
+                      const Index& index, std::uint64_t transformed_input_identity = 0);
+PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options,
+                      const IndexOptions& index_options, std::uint64_t transformed_input_identity = 0);
+
 
 struct Capture {
     std::uint64_t start = 0;
@@ -365,6 +404,15 @@ GateEvaluation evaluate_performance_gate(
     const ShadowPlanReport& shadow_report = {});
 
 std::vector<PlanCandidateMetrics> estimate_candidate_plans(const Pattern& pattern, const Index& index, unsigned char record_separator = '\n');
+// M1.3 PlanKey overloads: explicit selection/caching contract. Every semantic
+// input is part of the key; no default newline/non-overlap/positive-match
+// assumption. Distinct keys must not reuse a cached plan; implementations fall
+// back to recompute when keys differ.
+std::vector<PlanCandidateMetrics> estimate_candidate_plans(const PlanKey& key, const Index& index);
+detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, unsigned char record_separator);
+detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator);
+detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I);
+detail::VerifierKind chooseVerifier(const PlanKey& key, const detail::IndexData& I);
 
 class Searcher {
 public:
@@ -381,3 +429,8 @@ private:
 std::string version();
 
 } // namespace pergrep
+namespace std {
+template<> struct hash<pergrep::PlanKey> {
+    size_t operator()(const pergrep::PlanKey& k) const noexcept { return static_cast<size_t>(k.hash()); }
+};
+} // namespace std

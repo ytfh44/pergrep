@@ -39,7 +39,11 @@ In shadow evaluation mode:
 - During or following execution, actual metrics (observed latency, verified bytes, candidate chunks/blocks) are recorded.
 - Counterfactual costs for alternative candidates are estimated or measured to evaluate if an alternate plan would have executed with lower actual cost.
 
+### M1.3 PlanKey Construction
+Plan selection and any future plan cache are keyed by an explicit `PlanKey` (`include/pergrep/pergrep.hpp`): `PatternOptions` (all 9 fields), `SearchOptions` (`overlapping`, `invert_match`, `files_with/without_match`, `max_matches`, `record_separator`, `include_binary`, `eligible_file_ids` sorted deduped), `IndexOptions` capabilities (`chunk_bytes`, `chunk_overlap`, `positional_block_bytes`, `positional_budget_ratio`, `planned_qgrams`, `include_hidden`, `follow_symlinks`, `persist_corpus`), and `transformed_input_identity`. `hash()` is deterministic FNV-64 with bitwise double handling; `operator==` compares all fields. `Searcher::find` routes through `make_plan_key` → `estimateCost(PlanKey, IndexData)`; distinct keys never reuse a cached plan (fallback to recompute). No path assumes default newline, non-overlap, or positive matching.
+
 ---
+
 
 ## 3. Mathematical Definition of Plan Regret
 
