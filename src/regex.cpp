@@ -707,6 +707,189 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,co
 
 } // namespace
 
+namespace {
+bool filter_equal(const FilterExpr& a, const FilterExpr& b) {
+    if (a.value.index() != b.value.index()) return false;
+    if (std::holds_alternative<FilterExpr::True>(a.value)) return true;
+    if (std::holds_alternative<FilterExpr::Atom>(a.value)) {
+        return std::get<FilterExpr::Atom>(a.value).literal ==
+               std::get<FilterExpr::Atom>(b.value).literal;
+    }
+    const auto& ax = std::holds_alternative<FilterExpr::And>(a.value)
+        ? std::get<FilterExpr::And>(a.value).terms
+        : std::get<FilterExpr::Or>(a.value).terms;
+    const auto& bx = std::holds_alternative<FilterExpr::And>(b.value)
+        ? std::get<FilterExpr::And>(b.value).terms
+        : std::get<FilterExpr::Or>(b.value).terms;
+    if (ax.size() != bx.size()) return false;
+    std::vector<bool> used(bx.size(), false);
+    for (const auto& left : ax) {
+        bool found = false;
+        for (std::size_t i = 0; i < bx.size(); ++i) {
+            if (!used[i] && filter_equal(left, bx[i])) {
+                used[i] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+bool and_contains(const FilterExpr& expr, const FilterExpr& term) {
+    if (!std::holds_alternative<FilterExpr::And>(expr.value)) return false;
+    for (const auto& child : std::get<FilterExpr::And>(expr.value).terms) {
+        if (filter_equal(child, term)) return true;
+    }
+    return false;
+}
+
+bool filter_subsumes(const FilterExpr& lhs, const FilterExpr& rhs) {
+    if (filter_equal(lhs, rhs)) return true;
+    if (std::holds_alternative<FilterExpr::Atom>(lhs.value) &&
+        std::holds_alternative<FilterExpr::Atom>(rhs.value)) {
+        const auto& left = std::get<FilterExpr::Atom>(lhs.value).literal;
+        const auto& right = std::get<FilterExpr::Atom>(rhs.value).literal;
+        // Presence of a longer literal implies presence of every literal
+        // contained in it, so Atom("a") absorbs Atom("ab").
+        return right.find(left) != std::string::npos;
+    }
+    return and_contains(rhs, lhs);
+}
+}
+FilterExpr FilterExpr::atom(std::string literal) {
+    if (literal.empty()) return true_();
+    return FilterExpr(Atom{std::move(literal)});
+}
+
+FilterExpr FilterExpr::and_(std::vector<FilterExpr> terms) {
+    return FilterExpr(And{std::move(terms)});
+}
+
+FilterExpr FilterExpr::or_(std::vector<FilterExpr> terms) {
+    return FilterExpr(Or{std::move(terms)});
+}
+
+bool FilterExpr::matches(std::string_view candidate) const {
+    if (std::holds_alternative<True>(value)) return true;
+    if (std::holds_alternative<Atom>(value)) {
+        const auto& literal = std::get<Atom>(value).literal;
+        return candidate.find(literal) != std::string_view::npos;
+    }
+    if (std::holds_alternative<And>(value)) {
+        for (const auto& term : std::get<And>(value).terms) {
+            if (!term.matches(candidate)) return false;
+        }
+        return true;
+    }
+    for (const auto& term : std::get<Or>(value).terms) {
+        if (term.matches(candidate)) return true;
+    }
+    return false;
+}
+
+FilterExpr FilterExpr::simplified() const {
+    if (std::holds_alternative<True>(value)) return true_();
+    if (std::holds_alternative<Atom>(value)) {
+        return atom(std::get<Atom>(value).literal);
+    }
+    if (std::holds_alternative<And>(value)) {
+        std::vector<FilterExpr> terms;
+        for (const auto& child : std::get<And>(value).terms) {
+            auto simplified_child = child.simplified();
+            if (std::holds_alternative<True>(simplified_child.value)) continue;
+            if (std::holds_alternative<And>(simplified_child.value)) {
+                for (auto& nested : std::get<And>(simplified_child.value).terms)
+                    terms.push_back(std::move(nested));
+            } else {
+                terms.push_back(std::move(simplified_child));
+            }
+        }
+        std::vector<FilterExpr> unique;
+        for (auto& term : terms) {
+            bool duplicate = false;
+            for (const auto& prior : unique) {
+                if (filter_equal(prior, term)) { duplicate = true; break; }
+            }
+            if (!duplicate) unique.push_back(std::move(term));
+        }
+        if (unique.empty()) return true_();
+        if (unique.size() == 1) return std::move(unique.front());
+        return and_(std::move(unique));
+    }
+
+    std::vector<FilterExpr> terms;
+    for (const auto& child : std::get<Or>(value).terms) {
+        auto simplified_child = child.simplified();
+        if (std::holds_alternative<True>(simplified_child.value)) return true_();
+        if (std::holds_alternative<Or>(simplified_child.value)) {
+            for (auto& nested : std::get<Or>(simplified_child.value).terms)
+                terms.push_back(std::move(nested));
+        } else {
+            terms.push_back(std::move(simplified_child));
+        }
+    }
+    std::vector<FilterExpr> unique;
+    for (auto& term : terms) {
+        bool duplicate = false;
+        for (const auto& prior : unique) {
+            if (filter_equal(prior, term)) { duplicate = true; break; }
+        }
+        if (!duplicate) unique.push_back(std::move(term));
+    }
+    // Safe absorption: A OR (A AND B) is equivalent to A. The literal
+    // implication case also absorbs Atom("a") OR Atom("ab"). This is the
+    // factoring/CSE seam; no regex node is rewritten and no match ordering can
+    // be affected.
+    for (std::size_t i = 0; i < unique.size(); ++i) {
+        std::size_t j = 0;
+        while (j < unique.size()) {
+            if (i != j && filter_subsumes(unique[i], unique[j])) {
+                unique.erase(unique.begin() + static_cast<std::ptrdiff_t>(j));
+                if (j < i) --i;
+                continue;
+            }
+            ++j;
+        }
+    }
+    if (unique.empty()) return true_();
+    if (unique.size() == 1) return std::move(unique.front());
+    return or_(std::move(unique));
+}
+
+FilterExpr query_filter(const std::shared_ptr<RegexNode>& n) {
+    using K = RegexNode::Kind;
+    if (!n) return FilterExpr::true_();
+    switch (n->kind) {
+    case K::Literal:
+        return (!n->literal.empty() && !n->icase) ? FilterExpr::atom(n->literal)
+                                                   : FilterExpr::true_();
+    case K::Group:
+        return n->children.empty() ? FilterExpr::true_() : query_filter(n->children.front());
+    case K::LookAhead:
+    case K::LookBehind:
+        return n->negative || n->children.empty() ? FilterExpr::true_()
+                                                   : query_filter(n->children.front());
+    case K::Repeat:
+        return n->min == 0 || n->children.empty() ? FilterExpr::true_()
+                                                   : query_filter(n->children.front());
+    case K::Concat: {
+        std::vector<FilterExpr> terms;
+        for (const auto& child : n->children) terms.push_back(query_filter(child));
+        return FilterExpr::and_(std::move(terms));
+    }
+    case K::Alt: {
+        std::vector<FilterExpr> terms;
+        for (const auto& child : n->children) terms.push_back(query_filter(child));
+        return FilterExpr::or_(std::move(terms));
+    }
+    default:
+        return FilterExpr::true_();
+    }
+}
+
+
 // Canonical QueryIR extraction helpers. All optimizer metadata is built here
 // and installed into RegexProgram once by Parser::parse().
 std::vector<std::string> query_mandatory(const std::shared_ptr<RegexNode>& n) {
@@ -810,6 +993,7 @@ bool query_is_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& out
 }
 QueryIR analyze_query(const std::shared_ptr<RegexNode>& ast, bool extended) {
     QueryIR ir;
+    ir.filter = query_filter(ast).simplified();
     ir.mandatory = query_mandatory(ast);
     std::sort(ir.mandatory.begin(), ir.mandatory.end());
     ir.mandatory.erase(std::unique(ir.mandatory.begin(), ir.mandatory.end()), ir.mandatory.end());

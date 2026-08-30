@@ -8,6 +8,7 @@
 
 - `RegexProgram::query_ir` is the canonical optimizer-facing representation (`mandatory`, `branch_mandatory`, `prefixes`, `is_pure_literal`, and `exact_literal`), built once during parsing.
 - Legacy `RegexProgram` metadata members remain synchronized compatibility views for existing internal callers; planner and verifier code reads `query_ir` only.
+- M1.2 `QueryIR::filter` is a filter-only `Atom`/`And`/`Or`/`True` algebra. Atoms are exact, non-empty, case-sensitive literal-presence necessary conditions; factoring/CSE may only widen candidates and never touches ordered regex execution.
 - `bench/workload_matrix.hpp` + `docs/workload-matrix.md`: versioned M0.1 workload/product-mode matrix (four closed classes, deterministic corpus/query profiles, lifecycle phases, and decision rule)
 - `nfa_search` prefix jump + `search.cpp` multi-branch union pruning + pure-literal fast path
 - Persistent index `v5` field-by-field serialization + `IndexOptions` upper/lower bound validation

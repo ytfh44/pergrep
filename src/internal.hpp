@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace pergrep::detail {
@@ -93,11 +95,51 @@ struct NfaInst {
     bool unicode = true;
     bool crlf = false;
 };
+// FilterExpr — a filter-only Boolean algebra. It is deliberately separate from
+// RegexNode: these expressions are only necessary conditions for candidate
+// pruning and must never be used to produce matches or mutate regex execution.
+//
+// Atom(literal) means the candidate contains the exact, non-empty, sensitive
+// literal bytes. And requires every child; Or requires at least one child;
+// True imposes no restriction. A filter may therefore retain false positives,
+// but must never reject text containing an exact regex match.
+struct FilterExpr {
+    struct True {};
+    struct Atom { std::string literal; };
+    struct And { std::vector<FilterExpr> terms; };
+    struct Or { std::vector<FilterExpr> terms; };
+
+    std::variant<True, Atom, And, Or> value = True{};
+
+    FilterExpr() = default;
+    explicit FilterExpr(True x) : value(std::move(x)) {}
+    explicit FilterExpr(Atom x) : value(std::move(x)) {}
+    explicit FilterExpr(And x) : value(std::move(x)) {}
+    explicit FilterExpr(Or x) : value(std::move(x)) {}
+
+    static FilterExpr atom(std::string literal);
+    static FilterExpr and_(std::vector<FilterExpr> terms);
+    static FilterExpr or_(std::vector<FilterExpr> terms);
+    static FilterExpr true_() { return FilterExpr(True{}); }
+
+    // Evaluate only the necessary-condition filter, never the regex itself.
+    bool matches(std::string_view candidate) const;
+    // Apply Boolean identities, flattening, duplicate elimination, and safe
+    // absorption (for example Atom("a") OR (Atom("a") AND Atom("b"))).
+    FilterExpr simplified() const;
+};
+
+FilterExpr query_filter(const std::shared_ptr<RegexNode>& n);
+
 // QueryIR — optimizer-facing literal/branch view derived from the regex AST.
 // Formalizes the "query plan" extracted for candidate pruning / NFA fast-path.
 // Fields are conservative (zero false negatives): pruning may keep extra chunks
 // but must never discard a true match.
 struct QueryIR {
+    // Filter-only algebra exposed for conservative candidate pruning. The
+    // current planner may continue using derived views below; exact regex
+    // execution remains owned by RegexNode/NFA/VM and never reads this tree.
+    FilterExpr filter;
     // mandatory: intersection of mandatory literals across all Alt branches.
     // Used as the global chunk filter when branch_mandatory is not available.
     // Example: `foo|foobar` -> intersection {foo}. Sorted longest-first.
