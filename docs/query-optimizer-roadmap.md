@@ -8,7 +8,7 @@
 
 - `RegexProgram { mandatory, prefixes, branch_mandatory, is_pure_literal }` extracted in `src/regex.cpp`
 - `nfa_search` prefix jump + `search.cpp` multi-branch union pruning + pure-literal fast path
-- `bench/bench.cpp` synthetic ~1 MiB corpus for **indexed vs brute-force** differential harness (not a cross-tool `rg` benchmark)
+- `bench/workload_matrix.hpp` + `docs/workload-matrix.md`: versioned M0.1 workload/product-mode matrix (four closed classes, deterministic corpus/query profiles, lifecycle phases, and decision rule)
 - Persistent index `v5` field-by-field serialization + `IndexOptions` upper/lower bound validation
 
 ## Decomposition into Scoped Autoresearch Subtasks
@@ -17,7 +17,7 @@
 - **Scope**: `src/regex.cpp`, `include/pergrep/pergrep.hpp`, `src/internal.hpp`
 - **Deliverable**: Formal `QueryIR { mandatory, branch_mandatory, prefixes, is_pure_literal, word/line/multiline/case }` with unit tests; precise **Branch Flavor** semantics: longest literal per disjunct `Alt` branch vs global intersection
 - **Correctness**: Conservativeness proof for `mandatory_literals()` + negative cases for `negative lookaround` isolation
-- **Metrics**: `pruned_chunks%` on `bench` `alt_*` cases, `is_pure_literal` hit rate
+- **Metrics**: `candidate_chunks` and `candidate_blocks` on the matrix alternation profiles, plus pure-literal dispatch hit rate
 - **Branch**: `autoresearch/qo-1-literal-branch`
 
 ### QO-2 — Q-gram Rarity Planner
@@ -38,7 +38,7 @@
 - **Scope**: `src/search.cpp` (`Searcher::find` dispatch), `src/regex.cpp` (`nfa_search`/`eval`)
 - **Deliverable**: **Cost model + scheduler** choosing `Fixed (rare-byte anchor)` vs `NFA (Thompson)` vs `VM (extended)` vs `prefix-anchored` inverted index; per-record cost for `multiline`/`crlf`/`record_separator`; short-circuit on `max_matches`/`overlapping`
 - **Correctness**: Strategy switch preserves `regex_find_all` semantics; `is_pure_literal` fast path only when `(multiline || !contains sep)`
-- **Metrics**: End-to-end `search_time_ms`/`throughput_mb_s`, per-flavor breakdown of `bench` 13 cases
+- **Metrics**: Matrix-versioned per-scenario `search_time_ms`/`search_ms_per_query`/`throughput_mb_s`, plus candidate chunks/blocks and verified bytes; QO-4 should preserve the cold-vs-warm lifecycle split
 - **Branch**: `autoresearch/qo-4-cost-model`
 
 ### QO-5 — Corpus & Freshness Optimizer (orthogonal to persistent index)
@@ -67,9 +67,9 @@ Every BF/QO runs on its own `autoresearch/*` branch gated by `autoresearch.sh` +
 
 ## Evaluation Harness
 
-- **Correctness**: `tests/test.cpp` differential `indexed (32 KiB) vs ref (1 MiB single-chunk)`; `bench` full 13-flavor `indexed vs ref` comparison
-- **Performance**: `bench` `search_time_ms`/`throughput_mb_s`/`pruned_chunks%`/`verified_kb`; later `hyperfine` vs `rg --no-config` as a separate, non-CI comparison
-- **CI**: `.github/workflows/ci.yml` on `ubuntu`/`windows-msvc`/`windows-clang` presets with `ctest --output-on-failure` + `pergrep_bench` smoke
+- **Correctness**: every matrix scenario runs an indexed (32 KiB) vs. brute-force reference differential before timing; matches, file selection, byte offsets, overlap, max, CRLF, and NUL record behavior must agree
+- **Performance**: matrix-versioned per-scenario `index_build_ms`, `search_time_ms`, `search_ms_per_query`, `throughput_mb_s`, `verified_kb`, `candidate_chunks`, and `candidate_blocks`; aggregate metrics remain for existing consumers
+- **CI**: `.github/workflows/ci.yml` on `ubuntu`/`windows-msvc`/`windows-clang` presets with `ctest --output-on-failure` + `pergrep_bench` smoke; all corpora are deterministic in-memory fixtures and never downloaded
 
 ## Milestone
 
