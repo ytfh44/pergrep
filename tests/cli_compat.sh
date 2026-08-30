@@ -155,6 +155,23 @@ mkdir -p "$T/hid/.secret"; printf 'needle\n' > "$T/hid/.secret/x"
 out="$($PG needle "$T/hid" || true)"; eq "$out" '' hidden-default
 out="$($PG --hidden needle "$T/hid")"; contains "$out" '.secret/x:needle' hidden-enabled
 
+# Selector scope is applied inside the core search, including file polarity and
+# invert mode, so excluded files do not contribute results or search stats.
+mkdir -p "$T/scope"
+printf 'needle\n' > "$T/scope/included.txt"
+printf 'needle\n' > "$T/scope/excluded.log"
+out="$($PG --glob '*.txt' needle "$T/scope")"
+eq "$out" 'included.txt:needle' selector-glob-output
+with="$($PG --glob '*.txt' --files-with-matches needle "$T/scope")"
+eq "$with" 'included.txt' selector-glob-files-with
+without="$($PG --glob '*.txt' --files-without-match needle "$T/scope" || true)"
+eq "$without" '' selector-glob-files-without
+inv="$($PG --glob '*.txt' --invert-match needle "$T/scope" || true)"
+eq "$inv" '' selector-glob-invert
+stats="$($PG --glob '*.txt' --stats needle "$T/scope")"
+contains "$stats" '1 files searched' selector-glob-stats
+not_contains "$stats" '2 files searched' selector-glob-stats-excluded
+
 # RIPGREP_CONFIG_PATH is prepended and CLI flags override it.
 printf '%s\n' '--ignore-case' > "$T/rg.conf"
 printf 'Needle\n' > "$T/config.txt"

@@ -400,6 +400,53 @@ int main(){
     auto m_inv = s.find(p, opt_inv);
     assert(!m_inv.empty());
   }
+  // Eligible file-ID scopes constrain candidate generation, exact verification,
+  // file polarity, inversion, and canonical search statistics.
+  {
+    const std::vector<Document> docs = {
+      {"a.txt", "apple\nexcluded\n"},
+      {"b.txt", "banana\nexcluded\n"},
+      {"c.txt", "apple\ngrape\n"}
+    };
+    IndexOptions small;
+    small.chunk_bytes = 64;
+    small.chunk_overlap = 32;
+    auto indexed_idx = Index::from_documents(docs, small);
+    auto reference_idx = Index::from_documents(docs);
+    Searcher indexed(indexed_idx), reference(reference_idx);
+    const std::vector<uint32_t> eligible{1, 2};
+    SearchOptions scoped;
+    scoped.eligible_file_ids = eligible;
+    auto p = Pattern::compile("apple", {.kind = PatternKind::Fixed});
+
+    SearchStats indexed_stats{}, reference_stats{};
+    auto actual = indexed.find(p, scoped, &indexed_stats);
+    auto expected = reference.find(p, scoped, &reference_stats);
+    assert(actual.size() == expected.size() && actual.size() == 1);
+    assert(actual[0].file_id == 2 && actual[0].start == expected[0].start);
+    assert(indexed_stats.candidate_files == 1);
+    for (const auto& m : actual) assert(std::find(eligible.begin(), eligible.end(), m.file_id) != eligible.end());
+
+    SearchOptions with = scoped;
+    with.files_with_matches = true;
+    assert((indexed.files(p, with) == std::vector<uint32_t>{2}));
+    SearchOptions without = scoped;
+    without.files_without_match = true;
+    assert((indexed.files(p, without) == std::vector<uint32_t>{1}));
+
+    SearchOptions inverted = scoped;
+    inverted.invert_match = true;
+    auto inverted_matches = indexed.find(p, inverted);
+    assert(!inverted_matches.empty());
+    for (const auto& m : inverted_matches) assert(m.file_id != 0);
+
+    SearchOptions empty_scope;
+    const std::vector<uint32_t> no_ids;
+    empty_scope.eligible_file_ids = no_ids;
+    auto no_scope = indexed.find(p);
+    assert(indexed.find(p, empty_scope).size() == no_scope.size());
+    assert(indexed.files(p, empty_scope) == indexed.files(p));
+  }
   std::cerr << "M21\n" << std::flush;
   // Differential regression matrix: compare the chunked index with a whole-file
   // reference index for every observable result, not just match counts.
