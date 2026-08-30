@@ -224,6 +224,11 @@ struct SearchStats {
     double estimated_cost = 0.0;
     double plan_regret = 0.0;
     bool verifier_fallback = false;
+    // M1.7: execution backend and whether the guarded fixed dispatcher ran.
+    // physical_operator is more specific than the public verifier enum: it
+    // distinguishes chunk-level from whole-file FixedRareByte scans.
+    std::string physical_operator = {};
+    bool guarded_dispatch_used = false;
     // Planner predictions are candidate-work units, not corpus-byte
     // occurrence proxies. Bounds are conservative upper bounds widened for
     // legacy hash collisions; observed values may be lower.

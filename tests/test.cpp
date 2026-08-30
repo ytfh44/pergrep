@@ -1189,14 +1189,20 @@ int main(){
       (void)s.find(pat_common, {}, &st_common);
       // Common gram appears in every doc, so candidate_blocks should be large (many chunks).
       // Rare query should prune to far fewer blocks.
-      assert(st_common.candidate_blocks > stats.candidate_blocks);
-      assert(st_common.candidate_blocks >= 10);
+      if (stats.guarded_dispatch_used && stats.physical_operator != "FixedPositional") {
+        assert(stats.candidate_blocks == 0);
+      } else {
+        assert(st_common.candidate_blocks > stats.candidate_blocks);
+      }
+      if (!stats.guarded_dispatch_used || stats.physical_operator == "FixedPositional")
+        assert(st_common.candidate_blocks >= 10);
     }
     // Rarity-aware should prune to ~1 doc worth of chunks.
     assert(stats.candidate_blocks <= 4);
     // Also candidate_chunks (pre-positional) is Bloom-based; rarity mainly affects blocks,
     // but overall verified_bytes should be small thanks to block pruning.
-    assert(stats.verified_bytes < 8192);
+    if (!stats.guarded_dispatch_used || stats.physical_operator == "FixedPositional")
+      assert(stats.verified_bytes < 8192);
     // Zero false negatives: searching the rare gram alone also finds it
     auto pat2 = Pattern::compile("xyzq", {.kind = PatternKind::Fixed});
     SearchStats st2{};
@@ -1575,8 +1581,8 @@ int main(){
     auto v_common = pergrep::chooseVerifier(p_common, I);
     auto v_rare = pergrep::chooseVerifier(p_rare, I);
     // Both fixed small literals -> FixedPositional per dispatch; verify enum mapping
-    assert(v_common == pergrep::detail::VerifierKind::FixedPositional);
-    assert(v_rare == pergrep::detail::VerifierKind::FixedPositional);
+    assert(v_common == cost_common.verifier);
+    assert(v_rare == cost_rare.verifier);
     // Regex branch_mandatory: "aaaa|xyzq" should produce two branches and cost model picks rare
     auto prog = pergrep::detail::parse_regex("aaaa|xyzq", {});
     assert(prog.branch_mandatory.size() == 2);
@@ -1592,7 +1598,7 @@ int main(){
     {
       SearchStats st{};
       (void)s.find(p_rare, {}, &st);
-      assert(st.verifier == std::string(pergrep::detail::to_string(pergrep::detail::VerifierKind::FixedPositional)));
+      assert(st.verifier == std::string(pergrep::detail::to_string(cost_rare.verifier)));
       // Pure-literal regex fast path: "hello" is pure literal but not in skewed corpus -> still FixedRareByte via cost model when not multiline? Check.
       // For default sep '\n', pure literal without sep should be FixedRareByte (fast path) and is_pure_literal respects (multiline || !contains sep)
       auto p_pure = Pattern::compile("hello");
@@ -1615,7 +1621,8 @@ int main(){
       assert(st.candidate_blocks <= 4);
       auto m_common = s.find(p_common, {}, &st);
       assert(m_common.size() >= 1); // common appears everywhere
-      assert(st.candidate_blocks > m_rare.size()); // common has more blocks than rare (pruning less)
+       if (st.physical_operator == "FixedPositional")
+         assert(st.candidate_blocks > m_rare.size());
     }
     std::cerr << "M24 QO-4 cost model done\n" << std::flush;
   }
@@ -2356,7 +2363,8 @@ int main(){
       SearchStats stats_nul_sep{};
       s_nul.find(pat_nl, {.include_binary = true, .record_separator = '\0'}, &stats_nul_sep);
       assert(stats_nul_sep.verifier == "FixedPositional");
-      assert(!stats_nul_sep.verifier_fallback);
+      // M1.7 deliberately excludes custom separators from guarded fixed dispatch.
+      assert(stats_nul_sep.verifier_fallback);
       bool has_chosen_matched = false;
       for (const auto& c : cands_nul_sep) {
         if (c.chosen && to_string(c.verifier) == stats_nul_sep.verifier) {
@@ -3201,6 +3209,112 @@ int main(){
       test_query(Pattern::compile("RARE_X_12345"), {.include_binary = true, .record_separator = '\0'});
     }
   }
+  // M1.7 guarded fixed dispatch: calibrated estimates may choose each safe
+  // backend, while every excluded semantic combination remains a fallback.
+  {
+    std::string text(128 * 100, 'x');
+    text.replace(500, 6, "NEEDLE");
+    text.push_back('\n');
+    auto check = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      assert(a.size() == b.size());
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        assert(a[i].file_id == b[i].file_id && a[i].start == b[i].start && a[i].end == b[i].end);
+      }
+    };
 
+    IndexOptions positional_opt;
+    positional_opt.chunk_bytes = 128;
+    positional_opt.chunk_overlap = 32;
+    positional_opt.positional_block_bytes = 256;
+    auto positional_idx = Index::from_documents({{"a.txt", text}}, positional_opt);
+    auto positional_ref = Index::from_documents({{"a.txt", text}});
+    Searcher positional_searcher(positional_idx), positional_reference(positional_ref);
+    auto needle = Pattern::compile("NEEDLE", {.kind = PatternKind::Fixed});
+    SearchStats positional_stats{};
+    auto positional_matches = positional_searcher.find(needle, {}, &positional_stats);
+    auto positional_expected = positional_reference.find(needle);
+    check(positional_matches, positional_expected);
+    assert(positional_stats.guarded_dispatch_used);
+    assert(positional_stats.physical_operator == "FixedPositional");
+    assert(!positional_stats.verifier_fallback);
+
+    IndexOptions chunk_opt = positional_opt;
+    chunk_opt.positional_block_bytes = 16;
+    auto chunk_idx = Index::from_documents({{"a.txt", text}}, chunk_opt);
+    auto chunk_ref = Index::from_documents({{"a.txt", text}});
+    Searcher chunk_searcher(chunk_idx), chunk_reference(chunk_ref);
+    SearchStats chunk_stats{};
+    auto chunk_matches = chunk_searcher.find(needle, {}, &chunk_stats);
+    check(chunk_matches, chunk_reference.find(needle));
+    assert(chunk_stats.guarded_dispatch_used);
+    assert(chunk_stats.physical_operator == "FixedChunk");
+    assert(chunk_stats.verifier == "FixedRareByte");
+    assert(!chunk_stats.verifier_fallback);
+
+    // An oversized chunk and positional block make the whole-file estimate
+    // cheapest, without changing the exact match contract.
+    IndexOptions whole_opt = positional_opt;
+    whole_opt.chunk_bytes = 65536;
+    whole_opt.positional_block_bytes = 65536;
+    auto whole_idx = Index::from_documents({{"a.txt", text}}, whole_opt);
+    auto whole_ref = Index::from_documents({{"a.txt", text}});
+    Searcher whole_searcher(whole_idx), whole_reference(whole_ref);
+    SearchStats whole_stats{};
+    auto whole_matches = whole_searcher.find(needle, {}, &whole_stats);
+    check(whole_matches, whole_reference.find(needle));
+    assert(whole_stats.guarded_dispatch_used);
+    assert(whole_stats.physical_operator == "FixedRareByteWholeFile");
+
+    auto assert_fallback = [&](Pattern p, SearchOptions opt) {
+      SearchStats st{};
+      auto actual = positional_searcher.find(p, opt, &st);
+      auto expected = positional_reference.find(p, opt);
+      check(actual, expected);
+      assert(!st.guarded_dispatch_used);
+      assert(st.verifier_fallback);
+    };
+    assert_fallback(Pattern::compile("abc", {.kind = PatternKind::Fixed}), {});
+    assert_fallback(Pattern::compile(std::string(40, 'N'), {.kind = PatternKind::Fixed}), {});
+    assert_fallback(Pattern::compile("needle", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive}), {});
+    assert_fallback(Pattern::compile("NEEDLE", {.kind = PatternKind::Fixed, .word = true}), {});
+    assert_fallback(Pattern::compile("NEEDLE", {.kind = PatternKind::Fixed, .line = true}), {});
+    assert_fallback(needle, {.record_separator = '\0'});
+    assert_fallback(needle, {.invert_match = true});
+    assert_fallback(needle, {.max_matches = 1});
+    assert_fallback(needle, {.overlapping = true});
+    const std::vector<std::uint32_t> scope{0};
+    SearchOptions scoped; scoped.eligible_file_ids = scope;
+    assert_fallback(needle, scoped);
+    // Regex-to-fixed recursion must never advertise a guarded choice; a
+    // capture-bearing literal-shaped regex must stay on regex verification.
+    {
+      auto pure_regex = Pattern::compile("NEEDLE");
+      SearchStats pure_stats{};
+      auto pure_matches = positional_searcher.find(pure_regex, {}, &pure_stats);
+      check(pure_matches, positional_reference.find(pure_regex));
+      assert(!pure_stats.guarded_dispatch_used);
+      assert(pure_stats.verifier_fallback);
+
+      auto captured_regex = Pattern::compile("(NEEDLE)");
+      SearchStats captured_stats{}, captured_ref_stats{};
+      auto captured_matches = positional_searcher.find(captured_regex, {}, &captured_stats);
+      auto captured_expected = positional_reference.find(captured_regex, {}, &captured_ref_stats);
+      assert(captured_matches.size() == captured_expected.size());
+      for (std::size_t i = 0; i < captured_matches.size(); ++i) {
+        assert(captured_matches[i].file_id == captured_expected[i].file_id);
+        assert(captured_matches[i].start == captured_expected[i].start);
+        assert(captured_matches[i].end == captured_expected[i].end);
+        assert(captured_matches[i].captures.size() == captured_expected[i].captures.size());
+        for (std::size_t j = 0; j < captured_matches[i].captures.size(); ++j) {
+          assert(captured_matches[i].captures[j].start == captured_expected[i].captures[j].start);
+          assert(captured_matches[i].captures[j].end == captured_expected[i].captures[j].end);
+          assert(captured_matches[i].captures[j].matched == captured_expected[i].captures[j].matched);
+          assert(captured_matches[i].captures[j].name == captured_expected[i].captures[j].name);
+        }
+      }
+      assert(!captured_stats.guarded_dispatch_used);
+      assert(captured_stats.verifier != "FixedPositional");
+    }
+  }
   return 0;
 }

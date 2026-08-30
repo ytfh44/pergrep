@@ -62,6 +62,33 @@ pretending that an unavailable counter is zero.
 
 ### M1.3 PlanKey Construction
 Plan selection and any future plan cache are keyed by an explicit `PlanKey` (`include/pergrep/pergrep.hpp`): `PatternOptions` (all 9 fields), `SearchOptions` (`overlapping`, `invert_match`, `files_with/without_match`, `max_matches`, `record_separator`, `include_binary`, `eligible_file_ids` sorted deduped), `IndexOptions` capabilities (`chunk_bytes`, `chunk_overlap`, `positional_block_bytes`, `positional_budget_ratio`, `planned_qgrams`, `include_hidden`, `follow_symlinks`, `persist_corpus`), and `transformed_input_identity`. `hash()` is deterministic FNV-64 with bitwise double handling; `operator==` compares all fields. `Searcher::find` routes through `make_plan_key` → `estimateCost(PlanKey, IndexData)`; distinct keys never reuse a cached plan (fallback to recompute). No path assumes default newline, non-overlap, or positive matching.
+### M1.7 guarded fixed-dispatch policy
+
+M1.7 changes the M1.6 measurement-only rule only for a narrow fixed-string
+contract. The guard requires a 4--64 byte literal contained by chunk_overlap,
+sensitive/default fixed matching, no word/line/multiline/dotall/crlf modifiers,
+Unicode enabled, newline records, unlimited non-overlapping positive matching,
+no invert/files wrapper, no binary inclusion, no eligible-file scope, and an
+IndexOptions identity exactly equal to the live index. Planner statistics must be
+ready, positional rows must exist, and the corpus must contain no binary files.
+Short/empty/long or cross-chunk literals, custom/NUL separators, max-count,
+overlap, selectors, unsupported statistics, and ambiguous option combinations
+fall back to the established dispatch without cost-based selection.
+
+The guarded selector compares calibrated M1.6 candidate-work estimates for
+FixedPositional, chunk-level FixedRareByte, and whole-file FixedRareByte. Ties
+prefer FixedPositional. Estimates may rank physical operators but never determine
+candidate membership: every q-gram/Bloom candidate filter remains conservative,
+and exact verification is unchanged. PlanKey fields are part of the guard so a
+stale capability or semantic key cannot select a backend for a different contract.
+
+SearchStats reports the concrete physical_operator and guarded_dispatch_used;
+the stable verifier label remains FixedRareByte for both rare-byte shapes.
+verifier_fallback is true for fixed searches outside the guard. Benchmark query
+metrics include both fields, and the existing shadow observation/regret rules
+continue to treat only the executed backend as Observed. Rollback is fail-closed:
+disable guarded selection and execute the previous length/option branch; no result,
+ordering, capture, offset, record, binary, or selector semantics are changed.
 
 ---
 
