@@ -401,7 +401,232 @@ int main(){
     assert(!m_inv.empty());
   }
   std::cerr << "M21\n" << std::flush;
-  // Property-based differential test suite (Indexed Search == Brute-force Search).
+  // Differential regression matrix: compare the chunked index with a whole-file
+  // reference index for every observable result, not just match counts.
+  {
+    std::string boundary(34000, 'x');
+    const std::string boundary_token = "BOUNDARY_" + std::string(34, 'K') + "_END";
+    const std::size_t boundary_pos = 32768 - 9;
+    boundary.replace(boundary_pos, boundary_token.size(), boundary_token);
+    boundary += "\nneedle at the end\n";
+
+    std::string invalid_utf8 = "valid ";
+    invalid_utf8.append("\xC3\x28", 2);
+    invalid_utf8 += " tail\n";
+
+    std::string binary = "before";
+    binary.push_back('\0');
+    binary += "needle";
+    binary.push_back('\0');
+    binary += "after";
+
+    std::vector<Document> docs = {
+      {"alpha.txt", "alpha ALPHA alpha\nbeta-123 beta-456\ncat scat bob banana\n"},
+      {"crlf.txt", "foo\r\nbar foo\r\nfoo\r\n"},
+      {"unicode.txt", "café CAFÉ Ελληνικά 世界 世界\n"},
+      {"boundary.txt", std::move(boundary)},
+      {"invalid.bin", std::move(invalid_utf8)},
+      {"binary.bin", std::move(binary)},
+      {"empty.txt", ""},
+      {"records.dat", "r1::needle::r2::needle::r3"}
+    };
+
+    IndexOptions indexed_opt;
+    indexed_opt.chunk_bytes = 64;
+    indexed_opt.chunk_overlap = 16;
+    indexed_opt.positional_block_bytes = 16;
+    IndexOptions reference_opt;
+    reference_opt.chunk_bytes = 1024 * 1024;
+    reference_opt.chunk_overlap = 512 * 1024;
+    reference_opt.positional_block_bytes = 1024;
+    auto indexed_idx = Index::from_documents(docs, indexed_opt);
+    auto reference_idx = Index::from_documents(docs, reference_opt);
+    Searcher indexed_searcher(indexed_idx);
+    Searcher reference_searcher(reference_idx);
+
+    struct QueryCase {
+      std::string pattern;
+      PatternOptions pattern_options;
+      SearchOptions search_options;
+    };
+
+    auto assert_matches_equal = [](const std::vector<Match>& actual,
+                                   const std::vector<Match>& expected) {
+      assert(actual.size() == expected.size());
+      for (std::size_t i = 0; i < expected.size(); ++i) {
+        assert(actual[i].file_id == expected[i].file_id);
+        assert(actual[i].start == expected[i].start);
+        assert(actual[i].end == expected[i].end);
+        assert(actual[i].captures.size() == expected[i].captures.size());
+        for (std::size_t g = 0; g < expected[i].captures.size(); ++g) {
+          const auto& a = actual[i].captures[g];
+          const auto& e = expected[i].captures[g];
+          assert(a.start == e.start);
+          assert(a.end == e.end);
+          assert(a.matched == e.matched);
+          assert(a.name == e.name);
+        }
+      }
+    };
+
+    auto assert_equivalent = [&](const QueryCase& q) {
+      auto pattern = Pattern::compile(q.pattern, q.pattern_options);
+      auto actual = indexed_searcher.find(pattern, q.search_options);
+      auto expected = reference_searcher.find(pattern, q.search_options);
+      assert_matches_equal(actual, expected);
+      auto actual_files = indexed_searcher.files(pattern, q.search_options);
+      auto expected_files = reference_searcher.files(pattern, q.search_options);
+      assert(actual_files == expected_files);
+      return actual;
+    };
+
+    PatternOptions fixed;
+    fixed.kind = PatternKind::Fixed;
+    PatternOptions fixed_icase = fixed;
+    fixed_icase.case_mode = CaseMode::Insensitive;
+    PatternOptions fixed_word = fixed;
+    fixed_word.word = true;
+    PatternOptions fixed_line = fixed;
+    fixed_line.line = true;
+    fixed_line.crlf = true;
+    PatternOptions regex_line;
+    regex_line.line = true;
+    regex_line.crlf = true;
+    PatternOptions regex_multiline;
+    regex_multiline.multiline = true;
+    PatternOptions pcre2;
+    pcre2.engine = Engine::Pcre2Compat;
+    PatternOptions invalid_options = fixed;
+    invalid_options.unicode = false;
+    PatternOptions invalid_regex_options;
+    invalid_regex_options.unicode = false;
+    PatternOptions nullable;
+    nullable.line = true;
+
+    SearchOptions overlap;
+    overlap.overlapping = true;
+    SearchOptions limited;
+    limited.max_matches = 3;
+    SearchOptions with_files;
+    with_files.files_with_matches = true;
+    SearchOptions without_files;
+    without_files.files_without_match = true;
+    SearchOptions inverted;
+    inverted.invert_match = true;
+    inverted.record_separator = '\n';
+    SearchOptions nul_records;
+    nul_records.include_binary = true;
+    nul_records.record_separator = '\0';
+    SearchOptions nul_files = nul_records;
+    nul_files.files_with_matches = true;
+
+    const std::vector<QueryCase> queries = {
+      // Fixed search: exact, case-folded, word/line constrained, and a literal
+      // that crosses the small index's chunk boundary.
+      {"alpha", fixed, {}},
+      {"alpha", fixed_icase, {}},
+      {"alpha", fixed_word, {}},
+      {"foo", fixed_line, {}},
+      {boundary_token, fixed, {}},
+      {"ana", fixed, overlap},
+      {"needle", fixed, limited},
+      {"needle", fixed, with_files},
+      {"needle", fixed, without_files},
+      {"needle", fixed, inverted},
+
+      // Regular search: alternation ordering, greediness, nullable and
+      // zero-width matches, captures, and multiline/dotall behavior.
+      {"(alpha|beta)", {}, {}},
+      {"(?<word>[A-Za-z]+)-([0-9]+)", {}, {}},
+      {"a+?", {}, {}},
+      {"a*", nullable, limited},
+      {"^", regex_multiline, limited},
+      {"$", regex_multiline, limited},
+      {"^foo$", regex_line, {}},
+      {"^.*$", PatternOptions{.multiline = true, .dotall = true}, limited},
+      {"BOUNDARY_K+_END", {}, {}},
+      {"ana", {}, overlap},
+      {"needle", {}, with_files},
+
+      // Unicode and malformed UTF-8 are both byte-coordinate-sensitive.
+      {R"(\p{Greek}+)", {}, {}},
+      {R"(\w+)", {}, limited},
+      {"世界", fixed, {}},
+      {R"(\xC3+)", invalid_regex_options, {}},
+      {"\xC3\x28", invalid_options, {}},
+
+      // PCRE2-compat lookaround must still use the same candidate-file set.
+      {R"((?<=cat )scat)", pcre2, {}},
+      {R"((?!bad)needle)", pcre2, {}},
+      {R"((?=(ana))ana)", pcre2, overlap},
+
+      // NUL record separators necessarily involve a binary file; include_binary
+      // makes the policy explicit rather than silently dropping that file.
+      {"^needle$", PatternOptions{.multiline = true}, nul_records},
+      {"needle", fixed, nul_records},
+      {"needle", fixed, nul_files},
+    };
+
+    bool saw_captures = false;
+    for (const auto& q : queries) {
+      auto matches = assert_equivalent(q);
+      if (q.pattern.find("(?<word>") != std::string::npos) {
+        assert(!matches.empty());
+        assert(matches.front().captures.size() >= 3);
+        assert(matches.front().captures[1].matched);
+        assert(matches.front().captures[1].name == "word");
+        saw_captures = true;
+      }
+    }
+    assert(saw_captures);
+    auto file_id = [&](std::string_view path) {
+      for (std::uint32_t id = 0; id < indexed_idx.files().size(); ++id) {
+        if (indexed_idx.files()[id].path == path) return id;
+      }
+      assert(false);
+      return std::uint32_t{0};
+    };
+    const auto boundary_id = file_id("boundary.txt");
+    const auto invalid_id = file_id("invalid.bin");
+    const auto binary_id = file_id("binary.bin");
+    const auto records_id = file_id("records.dat");
+
+    auto crossing = assert_equivalent({boundary_token, fixed, {}});
+    assert(crossing.size() == 1);
+    assert(crossing.front().file_id == boundary_id);
+    assert(crossing.front().start == boundary_pos);
+    auto overlapping = assert_equivalent({"ana", fixed, overlap});
+    assert(overlapping.size() == 2);
+    assert(overlapping[0].start < overlapping[1].start);
+    auto malformed = assert_equivalent({"\xC3\x28", invalid_options, {}});
+    assert(malformed.size() == 1);
+    assert(malformed.front().file_id == invalid_id);
+    assert(malformed.front().start == 6 && malformed.front().end == 8);
+    auto nul_match = assert_equivalent({"^needle$", PatternOptions{.multiline = true}, nul_records});
+    assert(nul_match.size() == 1);
+    assert(nul_match.front().file_id == binary_id);
+    assert(nul_match.front().start == 7 && nul_match.front().end == 13);
+
+
+    // The file selector polarity and binary policy are part of the oracle,
+    // including the empty file and the binary file.
+    auto needle = Pattern::compile("needle", fixed);
+    std::vector<std::uint32_t> needle_files = {boundary_id, records_id};
+    std::sort(needle_files.begin(), needle_files.end());
+    assert(indexed_searcher.files(needle) == needle_files);
+    SearchOptions include_binary = with_files;
+    include_binary.include_binary = true;
+    needle_files.push_back(binary_id);
+    std::sort(needle_files.begin(), needle_files.end());
+    assert(indexed_searcher.files(needle, include_binary) == needle_files);
+    SearchOptions exclude_binary = without_files;
+    exclude_binary.include_binary = false;
+    auto excluded = indexed_searcher.files(needle, exclude_binary);
+    assert(std::find(excluded.begin(), excluded.end(), binary_id) == excluded.end());
+  }
+  // Preserve the seeded property corpus for broad workload coverage in
+  // addition to the minimized semantic regression matrix above.
+  {
     std::mt19937 rng(42);
     std::vector<std::string> words = {
       "apple", "banana", "cherry", "date", "elderberry", "fig", "grape",
@@ -409,23 +634,23 @@ int main(){
       "quince", "raspberry", "strawberry", "tangerine", "ugli", "vanilla",
       "watermelon", "xigua", "yam", "zucchini", "Alpha123", "Beta456", "Gamma789"
     };
-    auto random_text = [&](size_t target_size) {
-      std::string res;
-      res.reserve(target_size + 1000);
-      size_t line_len = 0;
-      while (res.size() < target_size) {
-        std::string w = words[rng() % words.size()];
-        res += w;
-        line_len += w.size();
+    auto random_text = [&](std::size_t target_size) {
+      std::string result;
+      result.reserve(target_size + 1000);
+      std::size_t line_len = 0;
+      while (result.size() < target_size) {
+        std::string word = words[rng() % words.size()];
+        result += word;
+        line_len += word.size();
         if (line_len > 70 || (rng() % 10 == 0)) {
-          res += '\n';
+          result += '\n';
           line_len = 0;
         } else {
-          res += ' ';
+          result += ' ';
           line_len += 1;
         }
       }
-      return res;
+      return result;
     };
     std::vector<Document> docs = {
       {"doc0_small.txt", random_text(2000)},
@@ -434,30 +659,32 @@ int main(){
       {"doc3_large.txt", random_text(75000)}
     };
     std::string boundary_lit = "BOUNDARY_TOKEN_CROSSING_" + std::string(140, 'K') + "_END";
-    size_t cross_off = 32768 - 70;
+    const std::size_t cross_off = 32768 - 70;
     docs[2].content.replace(cross_off, boundary_lit.size(), boundary_lit);
     docs[1].content += "\nSPECIAL_REGEX_TARGET_12345_OK\n";
     docs[3].content.replace(1000, 26, "SPECIAL_REGEX_TARGET_67890");
     docs[3].content.replace(35000, 26, "SPECIAL_REGEX_TARGET_99999");
     docs[3].content.replace(68000, 26, "SPECIAL_REGEX_TARGET_00000");
+
     IndexOptions indexed_opt;
     indexed_opt.chunk_bytes = 32768;
     indexed_opt.chunk_overlap = 128;
     indexed_opt.positional_block_bytes = 256;
     auto indexed_idx = Index::from_documents(docs, indexed_opt);
     Searcher indexed_searcher(indexed_idx);
-    IndexOptions ref_opt;
-    ref_opt.chunk_bytes = 1024 * 1024;
-    ref_opt.chunk_overlap = 512 * 1024;
-    ref_opt.positional_block_bytes = 1024;
-    auto ref_idx = Index::from_documents(docs, ref_opt);
-    Searcher ref_searcher(ref_idx);
+    IndexOptions reference_opt;
+    reference_opt.chunk_bytes = 1024 * 1024;
+    reference_opt.chunk_overlap = 512 * 1024;
+    reference_opt.positional_block_bytes = 1024;
+    auto reference_idx = Index::from_documents(docs, reference_opt);
+    Searcher reference_searcher(reference_idx);
+
     struct QueryCase {
       std::string pattern;
-      PatternOptions popt;
-      SearchOptions sopt;
+      PatternOptions pattern_options;
+      SearchOptions search_options;
     };
-    std::vector<QueryCase> test_queries = {
+    const std::vector<QueryCase> queries = {
       {"apple", {.kind = PatternKind::Fixed}, {}},
       {"banana", {.kind = PatternKind::Fixed}, {}},
       {"cherry", {.kind = PatternKind::Fixed}, {}},
@@ -481,19 +708,22 @@ int main(){
       {"apple", {.kind = PatternKind::Fixed}, {.max_matches = 3}},
       {"SPECIAL_REGEX_TARGET_[0-9]+", {}, {.max_matches = 2}}
     };
-    for (const auto& q : test_queries) {
-      auto pat = Pattern::compile(q.pattern, q.popt);
-      auto actual = indexed_searcher.find(pat, q.sopt);
-      auto expected = ref_searcher.find(pat, q.sopt);
+    auto assert_matches_equal = [](const std::vector<Match>& actual,
+                                   const std::vector<Match>& expected) {
       assert(actual.size() == expected.size());
-      for (size_t i = 0; i < expected.size(); ++i) {
+      for (std::size_t i = 0; i < expected.size(); ++i) {
         assert(actual[i].file_id == expected[i].file_id);
         assert(actual[i].start == expected[i].start);
         assert(actual[i].end == expected[i].end);
       }
-      auto actual_files = indexed_searcher.files(pat, q.sopt);
-      auto expected_files = ref_searcher.files(pat, q.sopt);
-      assert(actual_files == expected_files);
+    };
+    for (const auto& q : queries) {
+      auto pattern = Pattern::compile(q.pattern, q.pattern_options);
+      auto actual = indexed_searcher.find(pattern, q.search_options);
+      auto expected = reference_searcher.find(pattern, q.search_options);
+      assert_matches_equal(actual, expected);
+      assert(indexed_searcher.files(pattern, q.search_options) ==
+             reference_searcher.files(pattern, q.search_options));
     }
   }
   // Advanced test suite 1: Nested capturing groups with repetition and backreferences.
@@ -1565,4 +1795,5 @@ int main(){
   }
 
    return 0;
+}
 }
