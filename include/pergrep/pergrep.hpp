@@ -11,7 +11,9 @@
 #include <vector>
 
 namespace pergrep {
-namespace detail { struct IndexData; struct QueryCost; enum class VerifierKind : std::uint8_t; }
+class Pattern;
+struct PlanCandidateMetrics;
+namespace detail { struct IndexData; struct QueryCost; enum class VerifierKind : std::uint8_t; std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern&, const IndexData&, unsigned char record_separator = '\n'); }
 
 enum class PatternKind { Regex, Fixed };
 enum class CaseMode { Sensitive, Insensitive, Smart };
@@ -42,9 +44,10 @@ private:
     std::shared_ptr<const Impl> impl_;
     explicit Pattern(std::shared_ptr<const Impl> impl);
     friend class Searcher;
-    friend detail::QueryCost estimateCost(const Pattern&, const detail::IndexData&);
-    friend detail::VerifierKind chooseVerifier(const Pattern&, const detail::IndexData&);
+    friend detail::QueryCost estimateCost(const Pattern&, const detail::IndexData&, unsigned char);
+    friend detail::VerifierKind chooseVerifier(const Pattern&, const detail::IndexData&, unsigned char);
     friend std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string>>&, const detail::IndexData&);
+    friend std::vector<PlanCandidateMetrics> detail::estimate_all_candidate_plans(const Pattern&, const detail::IndexData&, unsigned char);
 };
 
 struct IndexOptions {
@@ -169,6 +172,9 @@ struct SearchStats {
     // logging in bench/bench.cpp and tests. Values correspond to detail::VerifierKind.
     std::string verifier = {};
     double estimated_selectivity = 0.0;
+    double estimated_cost = 0.0;
+    double plan_regret = 0.0;
+    bool verifier_fallback = false;
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
@@ -184,6 +190,180 @@ inline const char* to_string(VerifierKind k) noexcept {
     }
     return "Unknown";
 }
+
+struct PlanCandidateMetrics {
+    std::string name;
+    VerifierKind verifier = VerifierKind::FixedRareByte;
+    double predicted_cost = 0.0;
+    double predicted_selectivity = 1.0;
+    double actual_cost = 0.0;
+    double actual_time_ms = 0.0;
+    std::uint64_t actual_verified_bytes = 0;
+    std::uint64_t actual_candidate_chunks = 0;
+    std::uint64_t actual_candidate_blocks = 0;
+    bool is_fallback = false;
+    bool chosen = false;
+    bool actual_observed = false;
+};
+
+struct PlanRegret {
+    std::string query_name;
+    std::string chosen_plan;
+    std::string optimal_plan;
+    VerifierKind chosen_verifier = VerifierKind::FixedRareByte;
+    VerifierKind optimal_verifier = VerifierKind::FixedRareByte;
+    double predicted_cost = 0.0;
+    double actual_cost = 0.0;
+    double optimal_actual_cost = 0.0;
+    double absolute_regret = 0.0;
+    double relative_regret = 0.0;
+    double prediction_error = 0.0;
+    bool is_suboptimal = false;
+    bool is_fallback = false;
+    std::size_t rank_inversions = 0;
+    std::vector<PlanCandidateMetrics> candidates;
+};
+
+struct ShadowPlanReport {
+    std::size_t total_queries = 0;
+    std::size_t suboptimal_plan_count = 0;
+    std::size_t fallback_count = 0;
+    double fallback_rate = 0.0;
+    double mean_regret = 0.0;
+    double p50_regret = 0.0;
+    double p95_regret = 0.0;
+    double max_regret = 0.0;
+    double mean_prediction_error = 0.0;
+    double p95_prediction_error = 0.0;
+    double total_excess_cost = 0.0;
+    std::vector<PlanRegret> query_regrets;
+};
+
+enum class GateStatus : std::uint8_t { Pass = 0, Warn = 1, Fail = 2, Rollback = 3 };
+inline const char* to_string(GateStatus status) noexcept {
+    switch (status) {
+        case GateStatus::Pass: return "PASS";
+        case GateStatus::Warn: return "WARN";
+        case GateStatus::Fail: return "FAIL";
+        case GateStatus::Rollback: return "ROLLBACK";
+    }
+    return "UNKNOWN";
+}
+
+enum class WorkloadClassification : std::uint8_t { Win = 0, Neutral = 1, Regression = 2 };
+inline const char* to_string(WorkloadClassification c) noexcept {
+    switch (c) {
+        case WorkloadClassification::Win: return "WIN";
+        case WorkloadClassification::Neutral: return "NEUTRAL";
+        case WorkloadClassification::Regression: return "REGRESSION";
+    }
+    return "UNKNOWN";
+}
+
+struct PerformanceGateThresholds {
+    double max_search_p50_ms = 100.0;
+    double max_search_p95_ms = 300.0;
+    double max_search_ms_per_query = 50.0;
+    double min_throughput_mb_s = 1.0;
+
+    double max_p50_regression_ratio = 1.05;
+    double max_p95_regression_ratio = 1.10;
+    double max_search_time_regression_ratio = 1.08;
+    double max_memory_regression_ratio = 1.15;
+
+    double max_fallback_rate = 0.25;
+    double max_mean_regret_ratio = 0.15;
+    double max_p95_regret_ratio = 0.30;
+    double max_suboptimal_plan_ratio = 0.20;
+
+    double rollback_p50_regression_ratio = 1.15;
+    double rollback_p95_regression_ratio = 1.25;
+    double rollback_fallback_rate = 0.50;
+    double rollback_mean_regret_ratio = 0.40;
+    double rollback_memory_regression_ratio = 1.30;
+
+    bool require_correctness_pass = true;
+
+    static PerformanceGateThresholds default_release_gate() {
+        return PerformanceGateThresholds{};
+    }
+
+    static PerformanceGateThresholds strict_release_gate() {
+        PerformanceGateThresholds t;
+        t.max_search_p50_ms = 50.0;
+        t.max_search_p95_ms = 150.0;
+        t.max_search_ms_per_query = 25.0;
+        t.min_throughput_mb_s = 5.0;
+        t.max_p50_regression_ratio = 1.02;
+        t.max_p95_regression_ratio = 1.05;
+        t.max_search_time_regression_ratio = 1.03;
+        t.max_memory_regression_ratio = 1.10;
+        t.max_fallback_rate = 0.15;
+        t.max_mean_regret_ratio = 0.10;
+        t.max_p95_regret_ratio = 0.20;
+        t.max_suboptimal_plan_ratio = 0.10;
+        t.rollback_p50_regression_ratio = 1.10;
+        t.rollback_p95_regression_ratio = 1.15;
+        t.rollback_fallback_rate = 0.35;
+        t.rollback_mean_regret_ratio = 0.25;
+        return t;
+    }
+};
+
+struct ScenarioGateVerdict {
+    std::string scenario_name;
+    std::string workload_class;
+    GateStatus status = GateStatus::Pass;
+    WorkloadClassification classification = WorkloadClassification::Neutral;
+    double search_time_ms = 0.0;
+    double baseline_search_time_ms = 0.0;
+    double latency_ratio = 1.0;
+    double p50_ms = 0.0;
+    double baseline_p50_ms = 0.0;
+    double p50_ratio = 1.0;
+    double p95_ms = 0.0;
+    double baseline_p95_ms = 0.0;
+    double p95_ratio = 1.0;
+    double fallback_rate = 0.0;
+    double mean_regret = 0.0;
+    double throughput_mb_s = 0.0;
+    double baseline_throughput_mb_s = 0.0;
+    std::uint64_t rss_kb = 0;
+    std::uint64_t baseline_rss_kb = 0;
+    double memory_ratio = 1.0;
+    bool correctness_pass = true;
+    std::vector<std::string> violations;
+    std::vector<std::string> warnings;
+};
+
+struct GateEvaluation {
+    GateStatus overall_status = GateStatus::Pass;
+    bool passed = true;
+    bool rollback_triggered = false;
+    std::vector<std::string> rollback_reasons;
+    std::vector<std::string> failure_reasons;
+    std::vector<std::string> warning_reasons;
+    std::vector<ScenarioGateVerdict> scenario_verdicts;
+    ShadowPlanReport shadow_report;
+    std::size_t wins_count = 0;
+    std::size_t neutral_count = 0;
+    std::size_t regressions_count = 0;
+
+    std::string format_release_report() const;
+};
+
+PlanRegret compute_plan_regret(const PlanCandidateMetrics& chosen,
+                               const std::vector<PlanCandidateMetrics>& candidates,
+                               std::string query_name = "");
+
+ShadowPlanReport evaluate_shadow_plans(const std::vector<PlanRegret>& query_regrets);
+
+GateEvaluation evaluate_performance_gate(
+    const std::vector<ScenarioGateVerdict>& scenario_verdicts,
+    const PerformanceGateThresholds& thresholds = PerformanceGateThresholds::default_release_gate(),
+    const ShadowPlanReport& shadow_report = {});
+
+std::vector<PlanCandidateMetrics> estimate_candidate_plans(const Pattern& pattern, const Index& index, unsigned char record_separator = '\n');
 
 class Searcher {
 public:

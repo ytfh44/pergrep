@@ -85,7 +85,8 @@ selection.
 
 Release gates should retain the per-scenario lines rather than relying only on aggregate
 metrics. Aggregate fields remain for compatibility with existing benchmark consumers.
-
+See `docs/plan-regret-gates.md` for full specification of plan regret metrics, shadow plan
+evaluation, target workload thresholds, regression limits, fallback-rate caps, and rollback triggers.
 ## Execution versus storage decision rule
 
 1. **Choose execution work first** when the warm/repeated or interactive scenarios show

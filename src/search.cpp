@@ -3,8 +3,10 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <numeric>
@@ -16,7 +18,6 @@
 #include <vector>
 #include <unicode/uchar.h>
 #include <unicode/utf8.h>
-
 namespace pergrep {
 using detail::QueryDesc;
 namespace {
@@ -542,7 +543,7 @@ std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string
     // This satisfies QO-4 test: rare literal vs common literal -> picks rare.
     return best;
 }
-detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I) {
+detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
     detail::QueryCost qc;
     const auto total_chunks = I.chunks.size();
     const auto total_blocks = [&]{
@@ -582,20 +583,14 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I) {
         return qc;
     }
     // Regex patterns
-    // is_pure_literal fast path: (multiline || !contains sep) already checked in find(); cost-wise it's FixedRareByte
-    // For cost, treat it as FixedRareByte with literal selectivity
+    // is_pure_literal fast path: (multiline || !contains sep) matches actual find() dispatch to Fixed
     if (p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
-        // Check sep condition for pure literal dispatch eligibility
-        bool sep_in_lit = p.impl_->re.exact_literal.find(char('\n')) != std::string::npos; // record_separator default
-        // Conservative: if not multiline and contains sep, pure literal path is not taken -> treat as regex
+        bool sep_in_lit = p.impl_->re.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
         if (p.impl_->opt.multiline || !sep_in_lit) {
-            double sel = detail::estimate_literal_selectivity(p.impl_->re.exact_literal, I);
-            qc.selectivity = sel;
-            qc.verifier = detail::VerifierKind::FixedRareByte;
-            qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : 0;
-            qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
-            qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
-            return qc;
+            PatternOptions fopt = p.impl_->opt;
+            fopt.kind = PatternKind::Fixed;
+            auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+            return estimateCost(fixed_pat, I, record_separator);
         }
     }
     // Regex with branch_mandatory or mandatory
@@ -633,8 +628,421 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I) {
     qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
     return qc;
 }
-detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I) {
-    return estimateCost(p, I).verifier;
+detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
+    return estimateCost(p, I, record_separator).verifier;
+}
+namespace detail {
+std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
+    std::vector<PlanCandidateMetrics> candidates;
+    const auto total_chunks = I.chunks.size();
+    const auto total_blocks = [&]{
+        size_t n = 0; for (const auto& d : I.pos_desc) n += d.blocks; return n;
+    }();
+
+    auto chosen_cost = estimateCost(p, I, record_separator);
+
+    if (p.is_fixed()) {
+        auto q = std::string_view(p.expression());
+        bool icase = (p.options().case_mode == CaseMode::Insensitive);
+        double sel = detail::estimate_literal_selectivity(q, I);
+        uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
+        if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
+        uint64_t est_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+
+        // Candidate 1: FixedRareByte
+        {
+            PlanCandidateMetrics c;
+            c.name = "FixedRareByte";
+            c.verifier = pergrep::VerifierKind::FixedRareByte;
+            c.predicted_selectivity = sel;
+            c.predicted_cost = double(est_bytes) + 100.0 * double(est_chunks);
+            c.is_fallback = (q.size() > I.opt.chunk_overlap);
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedRareByte);
+            c.actual_observed = false;
+            candidates.push_back(c);
+        }
+
+        // Candidate 2: FixedPositional (if eligible)
+        if (q.size() <= 64 && !icase && !p.options().word && !p.options().line) {
+            PlanCandidateMetrics c;
+            c.name = "FixedPositional";
+            c.verifier = pergrep::VerifierKind::FixedPositional;
+            c.predicted_selectivity = sel;
+            uint64_t est_blocks = static_cast<uint64_t>(sel * double(total_blocks));
+            if (est_blocks == 0 && sel < 1.0 && total_blocks > 0) est_blocks = 1;
+            c.predicted_cost = double(est_bytes) * 0.5 + 50.0 * double(est_blocks) + 10.0 * double(est_chunks);
+            c.is_fallback = false;
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::FixedPositional);
+            c.actual_observed = false;
+            candidates.push_back(c);
+        }
+
+        // Candidate 3: RegexBruteForce (fallback scan)
+        {
+            PlanCandidateMetrics c;
+            c.name = "RegexBruteForce";
+            c.verifier = pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_selectivity = 1.0;
+            c.predicted_cost = double(I.corp_bytes) + 200.0 * double(total_chunks);
+            c.is_fallback = true;
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
+            c.actual_observed = false;
+            candidates.push_back(c);
+        }
+    } else {
+        // Regex patterns
+        if (p.impl_ && p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
+            bool sep_in_lit = p.impl_->re.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
+            if (p.impl_->opt.multiline || !sep_in_lit) {
+                PatternOptions fopt = p.impl_->opt;
+                fopt.kind = PatternKind::Fixed;
+                auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+                return estimate_all_candidate_plans(fixed_pat, I, record_separator);
+            }
+        }
+
+        if (p.impl_ && (!p.impl_->re.branch_mandatory.empty() || !p.impl_->re.mandatory.empty())) {
+            double sel = chosen_cost.selectivity;
+            uint64_t est_chunks = chosen_cost.estimated_candidate_chunks;
+            uint64_t est_bytes = chosen_cost.estimated_verified_bytes;
+            PlanCandidateMetrics c;
+            c.name = "RegexChunk";
+            c.verifier = pergrep::VerifierKind::RegexChunk;
+            c.predicted_selectivity = sel;
+            c.predicted_cost = double(est_bytes) + 200.0 * double(est_chunks);
+            c.is_fallback = false;
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexChunk);
+            c.actual_observed = false;
+            candidates.push_back(c);
+        }
+
+        {
+            PlanCandidateMetrics c;
+            c.name = "RegexBruteForce";
+            c.verifier = pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_selectivity = 1.0;
+            c.predicted_cost = double(I.corp_bytes) + 200.0 * double(total_chunks);
+            c.is_fallback = true;
+            c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
+            c.actual_observed = false;
+            candidates.push_back(c);
+        }
+    }
+    return candidates;
+}
+} // namespace detail
+
+std::vector<PlanCandidateMetrics> estimate_candidate_plans(const Pattern& pattern, const Index& index, unsigned char record_separator) {
+    if (!index.debug_index_data()) return {};
+    const auto& I = *static_cast<const detail::IndexData*>(index.debug_index_data());
+    return detail::estimate_all_candidate_plans(pattern, I, record_separator);
+}
+
+PlanRegret compute_plan_regret(const PlanCandidateMetrics& chosen,
+                               const std::vector<PlanCandidateMetrics>& candidates,
+                               std::string query_name) {
+    PlanRegret regret;
+    regret.query_name = std::move(query_name);
+    regret.chosen_plan = chosen.name;
+    regret.chosen_verifier = chosen.verifier;
+    regret.predicted_cost = chosen.predicted_cost;
+    regret.actual_cost = chosen.actual_cost;
+    regret.is_fallback = chosen.is_fallback;
+    regret.candidates = candidates;
+
+    // The chosen argument is the single observed chosen plan by definition
+    std::vector<const PlanCandidateMetrics*> observed;
+    observed.push_back(&chosen);
+
+    // Collect only other candidates that are observed, excluding the same plan (name + verifier)
+    for (const auto& cand : candidates) {
+        if (cand.name == chosen.name && cand.verifier == chosen.verifier) {
+            continue;
+        }
+        const bool is_obs = cand.actual_observed || (cand.actual_cost > 0.0) ||
+                            (cand.actual_time_ms > 0.0) || (cand.actual_verified_bytes > 0);
+        if (is_obs) {
+            observed.push_back(&cand);
+        }
+    }
+
+    // If fewer than two observed candidates, report zero regret and no rank inversion
+    constexpr double kEpsilon = 1e-9;
+    if (observed.size() < 2) {
+        regret.optimal_plan = chosen.name;
+        regret.optimal_verifier = chosen.verifier;
+        regret.optimal_actual_cost = chosen.actual_cost;
+        regret.absolute_regret = 0.0;
+        regret.relative_regret = 0.0;
+        regret.prediction_error = std::abs(chosen.predicted_cost - chosen.actual_cost) /
+                                  std::max(chosen.actual_cost, kEpsilon);
+        regret.is_suboptimal = false;
+        regret.rank_inversions = 0;
+        return regret;
+    }
+
+    const PlanCandidateMetrics* best = observed[0];
+    for (const auto* cand : observed) {
+        if (cand->actual_cost < best->actual_cost) {
+            best = cand;
+        }
+    }
+
+    regret.optimal_plan = best->name;
+    regret.optimal_verifier = best->verifier;
+    regret.optimal_actual_cost = best->actual_cost;
+    regret.absolute_regret = std::max(0.0, chosen.actual_cost - best->actual_cost);
+    regret.relative_regret = (chosen.actual_cost - best->actual_cost) /
+                             std::max(best->actual_cost, kEpsilon);
+    regret.prediction_error = std::abs(chosen.predicted_cost - chosen.actual_cost) /
+                              std::max(chosen.actual_cost, kEpsilon);
+    regret.is_suboptimal = (regret.absolute_regret > 1e-6);
+
+    std::size_t inversions = 0;
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        for (std::size_t j = i + 1; j < observed.size(); ++j) {
+            const auto* a = observed[i];
+            const auto* b = observed[j];
+            bool pred_a_better = a->predicted_cost < b->predicted_cost;
+            bool act_a_better = a->actual_cost < b->actual_cost;
+            if (pred_a_better != act_a_better &&
+                std::abs(a->predicted_cost - b->predicted_cost) > 1e-6 &&
+                std::abs(a->actual_cost - b->actual_cost) > 1e-6) {
+                ++inversions;
+            }
+        }
+    }
+    regret.rank_inversions = inversions;
+    return regret;
+}
+
+static double internal_percentile(std::vector<double> samples, double p) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    if (samples.size() == 1) return samples[0];
+    const double rank = p * static_cast<double>(samples.size() - 1);
+    const std::size_t lower = static_cast<std::size_t>(std::floor(rank));
+    const std::size_t upper = static_cast<std::size_t>(std::ceil(rank));
+    const double weight = rank - static_cast<double>(lower);
+    if (upper >= samples.size()) return samples.back();
+    return samples[lower] * (1.0 - weight) + samples[upper] * weight;
+}
+
+ShadowPlanReport evaluate_shadow_plans(const std::vector<PlanRegret>& query_regrets) {
+    ShadowPlanReport report;
+    report.total_queries = query_regrets.size();
+    report.query_regrets = query_regrets;
+    if (query_regrets.empty()) return report;
+
+    std::vector<double> regrets;
+    regrets.reserve(query_regrets.size());
+    std::vector<double> errors;
+    errors.reserve(query_regrets.size());
+
+    double sum_regret = 0.0;
+    double sum_error = 0.0;
+    double max_r = 0.0;
+
+    for (const auto& r : query_regrets) {
+        if (r.is_suboptimal) ++report.suboptimal_plan_count;
+        if (r.is_fallback) ++report.fallback_count;
+        sum_regret += r.relative_regret;
+        sum_error += r.prediction_error;
+        report.total_excess_cost += r.absolute_regret;
+        regrets.push_back(r.relative_regret);
+        errors.push_back(r.prediction_error);
+        if (r.relative_regret > max_r) max_r = r.relative_regret;
+    }
+
+    report.fallback_rate = static_cast<double>(report.fallback_count) / static_cast<double>(report.total_queries);
+    report.mean_regret = sum_regret / static_cast<double>(report.total_queries);
+    report.mean_prediction_error = sum_error / static_cast<double>(report.total_queries);
+    report.max_regret = max_r;
+
+    report.p50_regret = internal_percentile(regrets, 0.50);
+    report.p95_regret = internal_percentile(regrets, 0.95);
+    report.p95_prediction_error = internal_percentile(errors, 0.95);
+
+    return report;
+}
+
+GateEvaluation evaluate_performance_gate(
+    const std::vector<ScenarioGateVerdict>& scenario_verdicts,
+    const PerformanceGateThresholds& thresholds,
+    const ShadowPlanReport& shadow_report) {
+    GateEvaluation eval;
+    eval.scenario_verdicts = scenario_verdicts;
+    eval.shadow_report = shadow_report;
+
+    bool has_fail = false;
+    bool has_warn = false;
+    bool has_rollback = false;
+
+    for (const auto& sc : scenario_verdicts) {
+        if (sc.classification == WorkloadClassification::Win) ++eval.wins_count;
+        else if (sc.classification == WorkloadClassification::Neutral) ++eval.neutral_count;
+        else if (sc.classification == WorkloadClassification::Regression) ++eval.regressions_count;
+
+        if (!sc.correctness_pass && thresholds.require_correctness_pass) {
+            has_rollback = true;
+            eval.rollback_reasons.push_back(sc.scenario_name + ": Correctness check failed (require_correctness_pass violated)");
+        }
+
+        if (sc.status == GateStatus::Rollback) {
+            has_rollback = true;
+            for (const auto& v : sc.violations) eval.rollback_reasons.push_back(sc.scenario_name + ": " + v);
+        } else if (sc.status == GateStatus::Fail) {
+            has_fail = true;
+            for (const auto& v : sc.violations) eval.failure_reasons.push_back(sc.scenario_name + ": " + v);
+        } else if (sc.status == GateStatus::Warn) {
+            has_warn = true;
+            for (const auto& w : sc.warnings) eval.warning_reasons.push_back(sc.scenario_name + ": " + w);
+        }
+    }
+
+    // Shadow planner aggregate checks
+    if (shadow_report.total_queries > 0) {
+        const double subopt_ratio = static_cast<double>(shadow_report.suboptimal_plan_count) / static_cast<double>(shadow_report.total_queries);
+        if (subopt_ratio > thresholds.max_suboptimal_plan_ratio) {
+            has_fail = true;
+            eval.failure_reasons.push_back("Shadow evaluation suboptimal plan ratio (" +
+                std::to_string(subopt_ratio * 100.0) + "%) exceeds threshold (" +
+                std::to_string(thresholds.max_suboptimal_plan_ratio * 100.0) + "%)");
+        }
+
+        if (shadow_report.fallback_rate > thresholds.rollback_fallback_rate) {
+            has_rollback = true;
+            eval.rollback_reasons.push_back("Shadow evaluation fallback rate (" +
+                std::to_string(shadow_report.fallback_rate * 100.0) + "%) exceeds rollback limit (" +
+                std::to_string(thresholds.rollback_fallback_rate * 100.0) + "%)");
+        } else if (shadow_report.fallback_rate > thresholds.max_fallback_rate) {
+            has_fail = true;
+            eval.failure_reasons.push_back("Shadow evaluation fallback rate (" +
+                std::to_string(shadow_report.fallback_rate * 100.0) + "%) exceeds threshold (" +
+                std::to_string(thresholds.max_fallback_rate * 100.0) + "%)");
+        }
+
+        if (shadow_report.mean_regret > thresholds.rollback_mean_regret_ratio) {
+            has_rollback = true;
+            eval.rollback_reasons.push_back("Shadow evaluation mean regret (" +
+                std::to_string(shadow_report.mean_regret * 100.0) + "%) exceeds rollback limit (" +
+                std::to_string(thresholds.rollback_mean_regret_ratio * 100.0) + "%)");
+        } else if (shadow_report.mean_regret > thresholds.max_mean_regret_ratio) {
+            has_fail = true;
+            eval.failure_reasons.push_back("Shadow evaluation mean regret (" +
+                std::to_string(shadow_report.mean_regret * 100.0) + "%) exceeds threshold (" +
+                std::to_string(thresholds.max_mean_regret_ratio * 100.0) + "%)");
+        }
+
+        if (shadow_report.p95_regret > thresholds.max_p95_regret_ratio) {
+            has_fail = true;
+            eval.failure_reasons.push_back("Shadow evaluation p95 regret (" +
+                std::to_string(shadow_report.p95_regret * 100.0) + "%) exceeds threshold (" +
+                std::to_string(thresholds.max_p95_regret_ratio * 100.0) + "%)");
+        }
+    }
+    if (has_rollback) {
+        eval.overall_status = GateStatus::Rollback;
+        eval.passed = false;
+        eval.rollback_triggered = true;
+    } else if (has_fail) {
+        eval.overall_status = GateStatus::Fail;
+        eval.passed = false;
+        eval.rollback_triggered = false;
+    } else if (has_warn) {
+        eval.overall_status = GateStatus::Warn;
+        eval.passed = true;
+        eval.rollback_triggered = false;
+    } else {
+        eval.overall_status = GateStatus::Pass;
+        eval.passed = true;
+        eval.rollback_triggered = false;
+    }
+
+    return eval;
+}
+
+std::string GateEvaluation::format_release_report() const {
+    std::string out;
+    out += "# Performance & Plan Regret Release Gate Report\n\n";
+    out += "**Overall Status**: " + std::string(to_string(overall_status)) + "\n";
+    out += "**Gate Passed**: " + std::string(passed ? "YES" : "NO") + "\n";
+    out += "**Rollback Triggered**: " + std::string(rollback_triggered ? "YES" : "NO") + "\n\n";
+
+    out += "## Workload Overview\n";
+    out += "- **Total Scenarios**: " + std::to_string(scenario_verdicts.size()) + "\n";
+    out += "- **Wins**: " + std::to_string(wins_count) + "\n";
+    out += "- **Neutral**: " + std::to_string(neutral_count) + "\n";
+    out += "- **Regressions**: " + std::to_string(regressions_count) + "\n\n";
+
+    out += "## Scenario Breakdown\n\n";
+    out += "| Scenario | Class | Status | Classif | p50 (ms) | p50 Base | Delta p50 | p95 (ms) | p95 Base | Delta p95 | Fallback % | Regret % |\n";
+    out += "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n";
+    for (const auto& sc : scenario_verdicts) {
+        char buf[512];
+        double p50_diff = (sc.p50_ratio - 1.0) * 100.0;
+        double p95_diff = (sc.p95_ratio - 1.0) * 100.0;
+        snprintf(buf, sizeof(buf), "| `%s` | %s | **%s** | %s | %.3f | %.3f | %+.1f%% | %.3f | %.3f | %+.1f%% | %.1f%% | %.1f%% |\n",
+            sc.scenario_name.c_str(),
+            sc.workload_class.c_str(),
+            to_string(sc.status),
+            to_string(sc.classification),
+            sc.p50_ms,
+            sc.baseline_p50_ms,
+            p50_diff,
+            sc.p95_ms,
+            sc.baseline_p95_ms,
+            p95_diff,
+            sc.fallback_rate * 100.0,
+            sc.mean_regret * 100.0
+        );
+        out += buf;
+    }
+    out += "\n";
+
+    if (shadow_report.total_queries > 0) {
+        out += "## Shadow Planner & Plan Regret Summary\n";
+        out += "- **Total Queries Evaluated**: " + std::to_string(shadow_report.total_queries) + "\n";
+        out += "- **Suboptimal Plan Selections**: " + std::to_string(shadow_report.suboptimal_plan_count) + "\n";
+        out += "- **Fallback Invocations**: " + std::to_string(shadow_report.fallback_count) + "\n";
+        char sbuf[256];
+        snprintf(sbuf, sizeof(sbuf), "- **Fallback Rate**: %.2f%%\n- **Mean Relative Regret**: %.2f%%\n- **P50 Relative Regret**: %.2f%%\n- **P95 Relative Regret**: %.2f%%\n- **Max Relative Regret**: %.2f%%\n- **P95 Prediction Error**: %.2f%%\n- **Total Excess Cost**: %.1f\n\n",
+            shadow_report.fallback_rate * 100.0,
+            shadow_report.mean_regret * 100.0,
+            shadow_report.p50_regret * 100.0,
+            shadow_report.p95_regret * 100.0,
+            shadow_report.max_regret * 100.0,
+            shadow_report.p95_prediction_error * 100.0,
+            shadow_report.total_excess_cost
+        );
+        out += sbuf;
+    }
+
+    if (!rollback_reasons.empty()) {
+        out += "## Rollback Triggers Fired\n";
+        for (const auto& r : rollback_reasons) {
+            out += "- **ROLLBACK**: " + r + "\n";
+        }
+        out += "\n";
+    }
+
+    if (!failure_reasons.empty()) {
+        out += "## Gate Failures\n";
+        for (const auto& f : failure_reasons) {
+            out += "- **FAIL**: " + f + "\n";
+        }
+        out += "\n";
+    }
+
+    if (!warning_reasons.empty()) {
+        out += "## Warnings & Advisories\n";
+        for (const auto& w : warning_reasons) {
+            out += "- **WARN**: " + w + "\n";
+        }
+        out += "\n";
+    }
+
+    return out;
 }
 
 Searcher::Searcher(std::shared_ptr<const Index> i) : owned_(std::move(i)), index_(owned_.get()) {}
@@ -653,10 +1061,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     // verifier via SearchStats::verifier and SearchStats::estimated_selectivity for bench/tests.
     // Pure-literal fast path respects (multiline || !contains sep) to avoid false negatives
     // when literal contains record_separator and multiline is off (would miss cross-record matches).
-    auto qc = estimateCost(p, I);
+    auto qc = estimateCost(p, I, opt.record_separator);
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->estimated_selectivity = qc.selectivity;
+        stats->estimated_cost = qc.cost;
     }
     const auto verifier_start = stats ? std::clock() : std::clock_t(0);
     if (opt.invert_match) {
@@ -978,6 +1387,37 @@ done:
                 static_cast<std::uint64_t>((static_cast<long double>(elapsed) * 1000000000.0L) /
                                             static_cast<long double>(CLOCKS_PER_SEC));
         }
+        const bool is_fallback_path = opt.invert_match || (qc.verifier == detail::VerifierKind::RegexBruteForce) ||
+                                      (p.is_fixed() && p.expression().size() > I.opt.chunk_overlap);
+        stats->verifier_fallback = is_fallback_path;
+        auto candidates = detail::estimate_all_candidate_plans(p, I, opt.record_separator);
+        PlanCandidateMetrics chosen;
+        chosen.name = stats->verifier;
+        chosen.verifier = static_cast<VerifierKind>(qc.verifier);
+        chosen.predicted_cost = qc.cost;
+        chosen.predicted_selectivity = qc.selectivity;
+        chosen.actual_cost = double(stats->physically_touched_bytes) + 100.0 * double(stats->candidate_chunks);
+        chosen.actual_time_ms = double(stats->verifier_cpu_ns) / 1000000.0;
+        chosen.actual_verified_bytes = stats->physically_touched_bytes;
+        chosen.actual_candidate_chunks = stats->candidate_chunks;
+        chosen.actual_candidate_blocks = stats->candidate_blocks;
+        chosen.is_fallback = is_fallback_path;
+        chosen.chosen = true;
+        chosen.actual_observed = true;
+
+        for (auto& cand : candidates) {
+            if (cand.verifier == chosen.verifier) {
+                cand.actual_cost = chosen.actual_cost;
+                cand.actual_time_ms = chosen.actual_time_ms;
+                cand.actual_verified_bytes = chosen.actual_verified_bytes;
+                cand.actual_candidate_chunks = chosen.actual_candidate_chunks;
+                cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
+                cand.chosen = true;
+                cand.actual_observed = true;
+            }
+        }
+        auto reg = compute_plan_regret(chosen, candidates, p.expression());
+        stats->plan_regret = reg.relative_regret;
     }
     return out;
 }
