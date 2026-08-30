@@ -228,11 +228,13 @@ namespace pergrep {
 // QO-4 cost model: estimate selectivity via IndexData qgram_freq/byte_freq and
 // chunk pruning rate, then choose cheapest verifier. Keeps existing dispatch
 // but adds explicit cost comments and helper chooseVerifier.
-detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I);
-detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I);
+detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, unsigned char record_separator = '\n');
+detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator = '\n');
 // Internal helper: pick rarest q-gram branch (for tests).
 std::string pick_rarest_branch_literal(const std::vector<std::vector<std::string>>& branches, const detail::IndexData& I);
 namespace detail {
+// M0.7: Candidate plan generator for shadow execution and plan regret analysis.
+std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p, const IndexData& I, unsigned char record_separator);
 double estimate_literal_selectivity(std::string_view lit, const IndexData& I);
 double estimate_branch_selectivity(const std::vector<std::vector<std::string>>& branches, const IndexData& I);
 } // namespace detail

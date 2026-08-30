@@ -405,4 +405,166 @@ inline std::vector<Document> materialize_documents(const WorkloadScenario& scena
     return selected;
 }
 
+// M0.7 Scenario baseline representation for release regression gates.
+struct ScenarioBaseline {
+    std::string scenario_name;
+    double search_time_ms = 0.0;
+    double search_p50_ms = 0.0;
+    double search_p95_ms = 0.0;
+    double throughput_mb_s = 0.0;
+    std::uint64_t rss_kb = 0;
+};
+
+inline std::vector<ScenarioBaseline> default_workload_baselines() {
+    return {
+        {"oneshot.cold.rare-short", 15.0, 1.0, 3.0, 20.0, 16384},
+        {"oneshot.filtered-scope.common-and-alternation", 20.0, 2.0, 5.0, 15.0, 16384},
+        {"oneshot.transformed.crlf", 18.0, 1.5, 4.0, 18.0, 16384},
+        {"oneshot.transformed.nul", 18.0, 1.5, 4.0, 18.0, 16384},
+        {"warm-repeated.medium.rare-long-unicode", 30.0, 0.8, 2.5, 40.0, 32768},
+        {"interactive.large-repository.filtered", 60.0, 1.5, 4.5, 50.0, 65536},
+        {"batch.multi-pattern.mixed", 45.0, 1.2, 3.8, 35.0, 32768},
+        {"filesystem.cold.roundtrip", 25.0, 1.8, 4.5, 12.0, 20480},
+        {"filesystem.warm-repeated.medium", 35.0, 1.0, 3.0, 35.0, 32768},
+    };
+}
+
+inline ScenarioGateVerdict evaluate_scenario_gate(
+    const WorkloadScenario& scenario,
+    double search_time_ms,
+    double p50_ms,
+    double p95_ms,
+    double fallback_rate,
+    double mean_regret,
+    bool correctness_pass,
+    const PerformanceGateThresholds& thresholds,
+    const ScenarioBaseline* baseline = nullptr,
+    double throughput_mb_s = 0.0,
+    std::uint64_t rss_kb = 0) {
+    ScenarioGateVerdict verdict;
+    verdict.scenario_name = scenario.name;
+    verdict.workload_class = to_string(scenario.workload_class);
+    verdict.search_time_ms = search_time_ms;
+    verdict.p50_ms = p50_ms;
+    verdict.p95_ms = p95_ms;
+    verdict.fallback_rate = fallback_rate;
+    verdict.mean_regret = mean_regret;
+    verdict.throughput_mb_s = throughput_mb_s;
+    verdict.rss_kb = rss_kb;
+    verdict.correctness_pass = correctness_pass;
+
+    if (!correctness_pass) {
+        verdict.status = GateStatus::Rollback;
+        verdict.classification = WorkloadClassification::Regression;
+        verdict.violations.push_back("Correctness check failed (search results mismatch vs reference oracle)");
+        return verdict;
+    }
+
+    // Absolute threshold enforcement (always enforced)
+    if (p50_ms > thresholds.max_search_p50_ms) {
+        if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+        verdict.violations.push_back("p50 latency (" + std::to_string(p50_ms) + " ms) exceeds absolute threshold (" +
+            std::to_string(thresholds.max_search_p50_ms) + " ms)");
+    }
+    if (p95_ms > thresholds.max_search_p95_ms) {
+        if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+        verdict.violations.push_back("p95 latency (" + std::to_string(p95_ms) + " ms) exceeds absolute threshold (" +
+            std::to_string(thresholds.max_search_p95_ms) + " ms)");
+    }
+    if (!scenario.queries.empty()) {
+        const double searches_count = double(scenario.queries.size() * std::max<std::size_t>(1, scenario.iterations));
+        const double ms_per_query = search_time_ms / std::max(1.0, searches_count);
+        if (ms_per_query > thresholds.max_search_ms_per_query) {
+            if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+            verdict.violations.push_back("Search time per query (" + std::to_string(ms_per_query) +
+                " ms) exceeds absolute threshold (" + std::to_string(thresholds.max_search_ms_per_query) + " ms)");
+        }
+    }
+    if (throughput_mb_s > 0.0 && throughput_mb_s < thresholds.min_throughput_mb_s) {
+        if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+        verdict.violations.push_back("Throughput (" + std::to_string(throughput_mb_s) +
+            " MB/s) below minimum threshold (" + std::to_string(thresholds.min_throughput_mb_s) + " MB/s)");
+    }
+
+    if (baseline && baseline->search_time_ms > 0.0) {
+        verdict.baseline_search_time_ms = baseline->search_time_ms;
+        verdict.baseline_p50_ms = baseline->search_p50_ms;
+        verdict.baseline_p95_ms = baseline->search_p95_ms;
+        verdict.baseline_throughput_mb_s = baseline->throughput_mb_s;
+        verdict.baseline_rss_kb = baseline->rss_kb;
+
+        verdict.latency_ratio = search_time_ms / std::max(1e-9, baseline->search_time_ms);
+        verdict.p50_ratio = (baseline->search_p50_ms > 0.0) ? (p50_ms / baseline->search_p50_ms) : 1.0;
+        verdict.p95_ratio = (baseline->search_p95_ms > 0.0) ? (p95_ms / baseline->search_p95_ms) : 1.0;
+        if (baseline->rss_kb > 0 && rss_kb > 0) {
+            verdict.memory_ratio = double(rss_kb) / double(baseline->rss_kb);
+            if (verdict.memory_ratio > thresholds.rollback_memory_regression_ratio) {
+                verdict.status = GateStatus::Rollback;
+                verdict.violations.push_back("Memory RSS ratio (" + std::to_string(verdict.memory_ratio) +
+                    ") exceeds rollback threshold (" + std::to_string(thresholds.rollback_memory_regression_ratio) + ")");
+            } else if (verdict.memory_ratio > thresholds.max_memory_regression_ratio) {
+                if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+                verdict.violations.push_back("Memory RSS ratio (" + std::to_string(verdict.memory_ratio) +
+                    ") exceeds regression threshold (" + std::to_string(thresholds.max_memory_regression_ratio) + ")");
+            }
+        }
+
+        // Classify
+        if (verdict.p95_ratio < 0.95 && verdict.p50_ratio < 0.95) {
+            verdict.classification = WorkloadClassification::Win;
+        } else if (verdict.p95_ratio > 1.05 || verdict.p50_ratio > 1.05) {
+            verdict.classification = WorkloadClassification::Regression;
+        } else {
+            verdict.classification = WorkloadClassification::Neutral;
+        }
+
+        // Check rollback triggers
+        if (verdict.p95_ratio > thresholds.rollback_p95_regression_ratio) {
+            verdict.status = GateStatus::Rollback;
+            verdict.violations.push_back("p95 latency ratio (" + std::to_string(verdict.p95_ratio) +
+                ") exceeds rollback threshold (" + std::to_string(thresholds.rollback_p95_regression_ratio) + ")");
+        } else if (verdict.p50_ratio > thresholds.rollback_p50_regression_ratio) {
+            verdict.status = GateStatus::Rollback;
+            verdict.violations.push_back("p50 latency ratio (" + std::to_string(verdict.p50_ratio) +
+                ") exceeds rollback threshold (" + std::to_string(thresholds.rollback_p50_regression_ratio) + ")");
+        } else if (verdict.p95_ratio > thresholds.max_p95_regression_ratio) {
+            if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+            verdict.violations.push_back("p95 latency ratio (" + std::to_string(verdict.p95_ratio) +
+                ") exceeds regression threshold (" + std::to_string(thresholds.max_p95_regression_ratio) + ")");
+        } else if (verdict.p50_ratio > thresholds.max_p50_regression_ratio) {
+            if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+            verdict.violations.push_back("p50 latency ratio (" + std::to_string(verdict.p50_ratio) +
+                ") exceeds regression threshold (" + std::to_string(thresholds.max_p50_regression_ratio) + ")");
+        } else if (verdict.latency_ratio > thresholds.max_search_time_regression_ratio) {
+            if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+            verdict.violations.push_back("Total search time ratio (" + std::to_string(verdict.latency_ratio) +
+                ") exceeds regression threshold (" + std::to_string(thresholds.max_search_time_regression_ratio) + ")");
+        }
+    }
+
+    // Fallback rate checks
+    if (fallback_rate > thresholds.rollback_fallback_rate) {
+        verdict.status = GateStatus::Rollback;
+        verdict.violations.push_back("Fallback rate (" + std::to_string(fallback_rate * 100.0) +
+            "%) exceeds rollback threshold (" + std::to_string(thresholds.rollback_fallback_rate * 100.0) + "%)");
+    } else if (fallback_rate > thresholds.max_fallback_rate) {
+        if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+        verdict.violations.push_back("Fallback rate (" + std::to_string(fallback_rate * 100.0) +
+            "%) exceeds threshold (" + std::to_string(thresholds.max_fallback_rate * 100.0) + "%)");
+    }
+
+    // Mean regret checks
+    if (mean_regret > thresholds.rollback_mean_regret_ratio) {
+        verdict.status = GateStatus::Rollback;
+        verdict.violations.push_back("Mean relative plan regret (" + std::to_string(mean_regret * 100.0) +
+            "%) exceeds rollback threshold (" + std::to_string(thresholds.rollback_mean_regret_ratio * 100.0) + "%)");
+    } else if (mean_regret > thresholds.max_mean_regret_ratio) {
+        if (verdict.status != GateStatus::Rollback) verdict.status = GateStatus::Fail;
+        verdict.violations.push_back("Mean relative plan regret (" + std::to_string(mean_regret * 100.0) +
+            "%) exceeds threshold (" + std::to_string(thresholds.max_mean_regret_ratio * 100.0) + "%)");
+    }
+
+    return verdict;
+}
+
 } // namespace pergrep::benchmark

@@ -13,8 +13,11 @@
 #if __has_include("../src/internal.hpp")
 #include "../src/internal.hpp"
 #endif
+#if __has_include("../bench/workload_matrix.hpp")
+#include "../bench/workload_matrix.hpp"
+#endif
 using namespace pergrep;
-
+using namespace pergrep::benchmark;
 static Index corpus(std::string s){ return Index::from_documents({{"a.txt",std::move(s)}}); }
 static bool throws_compile(std::string p, PatternOptions o={}){try{(void)Pattern::compile(std::move(p),o);return false;}catch(...){return true;}}
 
@@ -1841,6 +1844,455 @@ int main(){
     std::cerr << "QO-5 done\n" << std::flush;
   }
 
-   return 0;
-}
+  // M0.7: Plan-regret metrics, shadow plan evaluation, and performance regression gates
+  {
+    std::cerr << "M0.7 plan-regret and gates\n" << std::flush;
+
+    // 1. Candidate plan estimation
+    {
+      auto idx = Index::from_documents({
+          {"a.txt", "function return int double RARE_TOKEN_X9 error warning\n"},
+          {"b.txt", "class struct template typename public private\n"}
+      });
+      auto p_fixed = Pattern::compile("RARE_TOKEN_X9", {.kind = PatternKind::Fixed});
+      auto candidates_fixed = estimate_candidate_plans(p_fixed, idx);
+      assert(!candidates_fixed.empty());
+      bool has_chosen = false;
+      bool has_positional = false;
+      bool has_fallback = false;
+      for (const auto& c : candidates_fixed) {
+        if (c.chosen) has_chosen = true;
+        if (c.verifier == VerifierKind::FixedPositional) has_positional = true;
+        if (c.is_fallback) has_fallback = true;
+        assert(c.predicted_cost > 0.0);
+      }
+      assert(has_chosen);
+      assert(has_positional);
+      assert(has_fallback);
+      if (idx.debug_index_data()) {
+        const auto& raw_I = *static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data());
+        auto direct_cands = pergrep::detail::estimate_all_candidate_plans(p_fixed, raw_I);
+        assert(!direct_cands.empty());
+      }
+
+      auto p_regex = Pattern::compile("RARE_TOKEN_X[0-9]");
+      auto candidates_regex = estimate_candidate_plans(p_regex, idx);
+      assert(!candidates_regex.empty());
+      bool has_regex_chunk = false;
+      for (const auto& c : candidates_regex) {
+        if (c.verifier == VerifierKind::RegexChunk) has_regex_chunk = true;
+      }
+      assert(has_regex_chunk);
+
+      // Unanchored regex fallback
+      auto p_unanchored = Pattern::compile(".*");
+      auto candidates_unanchored = estimate_candidate_plans(p_unanchored, idx);
+      assert(!candidates_unanchored.empty());
+      for (const auto& c : candidates_unanchored) {
+        if (c.chosen) {
+          assert(c.is_fallback);
+          assert(c.verifier == VerifierKind::RegexBruteForce);
+        }
+      }
+    }
+
+    // 2. Plan regret mathematical calculations
+    {
+      // Case A: Chosen plan is optimal (both candidates observed)
+      PlanCandidateMetrics cand_opt;
+      cand_opt.name = "FixedPositional";
+      cand_opt.verifier = VerifierKind::FixedPositional;
+      cand_opt.predicted_cost = 100.0;
+      cand_opt.actual_cost = 105.0;
+      cand_opt.actual_observed = true;
+      cand_opt.chosen = true;
+
+      PlanCandidateMetrics cand_other;
+      cand_other.name = "FixedRareByte";
+      cand_other.verifier = VerifierKind::FixedRareByte;
+      cand_other.predicted_cost = 150.0;
+      cand_other.actual_cost = 160.0;
+      cand_other.actual_observed = true;
+      cand_other.chosen = false;
+
+      auto reg_opt = compute_plan_regret(cand_opt, {cand_opt, cand_other}, "q_optimal");
+      assert(!reg_opt.is_suboptimal);
+      assert(reg_opt.absolute_regret == 0.0);
+      assert(reg_opt.relative_regret == 0.0);
+      assert(reg_opt.optimal_plan == "FixedPositional");
+      assert(reg_opt.rank_inversions == 0);
+      assert(std::abs(reg_opt.prediction_error - (5.0 / 105.0)) < 1e-6);
+
+      // Case B: Chosen plan is suboptimal (both candidates observed)
+      PlanCandidateMetrics cand_sub;
+      cand_sub.name = "FixedRareByte";
+      cand_sub.verifier = VerifierKind::FixedRareByte;
+      cand_sub.predicted_cost = 120.0;
+      cand_sub.actual_cost = 200.0;
+      cand_sub.actual_observed = true;
+      cand_sub.chosen = true;
+
+      PlanCandidateMetrics cand_better;
+      cand_better.name = "FixedPositional";
+      cand_better.verifier = VerifierKind::FixedPositional;
+      cand_better.predicted_cost = 130.0;
+      cand_better.actual_cost = 100.0;
+      cand_better.actual_observed = true;
+      cand_better.chosen = false;
+
+      auto reg_sub = compute_plan_regret(cand_sub, {cand_sub, cand_better}, "q_suboptimal");
+      assert(reg_sub.is_suboptimal);
+      assert(reg_sub.absolute_regret == 100.0);
+      assert(reg_sub.relative_regret == 1.0); // (200 - 100) / 100 = 1.0 (100% regret)
+      assert(reg_sub.optimal_plan == "FixedPositional");
+      assert(reg_sub.rank_inversions == 1); // predicted sub < better, but actual sub > better
+
+      // Case C: Unobserved candidate alternatives must produce zero regret and no rank inversion
+      PlanCandidateMetrics cand_single_obs;
+      cand_single_obs.name = "FixedPositional";
+      cand_single_obs.verifier = VerifierKind::FixedPositional;
+      cand_single_obs.predicted_cost = 100.0;
+      cand_single_obs.actual_cost = 150.0;
+      cand_single_obs.actual_observed = true;
+      cand_single_obs.chosen = true;
+
+      PlanCandidateMetrics cand_unobs;
+      cand_unobs.name = "FixedRareByte";
+      cand_unobs.verifier = VerifierKind::FixedRareByte;
+      cand_unobs.predicted_cost = 80.0;
+      cand_unobs.actual_cost = 0.0;
+      cand_unobs.actual_observed = false;
+      cand_unobs.chosen = false;
+
+      auto reg_unobs = compute_plan_regret(cand_single_obs, {cand_single_obs, cand_unobs}, "q_unobs");
+      assert(!reg_unobs.is_suboptimal);
+      assert(reg_unobs.absolute_regret == 0.0);
+      assert(reg_unobs.relative_regret == 0.0);
+      assert(reg_unobs.optimal_plan == "FixedPositional");
+      assert(reg_unobs.rank_inversions == 0);
+
+      // Case D: Zero-cost boundary test with epsilon denominator
+      PlanCandidateMetrics cand_zero_chosen;
+      cand_zero_chosen.name = "FixedRareByte";
+      cand_zero_chosen.verifier = VerifierKind::FixedRareByte;
+      cand_zero_chosen.predicted_cost = 50.0;
+      cand_zero_chosen.actual_cost = 0.0;
+      cand_zero_chosen.actual_observed = true;
+      cand_zero_chosen.chosen = true;
+
+      PlanCandidateMetrics cand_zero_best;
+      cand_zero_best.name = "FixedPositional";
+      cand_zero_best.verifier = VerifierKind::FixedPositional;
+      cand_zero_best.predicted_cost = 20.0;
+      cand_zero_best.actual_cost = 0.0;
+      cand_zero_best.actual_observed = true;
+      cand_zero_best.chosen = false;
+
+      auto reg_zero = compute_plan_regret(cand_zero_chosen, {cand_zero_chosen, cand_zero_best}, "q_zero");
+      assert(reg_zero.absolute_regret == 0.0);
+      assert(reg_zero.relative_regret == 0.0);
+      assert(!std::isnan(reg_zero.relative_regret) && !std::isinf(reg_zero.relative_regret));
+      assert(!std::isnan(reg_zero.prediction_error) && !std::isinf(reg_zero.prediction_error));
+      assert(std::abs(reg_zero.prediction_error - (50.0 / 1e-9)) < 1e-3);
+
+      // Case E: Unobserved candidate with same name as chosen does not produce false regret
+      PlanCandidateMetrics cand_chosen_named;
+      cand_chosen_named.name = "FixedRareByte";
+      cand_chosen_named.verifier = VerifierKind::FixedRareByte;
+      cand_chosen_named.predicted_cost = 100.0;
+      cand_chosen_named.actual_cost = 200.0;
+      cand_chosen_named.actual_observed = true;
+      cand_chosen_named.chosen = true;
+
+      PlanCandidateMetrics cand_unobs_same_name;
+      cand_unobs_same_name.name = "FixedRareByte";
+      cand_unobs_same_name.verifier = VerifierKind::FixedRareByte;
+      cand_unobs_same_name.predicted_cost = 100.0;
+      cand_unobs_same_name.actual_cost = 0.0;
+      cand_unobs_same_name.actual_observed = false;
+      cand_unobs_same_name.chosen = false;
+
+      PlanCandidateMetrics cand_unobs_diff_name;
+      cand_unobs_diff_name.name = "FixedPositional";
+      cand_unobs_diff_name.verifier = VerifierKind::FixedPositional;
+      cand_unobs_diff_name.predicted_cost = 80.0;
+      cand_unobs_diff_name.actual_cost = 0.0;
+      cand_unobs_diff_name.actual_observed = false;
+      cand_unobs_diff_name.chosen = false;
+
+      auto reg_same_name = compute_plan_regret(cand_chosen_named, {cand_unobs_same_name, cand_unobs_diff_name}, "q_same");
+      assert(!reg_same_name.is_suboptimal);
+      assert(reg_same_name.absolute_regret == 0.0);
+      assert(reg_same_name.relative_regret == 0.0);
+      assert(reg_same_name.optimal_plan == "FixedRareByte");
+      assert(reg_same_name.rank_inversions == 0);
+    }
+
+    // 3. Shadow plan evaluation aggregation
+    {
+      PlanRegret r1;
+      r1.query_name = "q1";
+      r1.is_suboptimal = false;
+      r1.is_fallback = false;
+      r1.absolute_regret = 0.0;
+      r1.relative_regret = 0.0;
+      r1.prediction_error = 0.05;
+
+      PlanRegret r2;
+      r2.query_name = "q2";
+      r2.is_suboptimal = true;
+      r2.is_fallback = false;
+      r2.absolute_regret = 10.0;
+      r2.relative_regret = 0.10;
+      r2.prediction_error = 0.08;
+
+      PlanRegret r3;
+      r3.query_name = "q3";
+      r3.is_suboptimal = true;
+      r3.is_fallback = true;
+      r3.absolute_regret = 30.0;
+      r3.relative_regret = 0.20;
+      r3.prediction_error = 0.12;
+
+      PlanRegret r4;
+      r4.query_name = "q4";
+      r4.is_suboptimal = true;
+      r4.is_fallback = true;
+      r4.absolute_regret = 50.0;
+      r4.relative_regret = 0.50;
+      r4.prediction_error = 0.25;
+
+      auto report = evaluate_shadow_plans({r1, r2, r3, r4});
+      assert(report.total_queries == 4);
+      assert(report.suboptimal_plan_count == 3);
+      assert(report.fallback_count == 2);
+      assert(std::abs(report.fallback_rate - 0.50) < 1e-6);
+      assert(std::abs(report.mean_regret - 0.20) < 1e-6);
+      assert(report.max_regret == 0.50);
+      assert(report.total_excess_cost == 90.0);
+      assert(report.p50_regret >= 0.0 && report.p50_regret <= 0.50);
+      assert(report.p95_regret >= report.p50_regret);
+    }
+
+    // 4. Performance gate scenarios and classification
+    {
+      PerformanceGateThresholds thresholds;
+      WorkloadScenario sc;
+      sc.name = "test.scenario.oneshot";
+      sc.workload_class = WorkloadClass::OneShot;
+
+      ScenarioBaseline base;
+      base.scenario_name = sc.name;
+      base.search_time_ms = 100.0;
+      base.search_p50_ms = 10.0;
+      base.search_p95_ms = 20.0;
+      base.rss_kb = 16384;
+
+      // A. Win case (speedup > 5%)
+      auto v_win = benchmark::evaluate_scenario_gate(
+          sc, 80.0, 8.0, 16.0, 0.0, 0.0, true, thresholds, &base, 25.0, 16384);
+      assert(v_win.status == GateStatus::Pass);
+      assert(v_win.classification == WorkloadClassification::Win);
+      assert(v_win.violations.empty());
+
+      // B. Neutral case (+1% variance)
+      auto v_neutral = benchmark::evaluate_scenario_gate(
+          sc, 101.0, 10.1, 20.2, 0.0, 0.02, true, thresholds, &base, 20.0, 16384);
+      assert(v_neutral.status == GateStatus::Pass);
+      assert(v_neutral.classification == WorkloadClassification::Neutral);
+
+      // C. Regression failure (p50 +8% > max 5%)
+      auto v_reg = benchmark::evaluate_scenario_gate(
+          sc, 108.0, 10.8, 20.5, 0.0, 0.05, true, thresholds, &base);
+      assert(v_reg.status == GateStatus::Fail);
+      assert(v_reg.classification == WorkloadClassification::Regression);
+      assert(!v_reg.violations.empty());
+
+      // D. Rollback trigger on correctness failure
+      auto v_corr_fail = benchmark::evaluate_scenario_gate(
+          sc, 80.0, 8.0, 16.0, 0.0, 0.0, false, thresholds, &base);
+      assert(v_corr_fail.status == GateStatus::Rollback);
+      assert(!v_corr_fail.violations.empty());
+
+      // E. Rollback trigger on critical p95 regression (> 25%)
+      auto v_crit_p95 = benchmark::evaluate_scenario_gate(
+          sc, 130.0, 11.0, 26.0, 0.0, 0.0, true, thresholds, &base); // 26/20 = 1.30 > 1.25
+      assert(v_crit_p95.status == GateStatus::Rollback);
+
+      // F. Rollback trigger on excessive fallback rate (> 50%)
+      auto v_crit_fb = benchmark::evaluate_scenario_gate(
+          sc, 100.0, 10.0, 20.0, 0.60, 0.0, true, thresholds, &base);
+      assert(v_crit_fb.status == GateStatus::Rollback);
+
+      // G. Rollback trigger on excessive plan regret (> 40%)
+      auto v_crit_reg = benchmark::evaluate_scenario_gate(
+          sc, 100.0, 10.0, 20.0, 0.0, 0.45, true, thresholds, &base);
+      assert(v_crit_reg.status == GateStatus::Rollback);
+
+      // H. Absolute threshold failures without baseline
+      auto v_abs_p50 = benchmark::evaluate_scenario_gate(
+          sc, 150.0, 150.0, 200.0, 0.0, 0.0, true, thresholds, nullptr);
+      assert(v_abs_p50.status == GateStatus::Fail);
+
+      auto v_abs_tp = benchmark::evaluate_scenario_gate(
+          sc, 50.0, 20.0, 40.0, 0.0, 0.0, true, thresholds, nullptr, 0.5); // < min 1.0 MB/s
+      assert(v_abs_tp.status == GateStatus::Fail);
+
+      // I. Memory RSS regression and rollback
+      auto v_mem_reg = benchmark::evaluate_scenario_gate(
+          sc, 90.0, 9.0, 18.0, 0.0, 0.0, true, thresholds, &base, 20.0, 20000); // 20000/16384 = 1.22 > 1.15
+      assert(v_mem_reg.status == GateStatus::Fail);
+
+      auto v_mem_rb = benchmark::evaluate_scenario_gate(
+          sc, 90.0, 9.0, 18.0, 0.0, 0.0, true, thresholds, &base, 20.0, 25000); // 25000/16384 = 1.52 > 1.30
+      assert(v_mem_rb.status == GateStatus::Rollback);
+    }
+
+    // 5. Overall gate evaluation and release report formatting
+    {
+      PerformanceGateThresholds thresholds;
+      ScenarioGateVerdict v1;
+      v1.scenario_name = "oneshot.cold.rare-short";
+      v1.workload_class = "one-shot";
+      v1.status = GateStatus::Pass;
+      v1.classification = WorkloadClassification::Win;
+      v1.search_time_ms = 12.0;
+      v1.baseline_search_time_ms = 15.0;
+      v1.latency_ratio = 0.80;
+      v1.p50_ms = 0.8;
+      v1.baseline_p50_ms = 1.0;
+      v1.p50_ratio = 0.80;
+      v1.p95_ms = 2.4;
+      v1.baseline_p95_ms = 3.0;
+      v1.p95_ratio = 0.80;
+      v1.fallback_rate = 0.0;
+      v1.mean_regret = 0.0;
+      v1.correctness_pass = true;
+
+      ScenarioGateVerdict v2;
+      v2.scenario_name = "warm-repeated.medium.rare-long";
+      v2.workload_class = "warm-repeated";
+      v2.status = GateStatus::Pass;
+      v2.classification = WorkloadClassification::Neutral;
+      v2.search_time_ms = 30.0;
+      v2.baseline_search_time_ms = 30.0;
+      v2.latency_ratio = 1.00;
+      v2.p50_ms = 0.8;
+      v2.baseline_p50_ms = 0.8;
+      v2.p50_ratio = 1.00;
+      v2.p95_ms = 2.5;
+      v2.baseline_p95_ms = 2.5;
+      v2.p95_ratio = 1.00;
+      v2.fallback_rate = 0.0;
+      v2.mean_regret = 0.01;
+      v2.correctness_pass = true;
+
+      ShadowPlanReport shadow;
+      shadow.total_queries = 10;
+      shadow.suboptimal_plan_count = 1;
+      shadow.fallback_count = 0;
+      shadow.fallback_rate = 0.0;
+      shadow.mean_regret = 0.005;
+      shadow.p50_regret = 0.0;
+      shadow.p95_regret = 0.02;
+      shadow.max_regret = 0.03;
+      shadow.p95_prediction_error = 0.04;
+      shadow.total_excess_cost = 5.0;
+
+      auto gate_eval = evaluate_performance_gate({v1, v2}, thresholds, shadow);
+      assert(gate_eval.overall_status == GateStatus::Pass);
+      assert(gate_eval.passed == true);
+      assert(gate_eval.rollback_triggered == false);
+      assert(gate_eval.wins_count == 1);
+      assert(gate_eval.neutral_count == 1);
+      assert(gate_eval.regressions_count == 0);
+
+      // Correctness failure triggers rollback in evaluate_performance_gate
+      auto v_bad_corr = v1;
+      v_bad_corr.correctness_pass = false;
+      auto gate_eval_corr = evaluate_performance_gate({v_bad_corr, v2}, thresholds, shadow);
+      assert(gate_eval_corr.overall_status == GateStatus::Rollback);
+      assert(!gate_eval_corr.passed);
+      assert(gate_eval_corr.rollback_triggered);
+
+      // High suboptimal plan ratio triggers FAIL
+      auto shadow_subopt = shadow;
+      shadow_subopt.suboptimal_plan_count = 5; // 5/10 = 50% > max 20%
+      auto gate_eval_subopt = evaluate_performance_gate({v1, v2}, thresholds, shadow_subopt);
+      assert(gate_eval_subopt.overall_status == GateStatus::Fail);
+      assert(!gate_eval_subopt.passed);
+
+      // High p95 regret triggers FAIL (not WARN)
+      auto shadow_high_regret = shadow;
+      shadow_high_regret.p95_regret = 0.35; // 35% > max 30%
+      auto gate_eval_regret = evaluate_performance_gate({v1, v2}, thresholds, shadow_high_regret);
+      assert(gate_eval_regret.overall_status == GateStatus::Fail);
+      assert(!gate_eval_regret.passed);
+
+      std::string report_text = gate_eval.format_release_report();
+      assert(!report_text.empty());
+      assert(report_text.find("# Performance & Plan Regret Release Gate Report") != std::string::npos);
+      assert(report_text.find("Overall Status**: PASS") != std::string::npos);
+      assert(report_text.find("oneshot.cold.rare-short") != std::string::npos);
+      assert(report_text.find("Shadow Planner & Plan Regret Summary") != std::string::npos);
+    }
+
+    // 6. Search parity and SearchStats regret populating
+    {
+      auto idx = Index::from_documents({
+          {"doc1.txt", "abc 123 rare_target_str xyz\nline2 test\n"},
+          {"doc2.txt", "some other contents without match\n"}
+      });
+      Searcher s(idx);
+      auto pat = Pattern::compile("rare_target_str", {.kind = PatternKind::Fixed});
+
+      auto m_nostats = s.find(pat);
+      SearchStats stats{};
+      auto m_stats = s.find(pat, {}, &stats);
+
+      assert(m_nostats.size() == m_stats.size());
+      assert(m_stats.size() == 1);
+      assert(m_stats[0].file_id == m_nostats[0].file_id);
+      assert(m_stats[0].start == m_nostats[0].start);
+      assert(m_stats[0].end == m_nostats[0].end);
+      assert(!stats.verifier.empty());
+      assert(stats.estimated_cost >= 0.0);
+      assert(stats.plan_regret >= 0.0);
+      assert(!stats.verifier_fallback);
+
+      // Invert match fallback
+      SearchStats inv_stats{};
+      s.find(pat, {.invert_match = true}, &inv_stats);
+      assert(inv_stats.verifier_fallback);
+
+      // Unanchored regex fallback
+      auto unanchored_pat = Pattern::compile(".*");
+      SearchStats re_stats{};
+      s.find(unanchored_pat, {}, &re_stats);
+      assert(re_stats.verifier_fallback);
+
+      // NUL record separator pure-literal candidate/verifier parity test
+      std::string nul_content = "prefix\nwith_newline_inside_record\0tail\n";
+      auto idx_nul = Index::from_documents({{"nul.txt", nul_content}});
+      Searcher s_nul(idx_nul);
+      auto pat_nl = Pattern::compile("with_newline_inside_record");
+      auto cands_nul_sep = estimate_candidate_plans(pat_nl, idx_nul, '\0');
+      SearchStats stats_nul_sep{};
+      s_nul.find(pat_nl, {.include_binary = true, .record_separator = '\0'}, &stats_nul_sep);
+      assert(stats_nul_sep.verifier == "FixedPositional");
+      assert(!stats_nul_sep.verifier_fallback);
+      bool has_chosen_matched = false;
+      for (const auto& c : cands_nul_sep) {
+        if (c.chosen && to_string(c.verifier) == stats_nul_sep.verifier) {
+          has_chosen_matched = true;
+        }
+      }
+      assert(has_chosen_matched);
+    }
+
+    std::cerr << "M0.7 done\n" << std::flush;
+  }
+  }
+
+  return 0;
 }
