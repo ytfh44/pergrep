@@ -516,6 +516,108 @@ static double estimate_branch_selectivity_impl(const std::vector<std::vector<std
 }
 
 } // namespace
+// M1.3 PlanKey implementation
+namespace {
+inline uint64_t fnv_mix(uint64_t h, uint64_t v) noexcept {
+    h ^= v;
+    h *= 1099511628211ULL;
+    return h;
+}
+inline uint64_t fnv_mix_str(uint64_t h, std::string_view s) noexcept {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    h ^= 0xFF; h *= 1099511628211ULL;
+    return h;
+}
+inline uint64_t double_bits(double d) noexcept {
+    uint64_t u = 0; std::memcpy(&u, &d, sizeof(u)); return u;
+}
+} // namespace
+bool PlanKey::operator==(const PlanKey& o) const noexcept {
+    if (pattern_expression != o.pattern_expression) return false;
+    if (pattern_options.kind != o.pattern_options.kind) return false;
+    if (pattern_options.case_mode != o.pattern_options.case_mode) return false;
+    if (pattern_options.engine != o.pattern_options.engine) return false;
+    if (pattern_options.word != o.pattern_options.word) return false;
+    if (pattern_options.line != o.pattern_options.line) return false;
+    if (pattern_options.multiline != o.pattern_options.multiline) return false;
+    if (pattern_options.dotall != o.pattern_options.dotall) return false;
+    if (pattern_options.unicode != o.pattern_options.unicode) return false;
+    if (pattern_options.crlf != o.pattern_options.crlf) return false;
+    if (overlapping != o.overlapping) return false;
+    if (invert_match != o.invert_match) return false;
+    if (files_with_matches != o.files_with_matches) return false;
+    if (files_without_match != o.files_without_match) return false;
+    if (include_binary != o.include_binary) return false;
+    if (max_matches != o.max_matches) return false;
+    if (record_separator != o.record_separator) return false;
+    if (eligible_file_ids != o.eligible_file_ids) return false;
+    if (index_options.chunk_bytes != o.index_options.chunk_bytes) return false;
+    if (index_options.chunk_overlap != o.index_options.chunk_overlap) return false;
+    if (index_options.positional_block_bytes != o.index_options.positional_block_bytes) return false;
+    if (double_bits(index_options.positional_budget_ratio) != double_bits(o.index_options.positional_budget_ratio)) return false;
+    if (index_options.planned_qgrams != o.index_options.planned_qgrams) return false;
+    if (index_options.include_hidden != o.index_options.include_hidden) return false;
+    if (index_options.follow_symlinks != o.index_options.follow_symlinks) return false;
+    if (index_options.persist_corpus != o.index_options.persist_corpus) return false;
+    if (transformed_input_identity != o.transformed_input_identity) return false;
+    return true;
+}
+std::uint64_t PlanKey::hash() const noexcept {
+    uint64_t h = 14695981039346656037ULL;
+    h = fnv_mix_str(h, pattern_expression);
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.kind));
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.case_mode));
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.engine));
+    h = fnv_mix(h, pattern_options.word ? 1 : 0);
+    h = fnv_mix(h, pattern_options.line ? 1 : 0);
+    h = fnv_mix(h, pattern_options.multiline ? 1 : 0);
+    h = fnv_mix(h, pattern_options.dotall ? 1 : 0);
+    h = fnv_mix(h, pattern_options.unicode ? 1 : 0);
+    h = fnv_mix(h, pattern_options.crlf ? 1 : 0);
+    h = fnv_mix(h, overlapping ? 1 : 0);
+    h = fnv_mix(h, invert_match ? 1 : 0);
+    h = fnv_mix(h, files_with_matches ? 1 : 0);
+    h = fnv_mix(h, files_without_match ? 1 : 0);
+    h = fnv_mix(h, include_binary ? 1 : 0);
+    h = fnv_mix(h, max_matches);
+    h = fnv_mix(h, static_cast<uint64_t>(record_separator));
+    h = fnv_mix(h, static_cast<uint64_t>(eligible_file_ids.size()));
+    for (auto v : eligible_file_ids) h = fnv_mix(h, static_cast<uint64_t>(v));
+    h = fnv_mix(h, static_cast<uint64_t>(index_options.chunk_bytes));
+    h = fnv_mix(h, static_cast<uint64_t>(index_options.chunk_overlap));
+    h = fnv_mix(h, static_cast<uint64_t>(index_options.positional_block_bytes));
+    h = fnv_mix(h, double_bits(index_options.positional_budget_ratio));
+    h = fnv_mix(h, static_cast<uint64_t>(index_options.planned_qgrams));
+    h = fnv_mix(h, index_options.include_hidden ? 1 : 0);
+    h = fnv_mix(h, index_options.follow_symlinks ? 1 : 0);
+    h = fnv_mix(h, index_options.persist_corpus ? 1 : 0);
+    h = fnv_mix(h, transformed_input_identity);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+    return h;
+}
+PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
+    return make_plan_key(pattern, search_options, index.options(), transformed_input_identity);
+}
+PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const IndexOptions& index_options, std::uint64_t transformed_input_identity) {
+    PlanKey k;
+    k.pattern_expression = pattern.expression();
+    k.pattern_options = pattern.options();
+    k.overlapping = search_options.overlapping;
+    k.invert_match = search_options.invert_match;
+    k.files_with_matches = search_options.files_with_matches;
+    k.files_without_match = search_options.files_without_match;
+    k.include_binary = search_options.include_binary;
+    k.max_matches = search_options.max_matches;
+    k.record_separator = search_options.record_separator;
+    k.index_options = index_options;
+    k.transformed_input_identity = transformed_input_identity;
+    if (search_options.eligible_file_ids.data() && search_options.eligible_file_ids.size() > 0) {
+        k.eligible_file_ids.assign(search_options.eligible_file_ids.begin(), search_options.eligible_file_ids.end());
+        std::sort(k.eligible_file_ids.begin(), k.eligible_file_ids.end());
+        k.eligible_file_ids.erase(std::unique(k.eligible_file_ids.begin(), k.eligible_file_ids.end()), k.eligible_file_ids.end());
+    }
+    return k;
+}
 // ---- QO-4: public cost-model wrappers (still inside namespace pergrep) ----
 namespace detail {
 double estimate_literal_selectivity(std::string_view lit, const IndexData& I) {
@@ -631,6 +733,103 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
 detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
     return estimateCost(p, I, record_separator).verifier;
 }
+// M1.3 PlanKey overloads: explicit contract, no default-assumption paths.
+detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
+    detail::QueryCost qc;
+    const auto total_chunks = I.chunks.size();
+    const auto total_blocks = [&]{ size_t n=0; for(auto& d:I.pos_desc) n+=d.blocks; return n; }();
+    const auto& Kopt = key.index_options;
+    const unsigned char sep = key.record_separator;
+    bool is_fixed = (key.pattern_options.kind == PatternKind::Fixed);
+    if (is_fixed) {
+        auto q = std::string_view(key.pattern_expression);
+        bool icase = (key.pattern_options.case_mode == CaseMode::Insensitive);
+        double sel = detail::estimate_literal_selectivity(q, I);
+        qc.selectivity = sel;
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
+        if (qc.estimated_candidate_chunks==0 && sel < 1.0 && total_chunks>0) qc.estimated_candidate_chunks = 1;
+        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        if (q.size() > Kopt.chunk_overlap) {
+            qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.estimated_candidate_blocks = 0;
+            qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
+        } else if (icase || key.pattern_options.word || key.pattern_options.line) {
+            qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.estimated_candidate_blocks = 0;
+            qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
+        } else if (q.size() <= 64) {
+            qc.verifier = detail::VerifierKind::FixedPositional;
+            qc.estimated_candidate_blocks = static_cast<uint64_t>(sel * double(total_blocks));
+            if (qc.estimated_candidate_blocks==0 && sel < 1.0 && total_blocks>0) qc.estimated_candidate_blocks = 1;
+            qc.cost = double(qc.estimated_verified_bytes) * 0.5 + 50.0 * double(qc.estimated_candidate_blocks) + 10.0 * double(qc.estimated_candidate_chunks);
+        } else {
+            qc.verifier = detail::VerifierKind::FixedRareByte;
+            qc.estimated_candidate_blocks = 0;
+            qc.cost = double(qc.estimated_verified_bytes) + 100.0 * double(qc.estimated_candidate_chunks);
+        }
+        if (key.invert_match || key.files_with_matches || key.files_without_match) qc.cost += 1000.0;
+        if (key.overlapping) qc.cost += 500.0;
+        if (key.max_matches != 0) qc.cost = std::min(qc.cost, double(key.max_matches * 1024));
+        if (!key.eligible_file_ids.empty()) {
+            double ratio = double(key.eligible_file_ids.size()) / double(std::max<size_t>(I.infos.size(),1));
+            qc.cost *= (0.5 + 0.5 * ratio);
+            qc.estimated_candidate_chunks = static_cast<uint64_t>(qc.estimated_candidate_chunks * ratio);
+        }
+        qc.cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
+        return qc;
+    }
+    Pattern tmp;
+    try { tmp = Pattern::compile(key.pattern_expression, key.pattern_options); } catch (...) {
+        qc.selectivity = 1.0; qc.verifier = detail::VerifierKind::RegexBruteForce;
+        qc.estimated_candidate_chunks = I.chunks.size(); qc.estimated_candidate_blocks = total_blocks;
+        qc.estimated_verified_bytes = I.corp_bytes; qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
+        return qc;
+    }
+    if (tmp.impl_->re.query_ir.is_pure_literal && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
+        bool sep_in_lit = tmp.impl_->re.query_ir.exact_literal.find(static_cast<char>(sep)) != std::string::npos;
+        if (key.pattern_options.multiline || !sep_in_lit) {
+            PatternOptions fopt = key.pattern_options; fopt.kind = PatternKind::Fixed;
+            auto fixed_pat = Pattern::compile(tmp.impl_->re.query_ir.exact_literal, fopt);
+            PlanKey fixed_key = key; fixed_key.pattern_expression = fixed_pat.expression(); fixed_key.pattern_options = fopt;
+            return estimateCost(fixed_key, I);
+        }
+    }
+    if (!tmp.impl_->re.query_ir.branch_mandatory.empty()) {
+        double sel = detail::estimate_branch_selectivity(tmp.impl_->re.query_ir.branch_mandatory, I);
+        qc.selectivity = sel; qc.verifier = detail::VerifierKind::RegexChunk;
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : I.chunks.size();
+        if (qc.estimated_candidate_chunks==0 && sel < 1.0) qc.estimated_candidate_chunks = 1;
+        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
+    } else if (!tmp.impl_->re.query_ir.mandatory.empty()) {
+        double best = 1.0;
+        for (auto& m : tmp.impl_->re.query_ir.mandatory) {
+            double s = detail::estimate_literal_selectivity(m, I);
+            if (s < best) best = s;
+        }
+        qc.selectivity = best; qc.verifier = detail::VerifierKind::RegexChunk;
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(best * total_chunks) : I.chunks.size();
+        if (qc.estimated_candidate_chunks==0 && best < 1.0) qc.estimated_candidate_chunks = 1;
+        qc.estimated_verified_bytes = static_cast<uint64_t>(best * double(I.corp_bytes));
+        qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
+    } else {
+        qc.selectivity = 1.0; qc.verifier = detail::VerifierKind::RegexBruteForce;
+        qc.estimated_candidate_chunks = I.chunks.size(); qc.estimated_candidate_blocks = total_blocks;
+        qc.estimated_verified_bytes = I.corp_bytes; qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
+    }
+    if (key.invert_match || key.files_with_matches || key.files_without_match) qc.cost += 1000.0;
+    if (key.overlapping) qc.cost += 500.0;
+    if (key.max_matches != 0) qc.cost = std::min(qc.cost, double(key.max_matches * 1024));
+    if (!key.eligible_file_ids.empty()) {
+        double ratio = double(key.eligible_file_ids.size()) / double(std::max<size_t>(I.infos.size(),1));
+        qc.cost *= (0.5 + 0.5 * ratio);
+    }
+    qc.cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
+    return qc;
+}
+detail::VerifierKind chooseVerifier(const PlanKey& key, const detail::IndexData& I) {
+    return estimateCost(key, I).verifier;
+}
 namespace detail {
 std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
     std::vector<PlanCandidateMetrics> candidates;
@@ -731,6 +930,85 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
     return candidates;
 }
 } // namespace detail
+namespace detail {
+std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& key, const IndexData& I) {
+    std::vector<PlanCandidateMetrics> candidates;
+    const auto total_chunks = I.chunks.size();
+    const auto total_blocks = [&]{ size_t n=0; for(auto& d:I.pos_desc) n+=d.blocks; return n; }();
+    auto chosen_cost = estimateCost(key, I);
+    bool is_fixed = (key.pattern_options.kind == PatternKind::Fixed);
+    if (is_fixed) {
+        auto q = std::string_view(key.pattern_expression);
+        bool icase = (key.pattern_options.case_mode == CaseMode::Insensitive);
+        double sel = detail::estimate_literal_selectivity(q, I);
+        uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
+        if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
+        uint64_t est_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        {
+            PlanCandidateMetrics c; c.name="FixedRareByte"; c.verifier=pergrep::VerifierKind::FixedRareByte;
+            c.predicted_selectivity=sel; c.predicted_cost=double(est_bytes)+100.0*double(est_chunks);
+            c.is_fallback=(q.size() > key.index_options.chunk_overlap);
+            c.chosen=(chosen_cost.verifier==detail::VerifierKind::FixedRareByte); c.actual_observed=false; candidates.push_back(c);
+        }
+        if (q.size() <= 64 && !icase && !key.pattern_options.word && !key.pattern_options.line) {
+            PlanCandidateMetrics c; c.name="FixedPositional"; c.verifier=pergrep::VerifierKind::FixedPositional;
+            c.predicted_selectivity=sel; uint64_t est_blocks=static_cast<uint64_t>(sel*double(total_blocks));
+            if (est_blocks==0 && sel < 1.0 && total_blocks>0) est_blocks=1;
+            c.predicted_cost=double(est_bytes)*0.5+50.0*double(est_blocks)+10.0*double(est_chunks);
+            c.is_fallback=false; c.chosen=(chosen_cost.verifier==detail::VerifierKind::FixedPositional); c.actual_observed=false; candidates.push_back(c);
+        }
+        {
+            PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.is_fallback=true; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexBruteForce); c.actual_observed=false; candidates.push_back(c);
+        }
+    } else {
+        Pattern tmp; try { tmp = Pattern::compile(key.pattern_expression, key.pattern_options); } catch(...) {
+            PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.is_fallback=true; c.chosen=true; c.actual_observed=false; candidates.push_back(c);
+            return candidates;
+        }
+        if (tmp.impl_->re.query_ir.is_pure_literal && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
+            bool sep_in_lit = tmp.impl_->re.query_ir.exact_literal.find(static_cast<char>(key.record_separator)) != std::string::npos;
+            if (key.pattern_options.multiline || !sep_in_lit) {
+                PatternOptions fopt = key.pattern_options; fopt.kind = PatternKind::Fixed;
+                auto fixed_pat = Pattern::compile(tmp.impl_->re.query_ir.exact_literal, fopt);
+                PlanKey fixed_key = key; fixed_key.pattern_expression = fixed_pat.expression(); fixed_key.pattern_options = fopt;
+                return estimate_all_candidate_plans(fixed_key, I);
+            }
+        }
+        if (tmp.impl_ && (!tmp.impl_->re.query_ir.branch_mandatory.empty() || !tmp.impl_->re.query_ir.mandatory.empty())) {
+            double sel = chosen_cost.selectivity; uint64_t est_chunks = chosen_cost.estimated_candidate_chunks; uint64_t est_bytes = chosen_cost.estimated_verified_bytes;
+            PlanCandidateMetrics c; c.name="RegexChunk"; c.verifier=pergrep::VerifierKind::RegexChunk;
+            c.predicted_selectivity=sel; c.predicted_cost=double(est_bytes)+200.0*double(est_chunks);
+            c.is_fallback=false; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexChunk); c.actual_observed=false; candidates.push_back(c);
+        }
+        {
+            PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
+            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.is_fallback=true; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexBruteForce); c.actual_observed=false; candidates.push_back(c);
+        }
+    }
+    for (auto& c : candidates) {
+        if (key.invert_match || key.files_with_matches || key.files_without_match) c.predicted_cost += 1000.0;
+        if (key.overlapping) c.predicted_cost += 500.0;
+        if (key.max_matches != 0) c.predicted_cost = std::min(c.predicted_cost, double(key.max_matches * 1024));
+        if (!key.eligible_file_ids.empty()) {
+            double ratio = double(key.eligible_file_ids.size())/double(std::max<size_t>(I.infos.size(),1));
+            c.predicted_cost *= (0.5 + 0.5 * ratio);
+        }
+        c.predicted_cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
+    }
+    return candidates;
+}
+} // namespace detail
+
+std::vector<PlanCandidateMetrics> estimate_candidate_plans(const PlanKey& key, const Index& index) {
+    if (!index.debug_index_data()) return {};
+    const auto& I = *static_cast<const detail::IndexData*>(index.debug_index_data());
+    return detail::estimate_all_candidate_plans(key, I);
+}
 
 std::vector<PlanCandidateMetrics> estimate_candidate_plans(const Pattern& pattern, const Index& index, unsigned char record_separator) {
     if (!index.debug_index_data()) return {};
@@ -1061,7 +1339,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     // verifier via SearchStats::verifier and SearchStats::estimated_selectivity for bench/tests.
     // Pure-literal fast path respects (multiline || !contains sep) to avoid false negatives
     // when literal contains record_separator and multiline is off (would miss cross-record matches).
-    auto qc = estimateCost(p, I, opt.record_separator);
+    PlanKey plan_key = make_plan_key(p, opt, I.opt, 0);
+    auto qc = estimateCost(plan_key, I);
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->estimated_selectivity = qc.selectivity;
