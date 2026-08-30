@@ -21,6 +21,80 @@ using detail::Chunk;using detail::LoadedFile;
 
 static int64_t mtime_ns(const fs::path&p){std::error_code ec;auto t=fs::last_write_time(p,ec);if(ec)return 0;return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();}
 static bool looks_binary(std::string_view s){auto n=std::min<size_t>(s.size(),8192);return std::memchr(s.data(),'\0',n)!=nullptr;}
+// Exact planner tables are intentionally bounded: they are transient
+// calibration data, while legacy filter arrays remain available at any scale.
+inline constexpr std::uint64_t kPlannerCorpusCap = 128ULL * 1024 * 1024;
+inline constexpr std::size_t kPlannerDistinctQgramCap = 1ULL << 20;
+static void rebuild_planner_stats(detail::IndexData& I) {
+    I.exact_qgrams.clear();
+    I.hash_chunk_freq.fill(0);
+    for (auto& ids : I.hash_chunk_ids) ids.clear();
+    I.planner_stats_ready = false;
+    if (I.corp_bytes > kPlannerCorpusCap) return;
+    for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+        const auto& data = I.loaded[fid].data;
+        std::unordered_set<std::uint32_t> document_grams;
+        if (data.size() >= 4) {
+            document_grams.reserve(std::min<std::size_t>(
+                data.size() / 4, kPlannerDistinctQgramCap));
+            for (std::size_t q = 0; q + 4 <= data.size(); ++q) {
+                const auto key = detail::qgram4_key(
+                    reinterpret_cast<const unsigned char*>(data.data() + q));
+                auto it = I.exact_qgrams.find(key);
+                if (it == I.exact_qgrams.end()) {
+                    if (I.exact_qgrams.size() >= kPlannerDistinctQgramCap) {
+                        I.exact_qgrams.clear();
+                        return;
+                    }
+                    it = I.exact_qgrams.emplace(key, detail::IndexData::QgramStats{}).first;
+                }
+                ++it->second.occurrence_frequency;
+                document_grams.insert(key);
+            }
+        }
+        for (const auto key : document_grams) {
+            auto it = I.exact_qgrams.find(key);
+            if (it == I.exact_qgrams.end()) continue;
+            ++it->second.document_frequency;
+            it->second.document_ids.push_back(fid);
+        }
+    }
+    for (std::uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+        const auto& c = I.chunks[ci];
+        // v5/BF-4 fixtures may intentionally contain serialized offset
+        // values beyond the restored corpus. Do not let transient planner
+        // recomputation turn such a load into an exception.
+        if (c.file_id >= I.loaded.size()) continue;
+        const auto data_size = static_cast<std::uint64_t>(I.loaded[c.file_id].data.size());
+        if (c.core_begin > data_size || c.ext_end < c.core_begin || c.ext_end > data_size)
+            continue;
+        const auto view = std::string_view(I.loaded[c.file_id].data).substr(
+            c.core_begin, c.ext_end - c.core_begin);
+        std::unordered_set<std::uint32_t> exact_in_chunk;
+        std::unordered_set<std::uint16_t> hash_in_chunk;
+        if (view.size() >= 4) {
+            exact_in_chunk.reserve(std::min<std::size_t>(
+                view.size() / 4, kPlannerDistinctQgramCap));
+            hash_in_chunk.reserve(std::min<std::size_t>(view.size() / 4, 65536));
+            for (std::size_t q = 0; q + 4 <= view.size(); ++q) {
+                const auto* p = reinterpret_cast<const unsigned char*>(view.data() + q);
+                exact_in_chunk.insert(detail::qgram4_key(p));
+                hash_in_chunk.insert(static_cast<std::uint16_t>(detail::hash4(p) & 65535u));
+            }
+        }
+        for (const auto key : exact_in_chunk) {
+            auto it = I.exact_qgrams.find(key);
+            if (it == I.exact_qgrams.end()) continue;
+            ++it->second.chunk_frequency;
+            it->second.chunk_ids.push_back(ci);
+        }
+        for (const auto bucket : hash_in_chunk) {
+            ++I.hash_chunk_freq[bucket];
+            I.hash_chunk_ids[bucket].push_back(ci);
+        }
+    }
+    I.planner_stats_ready = true;
+}
 
 Index::Index() = default;
 Index::Index(std::shared_ptr<Impl> i) : impl_(std::move(i)) {}
@@ -112,6 +186,7 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
             I->chunks.push_back({fid, b, e, x});
         }
     }
+    rebuild_planner_stats(*I);
 
     std::array<uint32_t, 8> cnt{};
     for (auto const& c : I->chunks) ++cnt[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
@@ -234,6 +309,7 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
             I->chunks.push_back({fid, b, e, x});
         }
     }
+    rebuild_planner_stats(*I);
 
     std::array<uint32_t, 8> cnt{};
     for (auto const& c : I->chunks) ++cnt[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
@@ -487,6 +563,9 @@ void Index::save(const fs::path& file) const {
             put(o, uint64_t(impl_->corp_bytes));
             put(o, int64_t(impl_->root_mtime_ns));
             o.write(reinterpret_cast<const char*>(impl_->byte_freq.data()), sizeof(impl_->byte_freq));
+            // v5/v6 retain qgram_freq as the legacy hash-bucket occurrence
+            // array. M1.5 planner tables are recomputed on load from corpus
+            // bytes, so these formats remain byte-for-byte compatible.
             o.write(reinterpret_cast<const char*>(impl_->qgram_freq.data()), sizeof(impl_->qgram_freq));
             if (!o) throw std::runtime_error("index write failed");
             put(o, uint32_t(impl_->pos_block));
@@ -592,6 +671,8 @@ Index Index::load(const fs::path& file) {
     I->corp_bytes = get<uint64_t>(i);
     I->root_mtime_ns = get<int64_t>(i);
     i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
+    // qgram_freq is legacy hash-bucket occurrence data; exact planner stats
+    // are rebuilt below after v5/v6 corpus restoration.
     i.read(reinterpret_cast<char*>(I->qgram_freq.data()), sizeof(I->qgram_freq));
     if (!i) throw std::runtime_error("pergrep index: truncated");
     I->pos_block = get<uint32_t>(i);
@@ -669,6 +750,9 @@ Index Index::load(const fs::path& file) {
             I->loaded.push_back({f, std::move(data)});
         }
     }
+    // v5/v6 do not contain planner statistics. Recompute them from the loaded
+    // corpus rather than interpreting legacy qgram_freq bytes as exact stats.
+    rebuild_planner_stats(*I);
     return Index(I);
 }
 

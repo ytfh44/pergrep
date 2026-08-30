@@ -301,76 +301,69 @@ size_t adaptive_k(const detail::IndexData& I, std::string_view q) {
     return k;
 }
 
-// Rarity-aware q-gram planner.
-// - Collects all 4-byte q-gram hashes of the query.
-// - Sorts by corpus frequency (I.qgram_freq on low 16 bits of hash) ascending:
-//   rarest first, because rare q-grams prune more candidates per probe.
-// - Deduplicates hashes to respect per-query distinctness (repeated q-grams
-//   do not add filtering power).
-// - Drops extremely common q-grams whose corpus frequency exceeds 10% of
-//   corpus_bytes. This threshold identifies q-grams that appear in a large
-//   fraction of chunks and would pollute the candidate set with low-selectivity
-//   rows. Dropping is conservative: using fewer q-grams relaxes the positional
-//   intersection (more blocks pass), so zero false negatives is preserved;
-//   we only keep a subset of the rarest q-grams.
-// - Selects the first k hashes after filtering, where k is from adaptive_k().
-//   If filtering empties the set, returns empty -> caller falls back to no
-//   q-gram filter (all chunks).
+// Rarity-aware q-gram planner. Planner ordering uses exact q-gram chunk
+// frequency, widened by the corresponding legacy hash-bucket chunk frequency.
+// The returned hashes remain the legacy hash values consumed by conservative
+// Bloom filters; only planner ordering changes.
 std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_view q) {
-    std::vector<uint32_t> h;
-    if (q.size() < 4) return h;
-    for (size_t i = 0; i + 4 <= q.size(); ++i)
-        h.push_back(detail::hash4((const unsigned char*)q.data() + i));
-    // Rarity ordering: rarest first using corpus qgram frequency.
-    std::sort(h.begin(), h.end(), [&](uint32_t a, uint32_t b) {
-        auto fa = I.qgram_freq[a & 65535u], fb = I.qgram_freq[b & 65535u];
-        if (fa != fb) return fa < fb;
-        return a < b;
+    std::vector<std::pair<uint32_t, std::uint64_t>> ranked;
+    if (q.size() < 4) return {};
+    for (size_t i = 0; i + 4 <= q.size(); ++i) {
+        const auto* p = reinterpret_cast<const unsigned char*>(q.data() + i);
+        const auto hash = detail::hash4(p);
+        const auto key = detail::qgram4_key(p);
+        std::uint64_t exact_chunks = I.chunks.size();
+        auto it = I.exact_qgrams.find(key);
+        if (I.planner_stats_ready && it != I.exact_qgrams.end())
+            exact_chunks = it->second.chunk_frequency;
+        std::uint64_t bucket_chunks = I.chunks.size();
+        if (I.planner_stats_ready)
+            bucket_chunks = I.hash_chunk_freq[hash & 65535u];
+        ranked.push_back({hash, std::max(exact_chunks, bucket_chunks)});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](auto a, auto b) {
+        if (a.second != b.second) return a.second < b.second;
+        return a.first < b.first;
     });
-    h.erase(std::unique(h.begin(), h.end()), h.end());
-    // Adaptive k (budget + distinctness aware).
+    std::vector<std::pair<uint32_t, std::uint64_t>> unique_ranked;
+    unique_ranked.reserve(ranked.size());
+    for (const auto item : ranked) {
+        bool seen = false;
+        for (const auto prior : unique_ranked)
+            if (prior.first == item.first) { seen = true; break; }
+        if (!seen) unique_ranked.push_back(item);
+    }
+    ranked.swap(unique_ranked);
+    std::vector<uint32_t> h;
+    h.reserve(ranked.size());
+    for (auto [hash, unused] : ranked) {
+        (void)unused;
+        h.push_back(hash);
+    }
     size_t k = adaptive_k(I, q);
     if (k == 0) return {};
-    // Drop extremely common q-grams: freq > 10% of corpus bytes.
-    // For tiny corpora corpus_bytes may be 0-100; threshold then tiny, so
-    // guard against over-dropping by only applying when corpus_bytes is large
-    // enough for the ratio to be meaningful (>40). Otherwise keep all.
-    if (I.corp_bytes > 40) {
-        uint64_t common_thresh = I.corp_bytes / 10;
+    if (I.planner_stats_ready && I.chunks.size() > 40) {
+        const auto common_thresh = I.chunks.size() / 10;
         std::vector<uint32_t> filtered;
         filtered.reserve(h.size());
-        for (auto hh : h) {
-            uint32_t f = I.qgram_freq[hh & 65535u];
-            if (static_cast<uint64_t>(f) <= common_thresh) filtered.push_back(hh);
+        for (auto hash : h) {
+            if (I.hash_chunk_freq[hash & 65535u] <= common_thresh)
+                filtered.push_back(hash);
         }
-        // Only use filtered set if it still contains at least one q-gram;
-        // otherwise fall back to the rarest (even if common) to retain some
-        // pruning rather than disabling the filter entirely. But spec says
-        // dropping common even within budget is intended; if all are common,
-        // returning empty (no filter) is the conservative fallback.
-        // Here we prefer the conservative empty-return when everything is
-        // common, to avoid a useless highly-common filter.
-        if (!filtered.empty()) {
-            h.swap(filtered);
-        } else {
-            // All q-grams are extremely common -> disable positional filter
-            // rather than polluting with a low-selectivity gram.
-            return {};
-        }
+        if (filtered.empty()) return {};
+        h.swap(filtered);
     }
     if (h.size() > k) h.resize(k);
     return h;
 }
 
 // Positional filter compiler — query-aware block Bloom.
-// Compiles a fixed literal query into positional constraints: chunk -> block Bloom row selection.
-// Safety invariants (zero false negatives):
+// Positional filter compiler — query-aware block Bloom. The planner chooses
+// q-grams using exact chunk frequencies widened by legacy hash-bucket collision
+// counts; this only changes which safe subset of hash rows is intersected.
+// Conservative invariants:
 // - Positional blocks are ONLY used for case-sensitive fixed literals without word/line flags.
-//   Word/line boundaries are record-based (e.g., \\b, ^, $) and block boundaries do not align
-//   with record boundaries. Using block Bloom for word/line would be unsafe because a literal
-//   could be present in a block but fail the word/line check due to context outside the block,
-//   or vice versa. Therefore word/line/icase queries fall back to chunk-level candidate pruning
-//   (see `else if (icase||word||line)` branch in Searcher::find) which is conservative.
+// - A literal longer than chunk_overlap uses whole-file fallback.
 // - Safe cross-chunk fallback: when literal length exceeds chunk_overlap, a match may straddle
 //   two chunks and would be missed by chunk-level pruning. The code detects `q.size() > chunk_overlap`
 //   and falls back to whole-file rare-byte scan over the union of candidate files (conservative
@@ -463,56 +456,111 @@ bool fixed_match_in_record(std::string_view rec, std::string_view q, bool icase,
     }
     return false;
 }
-// QO-4 cost-model helpers (inside anonymous namespace for linkage, but wrappers
-// exposed via pergrep::detail / pergrep). Estimates selectivity via byte_freq
-// and qgram_freq: rarest q-gram / byte determines pruning power. For fixed
-// literals we use min qgram_freq across its 4-grams; for regex we use the
-// rarest mandatory per branch.
-static double estimate_literal_selectivity_impl(std::string_view lit, const detail::IndexData& I) {
-    if (lit.empty()) return 1.0;
-    if (I.corp_bytes == 0) return 1.0;
-    // Byte-level rarity (rare-byte anchor): min byte_freq / corp_bytes
-    uint64_t min_b = UINT64_MAX;
-    for (unsigned char c : lit) {
-        uint64_t f = I.byte_freq[c];
-        if (f < min_b) min_b = f;
-    }
-    double byte_sel = min_b == UINT64_MAX ? 1.0 : double(min_b) / double(I.corp_bytes);
-    if (lit.size() < 4) return byte_sel;
-    // Q-gram rarity: min qgram_freq across all 4-grams of the literal
-    uint32_t min_q = UINT32_MAX;
-    for (size_t i = 0; i + 4 <= lit.size(); ++i) {
-        uint32_t h = detail::hash4((const unsigned char*)lit.data() + i);
-        uint32_t f = I.qgram_freq[h & 65535u];
-        if (f < min_q) min_q = f;
-    }
-    double qgram_sel = min_q == UINT32_MAX ? 1.0 : double(min_q) / double(I.corp_bytes);
-    // Selectivity is dominated by rarest signal; take min (most selective)
-    double sel = std::min(byte_sel, qgram_sel);
-    if (sel < 0.0) sel = 0.0;
-    if (sel > 1.0) sel = 1.0;
-    // Clamp very common grams: if lit is all very common, selectivity near 1
-    return sel;
+// Planner selectivity is expressed in candidate chunks, not source-byte
+// occurrence counts. Hash-bucket frequencies are conservative upper bounds;
+// exact entries are keyed by raw q-gram bytes and remain collision-aware.
+static bool scope_contains(std::span<const std::uint32_t> scope, std::uint32_t fid) {
+    return scope.empty() || std::binary_search(scope.begin(), scope.end(), fid);
 }
-static double estimate_branch_selectivity_impl(const std::vector<std::vector<std::string>>& branches, const detail::IndexData& I) {
+static std::uint64_t scoped_chunk_count(const detail::IndexData& I,
+                                        std::span<const std::uint32_t> scope) {
+    if (scope.empty()) return I.chunks.size();
+    std::uint64_t n = 0;
+    for (const auto& c : I.chunks) n += scope_contains(scope, c.file_id);
+    return n;
+}
+static std::uint64_t scoped_ids(const std::vector<std::uint32_t>& ids,
+                                std::span<const std::uint32_t> scope,
+                                const detail::IndexData& I, bool chunks) {
+    if (scope.empty()) return ids.size();
+    if (!chunks) {
+        std::uint64_t n = 0;
+        for (auto id : ids) n += scope_contains(scope, id);
+        return n;
+    }
+    std::uint64_t n = 0;
+    for (auto id : ids)
+        if (id < I.chunks.size() && scope_contains(scope, I.chunks[id].file_id)) ++n;
+    return n;
+}
+static std::uint64_t scoped_hash_chunks(const detail::IndexData& I, std::uint32_t bucket,
+                                        std::span<const std::uint32_t> scope) {
+    if (!I.planner_stats_ready) return I.chunks.size();
+    const auto total = scoped_chunk_count(I, scope);
+    std::uint64_t result = 0;
+    // A group with lg bits accepts every legacy 16-bit bucket sharing the
+    // query's low-lg bits. Count those chunk IDs exactly; this widens for
+    // collisions without collapsing rare grams into all chunks.
+    std::vector<std::uint32_t> seen(I.chunks.size(), 0);
+    for (std::uint8_t lg = 9; lg <= 16; ++lg) {
+        const std::uint32_t mask = (1u << lg) - 1u;
+        const std::uint32_t target = bucket & mask;
+        const std::uint32_t generation = lg - 8;
+        for (std::uint32_t b = 0; b < 65536; ++b) {
+            if ((b & mask) != target) continue;
+            for (auto ci : I.hash_chunk_ids[b]) {
+                if (ci < I.chunks.size() && seen[ci] != generation &&
+                    scope_contains(scope, I.chunks[ci].file_id)) {
+                    const auto actual_lg = detail::lg_for(static_cast<std::size_t>(
+                        I.chunks[ci].ext_end - I.chunks[ci].core_begin));
+                    if (actual_lg == lg) {
+                        seen[ci] = generation;
+                        ++result;
+                    }
+                }
+            }
+        }
+    }
+    return std::min(result, total);
+}
+static std::uint64_t scoped_extended_bytes(
+    const detail::IndexData& I, std::span<const std::uint32_t> scope) {
+    std::uint64_t n = 0;
+    for (const auto& c : I.chunks) {
+        if (c.file_id >= I.loaded.size()) continue;
+        const auto size = static_cast<std::uint64_t>(I.loaded[c.file_id].data.size());
+        if (c.core_begin > size || c.ext_end < c.core_begin || c.ext_end > size) continue;
+        if (scope.empty() || scope_contains(scope, c.file_id))
+            n += c.ext_end - c.core_begin;
+    }
+    return n;
+}
+static double estimate_literal_selectivity_impl(
+    std::string_view lit, const detail::IndexData& I,
+    std::span<const std::uint32_t> scope = {}) {
+    const auto total_chunks = scoped_chunk_count(I, scope);
+    if (lit.size() < 4 || total_chunks == 0) return 1.0;
+    if (!I.planner_stats_ready) return 1.0;
+    double selectivity = 1.0;
+    for (std::size_t i = 0; i + 4 <= lit.size(); ++i) {
+        const auto* p = reinterpret_cast<const unsigned char*>(lit.data() + i);
+        const auto key = detail::qgram4_key(p);
+        const auto hash = detail::hash4(p) & 65535u;
+        std::uint64_t exact = 0;
+        if (auto it = I.exact_qgrams.find(key); it != I.exact_qgrams.end())
+            exact = scoped_ids(it->second.chunk_ids, scope, I, true);
+        const auto conservative = scoped_hash_chunks(I, hash, scope);
+        const auto candidates = std::min<std::uint64_t>(
+            total_chunks, std::max(exact, conservative));
+        selectivity = std::min(selectivity, double(candidates) / double(total_chunks));
+    }
+    return std::clamp(selectivity, 0.0, 1.0);
+}
+static double estimate_branch_selectivity_impl(
+    const std::vector<std::vector<std::string>>& branches, const detail::IndexData& I,
+    std::span<const std::uint32_t> scope = {}) {
     if (branches.empty()) return 1.0;
-    if (I.corp_bytes == 0) return 1.0;
-    // Union pruning: candidate chunks = union across branches. Estimate as
-    // sum of per-branch selectivities capped at 1. For each branch, its
-    // selectivity is min across its mandatory literals (branch needs one of them;rarest literal per branch dominates).
+    if (scoped_chunk_count(I, scope) == 0) return 1.0;
     double sum = 0.0;
     for (const auto& br : branches) {
-        if (br.empty()) return 1.0; // one branch has no mandatory -> no pruning
+        if (br.empty()) return 1.0;
         double best = 1.0;
-        for (const auto& lit : br) {
-            double s = estimate_literal_selectivity_impl(lit, I);
-            if (s < best) best = s;
-        }
+        for (const auto& lit : br)
+            best = std::min(best, estimate_literal_selectivity_impl(lit, I, scope));
         sum += best;
         if (sum >= 1.0) return 1.0;
     }
-    if (sum > 1.0) sum = 1.0;
-    return sum;
+    return std::min(sum, 1.0);
 }
 
 } // namespace
@@ -655,12 +703,15 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
     if (p.is_fixed()) {
         auto q = std::string_view(p.impl_->expr);
         bool icase = (p.impl_->opt.case_mode == CaseMode::Insensitive);
-        double sel = detail::estimate_literal_selectivity(q, I);
+        double sel = estimate_literal_selectivity_impl(q, I);
+        if (q.size() > I.opt.chunk_overlap || icase) sel = 1.0;
         qc.selectivity = sel;
         qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
         if (qc.estimated_candidate_chunks==0 && sel < 1.0 && total_chunks>0) qc.estimated_candidate_chunks = 1;
-        // Verified bytes heuristic: selectivity * corp_bytes, but at least candidate_chunks * chunk_bytes/2 for tiny sel
-        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        qc.estimated_verified_bytes =
+            (q.size() > I.opt.chunk_overlap || icase)
+                ? scoped_extended_bytes(I, {})
+                : qc.estimated_candidate_chunks * I.opt.chunk_bytes;
         // Branching similar to actual dispatch but with cost annotation
         // Cost model: FixedPositional cheaper when many blocks can be pruned (sel small)
         // and q small enough for positional (<=64) without word/line/icase.
@@ -676,6 +727,8 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
             qc.verifier = detail::VerifierKind::FixedPositional;
             qc.estimated_candidate_blocks = static_cast<uint64_t>(sel * double(total_blocks));
             if (qc.estimated_candidate_blocks==0 && sel < 1.0 && total_blocks>0) qc.estimated_candidate_blocks = 1;
+            qc.estimated_verified_bytes =
+                qc.estimated_candidate_blocks * (I.pos_block + 64);
             qc.cost = double(qc.estimated_verified_bytes) * 0.5 + 50.0 * double(qc.estimated_candidate_blocks) + 10.0 * double(qc.estimated_candidate_chunks);
         } else {
             qc.verifier = detail::VerifierKind::FixedRareByte;
@@ -697,12 +750,12 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
     }
     // Regex with branch_mandatory or mandatory
     if (!p.impl_->re.query_ir.branch_mandatory.empty()) {
-        double sel = detail::estimate_branch_selectivity(p.impl_->re.query_ir.branch_mandatory, I);
+        double sel = estimate_branch_selectivity_impl(p.impl_->re.query_ir.branch_mandatory, I);
         qc.selectivity = sel;
         qc.verifier = detail::VerifierKind::RegexChunk;
-        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : I.chunks.size();
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
         if (qc.estimated_candidate_chunks==0 && sel < 1.0) qc.estimated_candidate_chunks = 1;
-        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        qc.estimated_verified_bytes = scoped_extended_bytes(I, {});
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
         return qc;
     }
@@ -710,14 +763,14 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
         // Use rarest mandatory literal (longest is currently chosen for pruning, but cost uses rarest)
         double best = 1.0;
         for (auto& m : p.impl_->re.query_ir.mandatory) {
-            double s = detail::estimate_literal_selectivity(m, I);
+            double s = estimate_literal_selectivity_impl(m, I);
             if (s < best) best = s;
         }
         qc.selectivity = best;
         qc.verifier = detail::VerifierKind::RegexChunk;
-        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(best * total_chunks) : I.chunks.size();
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(best * total_chunks) : total_chunks;
         if (qc.estimated_candidate_chunks==0 && best < 1.0) qc.estimated_candidate_chunks = 1;
-        qc.estimated_verified_bytes = static_cast<uint64_t>(best * double(I.corp_bytes));
+        qc.estimated_verified_bytes = scoped_extended_bytes(I, {});
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
         return qc;
     }
@@ -726,8 +779,8 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
     qc.verifier = detail::VerifierKind::RegexBruteForce;
     qc.estimated_candidate_chunks = I.chunks.size();
     qc.estimated_candidate_blocks = total_blocks;
-    qc.estimated_verified_bytes = I.corp_bytes;
-    qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
+    qc.estimated_verified_bytes = scoped_extended_bytes(I, {});
+    qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(I.chunks.size());
     return qc;
 }
 detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I, unsigned char record_separator) {
@@ -736,19 +789,30 @@ detail::VerifierKind chooseVerifier(const Pattern& p, const detail::IndexData& I
 // M1.3 PlanKey overloads: explicit contract, no default-assumption paths.
 detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
     detail::QueryCost qc;
-    const auto total_chunks = I.chunks.size();
-    const auto total_blocks = [&]{ size_t n=0; for(auto& d:I.pos_desc) n+=d.blocks; return n; }();
     const auto& Kopt = key.index_options;
     const unsigned char sep = key.record_separator;
+    const std::span<const std::uint32_t> scope(key.eligible_file_ids.data(), key.eligible_file_ids.size());
     bool is_fixed = (key.pattern_options.kind == PatternKind::Fixed);
+    const auto total_chunks = scoped_chunk_count(I, scope);
+    const auto total_blocks = [&]{
+        size_t n = 0;
+        for (std::size_t ci = 0; ci < I.pos_desc.size(); ++ci)
+            if (scope.empty() || (ci < I.chunks.size() && scope_contains(scope, I.chunks[ci].file_id)))
+                n += I.pos_desc[ci].blocks;
+        return n;
+    }();
     if (is_fixed) {
         auto q = std::string_view(key.pattern_expression);
         bool icase = (key.pattern_options.case_mode == CaseMode::Insensitive);
-        double sel = detail::estimate_literal_selectivity(q, I);
+        double sel = estimate_literal_selectivity_impl(q, I, scope);
+        if (q.size() > Kopt.chunk_overlap || icase) sel = 1.0;
         qc.selectivity = sel;
         qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
         if (qc.estimated_candidate_chunks==0 && sel < 1.0 && total_chunks>0) qc.estimated_candidate_chunks = 1;
-        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        qc.estimated_verified_bytes =
+            (q.size() > Kopt.chunk_overlap || icase)
+                ? scoped_extended_bytes(I, scope)
+                : qc.estimated_candidate_chunks * I.opt.chunk_bytes;
         if (q.size() > Kopt.chunk_overlap) {
             qc.verifier = detail::VerifierKind::FixedRareByte;
             qc.estimated_candidate_blocks = 0;
@@ -761,6 +825,8 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
             qc.verifier = detail::VerifierKind::FixedPositional;
             qc.estimated_candidate_blocks = static_cast<uint64_t>(sel * double(total_blocks));
             if (qc.estimated_candidate_blocks==0 && sel < 1.0 && total_blocks>0) qc.estimated_candidate_blocks = 1;
+            qc.estimated_verified_bytes =
+                qc.estimated_candidate_blocks * (I.pos_block + 64);
             qc.cost = double(qc.estimated_verified_bytes) * 0.5 + 50.0 * double(qc.estimated_candidate_blocks) + 10.0 * double(qc.estimated_candidate_chunks);
         } else {
             qc.verifier = detail::VerifierKind::FixedRareByte;
@@ -771,9 +837,9 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
         if (key.overlapping) qc.cost += 500.0;
         if (key.max_matches != 0) qc.cost = std::min(qc.cost, double(key.max_matches * 1024));
         if (!key.eligible_file_ids.empty()) {
-            double ratio = double(key.eligible_file_ids.size()) / double(std::max<size_t>(I.infos.size(),1));
+            const double ratio = double(total_chunks) /
+                                 double(std::max<std::size_t>(I.chunks.size(), 1));
             qc.cost *= (0.5 + 0.5 * ratio);
-            qc.estimated_candidate_chunks = static_cast<uint64_t>(qc.estimated_candidate_chunks * ratio);
         }
         qc.cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
         return qc;
@@ -781,8 +847,9 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
     Pattern tmp;
     try { tmp = Pattern::compile(key.pattern_expression, key.pattern_options); } catch (...) {
         qc.selectivity = 1.0; qc.verifier = detail::VerifierKind::RegexBruteForce;
-        qc.estimated_candidate_chunks = I.chunks.size(); qc.estimated_candidate_blocks = total_blocks;
-        qc.estimated_verified_bytes = I.corp_bytes; qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
+        qc.estimated_candidate_chunks = total_chunks; qc.estimated_candidate_blocks = total_blocks;
+        qc.estimated_verified_bytes = total_chunks * I.opt.chunk_bytes;
+        qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(total_chunks);
         return qc;
     }
     if (tmp.impl_->re.query_ir.is_pure_literal && key.pattern_options.case_mode != CaseMode::Insensitive && !tmp.impl_->re.extended) {
@@ -795,33 +862,32 @@ detail::QueryCost estimateCost(const PlanKey& key, const detail::IndexData& I) {
         }
     }
     if (!tmp.impl_->re.query_ir.branch_mandatory.empty()) {
-        double sel = detail::estimate_branch_selectivity(tmp.impl_->re.query_ir.branch_mandatory, I);
+        double sel = estimate_branch_selectivity_impl(tmp.impl_->re.query_ir.branch_mandatory, I, scope);
         qc.selectivity = sel; qc.verifier = detail::VerifierKind::RegexChunk;
-        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : I.chunks.size();
-        if (qc.estimated_candidate_chunks==0 && sel < 1.0) qc.estimated_candidate_chunks = 1;
-        qc.estimated_verified_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
+        if (qc.estimated_candidate_chunks == 0 && sel < 1.0 && total_chunks > 0) qc.estimated_candidate_chunks = 1;
+        qc.estimated_verified_bytes = scoped_extended_bytes(I, scope);
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
     } else if (!tmp.impl_->re.query_ir.mandatory.empty()) {
         double best = 1.0;
-        for (auto& m : tmp.impl_->re.query_ir.mandatory) {
-            double s = detail::estimate_literal_selectivity(m, I);
-            if (s < best) best = s;
-        }
+        for (auto& m : tmp.impl_->re.query_ir.mandatory)
+            best = std::min(best, estimate_literal_selectivity_impl(m, I, scope));
         qc.selectivity = best; qc.verifier = detail::VerifierKind::RegexChunk;
-        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(best * total_chunks) : I.chunks.size();
-        if (qc.estimated_candidate_chunks==0 && best < 1.0) qc.estimated_candidate_chunks = 1;
-        qc.estimated_verified_bytes = static_cast<uint64_t>(best * double(I.corp_bytes));
+        qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(best * total_chunks) : total_chunks;
+        if (qc.estimated_candidate_chunks == 0 && best < 1.0 && total_chunks > 0) qc.estimated_candidate_chunks = 1;
+        qc.estimated_verified_bytes = scoped_extended_bytes(I, scope);
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
     } else {
         qc.selectivity = 1.0; qc.verifier = detail::VerifierKind::RegexBruteForce;
-        qc.estimated_candidate_chunks = I.chunks.size(); qc.estimated_candidate_blocks = total_blocks;
-        qc.estimated_verified_bytes = I.corp_bytes; qc.cost = double(I.corp_bytes) + 200.0 * double(I.chunks.size());
+        qc.estimated_candidate_chunks = total_chunks; qc.estimated_candidate_blocks = total_blocks;
+        qc.estimated_verified_bytes = scoped_extended_bytes(I, scope);
+        qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(total_chunks);
     }
     if (key.invert_match || key.files_with_matches || key.files_without_match) qc.cost += 1000.0;
     if (key.overlapping) qc.cost += 500.0;
     if (key.max_matches != 0) qc.cost = std::min(qc.cost, double(key.max_matches * 1024));
     if (!key.eligible_file_ids.empty()) {
-        double ratio = double(key.eligible_file_ids.size()) / double(std::max<size_t>(I.infos.size(),1));
+        const double ratio = double(total_chunks) / double(std::max<std::size_t>(I.chunks.size(), 1));
         qc.cost *= (0.5 + 0.5 * ratio);
     }
     qc.cost += (key.include_binary ? 250.0 : 0) + double(key.transformed_input_identity & 0xFF);
@@ -846,7 +912,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
         double sel = detail::estimate_literal_selectivity(q, I);
         uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
         if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
-        uint64_t est_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        uint64_t est_bytes = est_chunks * I.opt.chunk_bytes;
 
         // Candidate 1: FixedRareByte
         {
@@ -882,7 +948,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
             c.name = "RegexBruteForce";
             c.verifier = pergrep::VerifierKind::RegexBruteForce;
             c.predicted_selectivity = 1.0;
-            c.predicted_cost = double(I.corp_bytes) + 200.0 * double(total_chunks);
+            c.predicted_cost = double(total_chunks * I.opt.chunk_bytes) + 200.0 * double(total_chunks);
             c.is_fallback = true;
             c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
             c.actual_observed = false;
@@ -920,7 +986,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
             c.name = "RegexBruteForce";
             c.verifier = pergrep::VerifierKind::RegexBruteForce;
             c.predicted_selectivity = 1.0;
-            c.predicted_cost = double(I.corp_bytes) + 200.0 * double(total_chunks);
+            c.predicted_cost = double(total_chunks * I.opt.chunk_bytes) + 200.0 * double(total_chunks);
             c.is_fallback = true;
             c.chosen = (chosen_cost.verifier == detail::VerifierKind::RegexBruteForce);
             c.actual_observed = false;
@@ -943,7 +1009,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& ke
         double sel = detail::estimate_literal_selectivity(q, I);
         uint64_t est_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : total_chunks;
         if (est_chunks == 0 && sel < 1.0 && total_chunks > 0) est_chunks = 1;
-        uint64_t est_bytes = static_cast<uint64_t>(sel * double(I.corp_bytes));
+        uint64_t est_bytes = est_chunks * I.opt.chunk_bytes;
         {
             PlanCandidateMetrics c; c.name="FixedRareByte"; c.verifier=pergrep::VerifierKind::FixedRareByte;
             c.predicted_selectivity=sel; c.predicted_cost=double(est_bytes)+100.0*double(est_chunks);
@@ -959,13 +1025,13 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& ke
         }
         {
             PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
-            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.predicted_cost=double(total_chunks * I.opt.chunk_bytes)+200.0*double(total_chunks);
             c.is_fallback=true; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexBruteForce); c.actual_observed=false; candidates.push_back(c);
         }
     } else {
         Pattern tmp; try { tmp = Pattern::compile(key.pattern_expression, key.pattern_options); } catch(...) {
             PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
-            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.predicted_cost=double(total_chunks * I.opt.chunk_bytes)+200.0*double(total_chunks);
             c.is_fallback=true; c.chosen=true; c.actual_observed=false; candidates.push_back(c);
             return candidates;
         }
@@ -986,7 +1052,7 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const PlanKey& ke
         }
         {
             PlanCandidateMetrics c; c.name="RegexBruteForce"; c.verifier=pergrep::VerifierKind::RegexBruteForce;
-            c.predicted_selectivity=1.0; c.predicted_cost=double(I.corp_bytes)+200.0*double(total_chunks);
+            c.predicted_cost=double(total_chunks * I.opt.chunk_bytes)+200.0*double(total_chunks);
             c.is_fallback=true; c.chosen=(chosen_cost.verifier==detail::VerifierKind::RegexBruteForce); c.actual_observed=false; candidates.push_back(c);
         }
     }
@@ -1326,25 +1392,43 @@ std::string GateEvaluation::format_release_report() const {
 Searcher::Searcher(std::shared_ptr<const Index> i) : owned_(std::move(i)), index_(owned_.get()) {}
 Searcher::Searcher(const Index& i) : index_(&i) {}
 
-
 std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchStats* stats) const {
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
     StatsRecorder accounting(stats, I, opt.eligible_file_ids);
     std::vector<Match> out;
-    // QO-4 cost model: estimate selectivity via qgram_freq/byte_freq and chunk pruning rate.
-    // Computes per-verifier cost (verified_bytes + k*candidate_chunks) and picks cheapest.
-    // For now the scheduler keeps existing dispatch (documented below) but logs the chosen
-    // verifier via SearchStats::verifier and SearchStats::estimated_selectivity for bench/tests.
-    // Pure-literal fast path respects (multiline || !contains sep) to avoid false negatives
-    // when literal contains record_separator and multiline is off (would miss cross-record matches).
+    const auto total_blocks = [&] {
+        std::size_t n = 0;
+        for (std::size_t ci = 0; ci < I.pos_desc.size(); ++ci)
+            if (opt.eligible_file_ids.empty() ||
+                (ci < I.chunks.size() && scope_contains(opt.eligible_file_ids, I.chunks[ci].file_id)))
+                n += I.pos_desc[ci].blocks;
+        return n;
+    }();
+    const std::span<const std::uint32_t> scope(opt.eligible_file_ids.data(), opt.eligible_file_ids.size());
+    // Planner statistics estimate candidate work in chunk/block/byte units;
+    // conservative hash-bucket bounds are never used to reject candidates.
     PlanKey plan_key = make_plan_key(p, opt, I.opt, 0);
     auto qc = estimateCost(plan_key, I);
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->estimated_selectivity = qc.selectivity;
         stats->estimated_cost = qc.cost;
+        stats->predicted_candidate_chunks = qc.estimated_candidate_chunks;
+        stats->predicted_candidate_blocks = qc.estimated_candidate_blocks;
+        stats->predicted_verified_bytes = qc.estimated_verified_bytes;
+        const auto scoped_chunks = scoped_chunk_count(I, scope);
+        stats->prediction_error_bound_chunks =
+            scoped_chunks >= qc.estimated_candidate_chunks
+                ? scoped_chunks - qc.estimated_candidate_chunks : 0;
+        stats->prediction_error_bound_blocks =
+            total_blocks >= qc.estimated_candidate_blocks
+                ? total_blocks - qc.estimated_candidate_blocks : 0;
+        const auto scoped_bytes = scoped_extended_bytes(I, scope);
+        stats->prediction_error_bound_bytes =
+            scoped_bytes >= qc.estimated_verified_bytes
+                ? scoped_bytes - qc.estimated_verified_bytes : 0;
     }
     const auto verifier_start = stats ? std::clock() : std::clock_t(0);
     if (opt.invert_match) {

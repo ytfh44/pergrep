@@ -7,14 +7,13 @@
 #include <deque>
 #include <unordered_set>
 
-// QO-4 cost model integration: Regex flavour uses QueryIR branch_mandatory / mandatory
-// for chunk-level pruning. The cheapest verifier is chosen by estimateCost() in
-// search.cpp, which estimates selectivity via qgram_freq / byte_freq. For
-// branch_mandatory patterns (e.g. "foo|bar"), the cost model picks the rarest
-// literal across all branches (pick_rarest_branch_literal) for logging and
-// verifies via SearchStats::verifier. This file keeps the pure extraction
+// M1.5 cost model integration: Regex flavour uses QueryIR branch_mandatory /
+// mandatory for chunk-level pruning. estimateCost() consumes exact planner
+// q-gram chunk/document statistics and widens estimates using legacy hash
+// buckets; it never changes the conservative filter or regex execution.
+// For regex: branch_mandatory union or mandatory chunk pruning, then exact
+// per-file regex_find_all. This file keeps pure extraction conservative.
 // conservative (no false negatives) and documents the cost hooks.
-
 namespace pergrep::detail {
 namespace {
 
