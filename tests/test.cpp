@@ -234,6 +234,73 @@ int main(){
     auto m = s.find(p);
     assert(!m.empty());
   }
+  // Empty files and zero-width/nullable patterns must remain candidate files.
+  {
+    std::vector<Document> docs = {
+      {"empty.txt", ""},
+      {"hit.txt", "needle\n"},
+      {"trailing.txt", "x\n"},
+      {"other.txt", "other\n"}
+    };
+    IndexOptions indexed_opt;
+    indexed_opt.chunk_bytes = 64;
+    indexed_opt.chunk_overlap = 16;
+    auto indexed_idx = Index::from_documents(docs, indexed_opt);
+    IndexOptions reference_opt;
+    reference_opt.chunk_bytes = 1024 * 1024;
+    reference_opt.chunk_overlap = 512 * 1024;
+    auto reference_idx = Index::from_documents(docs, reference_opt);
+    Searcher indexed(indexed_idx), reference(reference_idx);
+
+    auto assert_equivalent = [&](std::string expr, PatternOptions popt, SearchOptions sopt = {}) {
+      auto pattern = Pattern::compile(std::move(expr), popt);
+      auto actual = indexed.find(pattern, sopt);
+      auto expected = reference.find(pattern, sopt);
+      assert(actual.size() == expected.size());
+      for (size_t i = 0; i < expected.size(); ++i) {
+        assert(actual[i].file_id == expected[i].file_id);
+        assert(actual[i].start == expected[i].start);
+        assert(actual[i].end == expected[i].end);
+      }
+      auto actual_files = indexed.files(pattern, sopt);
+      auto expected_files = reference.files(pattern, sopt);
+      assert(actual_files == expected_files);
+      return actual;
+    };
+
+    PatternOptions fixed;
+    fixed.kind = PatternKind::Fixed;
+    auto empty_fixed = assert_equivalent("", fixed);
+    assert(!empty_fixed.empty());
+    auto empty_files = indexed.files(Pattern::compile("", fixed));
+    assert((empty_files == std::vector<uint32_t>{0, 1, 2, 3}));
+
+    for (const auto& expr : {"a*", "^", "$", R"(\A)", R"(\z)"}) {
+      auto matches = assert_equivalent(expr, {});
+      assert(!matches.empty());
+      SearchOptions with;
+      with.files_with_matches = true;
+      assert_equivalent(expr, {}, with);
+      SearchOptions without;
+      without.files_without_match = true;
+      auto files_without = indexed.files(Pattern::compile(expr), without);
+      assert(files_without.empty());
+    }
+
+    PatternOptions multiline;
+    multiline.multiline = true;
+    auto multiline_begin = assert_equivalent("^", multiline);
+    auto multiline_end = assert_equivalent("$", multiline);
+    assert(multiline_begin.size() == 7);
+    assert(multiline_end.size() == 7);
+    auto singleline_begin = assert_equivalent("^", {});
+    auto trailing_id = indexed.files(Pattern::compile("^"));
+    assert(singleline_begin.size() == 4);
+    assert(trailing_id.size() == docs.size());
+    auto without_needle = indexed.files(Pattern::compile("needle", fixed), {.files_without_match = true});
+    assert(without_needle.size() == 3);
+    assert(without_needle[0] == 0 && without_needle[1] == 2 && without_needle[2] == 3);
+  }
   // Default-constructed Index observer calls.
   {
     Index idx;

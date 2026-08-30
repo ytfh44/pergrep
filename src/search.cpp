@@ -290,6 +290,15 @@ std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_vie
 //   negatives; intersection of q-gram rows can only over-approximate candidate blocks.
 std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(const detail::IndexData& I, std::string_view q, SearchStats* st) {
     std::vector<std::pair<uint32_t, uint32_t>> out;
+    if (q.empty()) {
+        out.reserve(I.chunks.size());
+        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) out.push_back({ci, 0});
+        if (st) {
+            st->candidate_chunks += I.chunks.size();
+            st->candidate_blocks += out.size();
+        }
+        return out;
+    }
     auto cv = chunk_candidates(I, q);
     if (st) st->candidate_chunks += cv.size();
     auto hs = planned_hashes(I, q);
@@ -674,9 +683,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin, z.ext_end - z.core_begin);
                     if (stats) stats->verified_bytes += v.size();
                     size_t pos = 0;
-                    while (pos < z.core_end - z.core_begin) {
+                    const auto core = z.core_end - z.core_begin;
+                    const auto max_start = core + (q.empty() ? 1 : 0);
+                    while (pos < max_start) {
                         size_t local_end = 0;
-                        auto x = anchor_find(v, q, a, pos, z.core_end - z.core_begin, icase, &local_end);
+                        auto x = anchor_find(v, q, a, pos, max_start, icase, &local_end);
                         if (x == std::string_view::npos) break;
                         uint64_t abs = z.core_begin + x, abs_end = z.core_begin + local_end;
                         bool ok = true;
@@ -731,15 +742,17 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 auto z = I.chunks[ci];
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
                 uint32_t rb = bi * I.pos_block;
-                if (rb >= z.core_end - z.core_begin) continue;
+                if (rb >= z.core_end - z.core_begin && !(q.empty() && rb == 0 && z.core_end == z.core_begin))
+                    continue;
                 uint32_t core = std::min<uint32_t>(I.pos_block, (z.core_end - z.core_begin) - rb);
                 uint32_t re = std::min<uint32_t>(z.ext_end - z.core_begin, rb + I.pos_block + 64);
                 auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin + rb, re - rb);
                 if (stats) stats->verified_bytes += v.size();
                 size_t pos = 0;
-                while (pos < core) {
+                const auto max_start = static_cast<size_t>(core) + (q.empty() ? 1 : 0);
+                while (pos < max_start) {
                     size_t local_end = 0;
-                    auto x = anchor_find(v, q, a, pos, core, false, &local_end);
+                    auto x = anchor_find(v, q, a, pos, max_start, false, &local_end);
                     if (x == std::string_view::npos) break;
                     uint64_t abs = z.core_begin + rb + x;
                     uint64_t abs_end = z.core_begin + rb + local_end;

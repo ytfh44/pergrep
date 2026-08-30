@@ -103,6 +103,10 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
     uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
     for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
         uint64_t n = I->loaded[fid].data.size();
+        if (n == 0) {
+            I->chunks.push_back({fid, 0, 0, 0});
+            continue;
+        }
         for (uint64_t b = 0; b < n; b += core) {
             uint64_t e = std::min(n, b + core), x = std::min(n, e + over);
             I->chunks.push_back({fid, b, e, x});
@@ -221,6 +225,10 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
     uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
     for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
         uint64_t n = I->loaded[fid].data.size();
+        if (n == 0) {
+            I->chunks.push_back({fid, 0, 0, 0});
+            continue;
+        }
         for (uint64_t b = 0; b < n; b += core) {
             uint64_t e = std::min(n, b + core), x = std::min(n, e + over);
             I->chunks.push_back({fid, b, e, x});
