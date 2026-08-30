@@ -737,6 +737,9 @@ int main(int argc, char** argv) {
         core_opt.files_with_matches = false;
         core_opt.files_without_match = false;
         core_opt.max_matches = 0;
+        // Quiet positive searches need existence; invert mode must retain all matches
+        // so the line-level non-match decision remains exact.
+        core_opt.objective = a.quiet && !a.sopt.invert_match ? SearchObjective::FirstHit : SearchObjective::Exhaustive;
         core_opt.include_binary = true;
         core_opt.record_separator = a.null_data ? '\0' : '\n';
         core_opt.eligible_file_ids = eligible_file_ids;
@@ -829,7 +832,11 @@ int main(int argc, char** argv) {
 
             if (a.files_with || a.files_without) {
                 bool emit = a.files_with ? hit : !hit;
-                if (emit) { any = true; std::cout << display_path(idx->files()[fid].path, a) << (a.null_out ? '\0' : '\n'); }
+                if (emit) {
+                    any = true;
+                    if (a.quiet) return 0;
+                    std::cout << display_path(idx->files()[fid].path, a) << (a.null_out ? '\0' : '\n');
+                }
                 continue;
             }
             if (a.quiet && hit) return 0;

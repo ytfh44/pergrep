@@ -61,6 +61,14 @@
 - **Tests**: Deterministic distinctness for each semantic input (NUL vs LF, overlap, max_matches, invert/files, binary, eligible ids, index options, PatternOptions fields, transformed identity) and `std::hash` stability.
 - **Branch**: `autoresearch/m1.3-plan-key` (M1.3)
 
+## M1.8 — Objective-Aware First-Hit and Ordered Prefix
+
+`SearchOptions::objective` separates exhaustive search from two bounded-result contracts: `FirstHit` returns the first result in the existing `(file_id, offset)` traversal, while `OrderedPrefix` permits stopping at `max_matches` only after that ordered prefix has been verified. The default remains `Exhaustive`; it never inherits hit-probability ordering or early-stop bias.
+
+Quiet CLI searches opt into `FirstHit`. `files_with_matches` and `files_without_match` retain file polarity and ascending file order; a first-file objective probes files in that order rather than reordering candidates. If ordering cannot be proven, callers must use exhaustive traversal. The optional C++ `should_cancel` callback is cooperative and checked only at safe candidate/record boundaries; absent callbacks mean no cancellation is requested.
+
+`SearchStats` reports `objective`, `candidate_order`, `candidate_order_preserved`, `early_stopped`, `early_stop_reason`, `first_hit_observed`, and `time_to_first_hit_ns`. The first-hit metric starts at search execution and ends at the first selected match (not candidate discovery); no-hit searches report `first_hit_observed=false` and `time_to_first_hit_ns=0`.
+
 ## Interleaving with BugFix
 
 ```
