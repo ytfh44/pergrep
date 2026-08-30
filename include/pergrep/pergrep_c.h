@@ -69,6 +69,7 @@ uint64_t pg_index_corpus_bytes(const pg_index* index);
 uint64_t pg_index_bytes(const pg_index* index);
 size_t pg_index_file_count(const pg_index* index);
 const char* pg_index_file_path(const pg_index* index, size_t file_id);
+int pg_index_is_snapshot(const pg_index* index);
 
 pg_pattern* pg_pattern_compile(const char* expression, const pg_pattern_options* options, char** error);
 void pg_pattern_free(pg_pattern* pattern);

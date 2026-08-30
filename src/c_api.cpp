@@ -94,6 +94,9 @@ const char* pg_index_file_path(const pg_index* p, size_t id) {
     if (!p || !p->value || id >= p->value->files().size()) return nullptr;
     return p->value->files()[id].path.c_str();
 }
+int pg_index_is_snapshot(const pg_index* p) {
+    return (p && p->value && p->value->is_snapshot()) ? 1 : 0;
+}
 
 pg_pattern* pg_pattern_compile(const char* expr, const pg_pattern_options* options, char** error) {
     if (!expr) { set_error(error, "expression is null"); return nullptr; }

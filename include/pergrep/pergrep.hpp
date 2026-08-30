@@ -96,6 +96,7 @@ public:
     std::span<const FileInfo> files() const noexcept;
     std::uint64_t corpus_bytes() const noexcept;
     std::uint64_t index_bytes() const noexcept;
+    bool is_snapshot() const noexcept;
     bool fresh() const;
     std::string_view content(std::size_t file_id) const;
     // QO-4 test hook: expose underlying IndexData for cost-model unit tests.

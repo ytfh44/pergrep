@@ -2367,6 +2367,254 @@ int main(){
 
     std::cerr << "M0.7 done\n" << std::flush;
   }
+  // M0.8: Freshness, snapshot contracts, and cache-security integrity
+  {
+    std::cerr << "M0.8 freshness and snapshot contracts\n" << std::flush;
+    namespace fs = std::filesystem;
+
+    // 1. Index::is_snapshot() on v5 vs v6 build/load paths & default constructed / ephemeral indexes
+    {
+      auto base = fs::temp_directory_path() / "pergrep_m08_snapshot_types";
+      fs::remove_all(base);
+      auto root = base / "corpus";
+      fs::create_directories(root);
+      {
+        std::ofstream f(root / "doc.txt", std::ios::binary);
+        f << "snapshot test payload line 1\nline 2 with key\n";
+      }
+
+      // Default Index() has no impl, is_snapshot() must be false
+      Index uninit;
+      assert(!uninit.is_snapshot());
+
+      // v5 source-backed build (persist_corpus = false by default)
+      IndexOptions opt_v5;
+      opt_v5.persist_corpus = false;
+      auto idx_v5 = Index::build(root, opt_v5);
+      assert(!idx_v5.is_snapshot());
+      auto path_v5 = base / "idx_v5.bin";
+      idx_v5.save(path_v5);
+
+      // Loading v5 index must report is_snapshot() == false
+      auto loaded_v5 = Index::load(path_v5);
+      assert(!loaded_v5.is_snapshot());
+      assert(loaded_v5.files().size() == 1);
+      assert(!loaded_v5.options().persist_corpus);
+
+      // v6 persisted snapshot build (persist_corpus = true)
+      IndexOptions opt_v6;
+      opt_v6.persist_corpus = true;
+      auto idx_v6 = Index::build(root, opt_v6);
+      assert(idx_v6.is_snapshot());
+      auto path_v6 = base / "idx_v6.bin";
+      idx_v6.save(path_v6);
+
+      // Loading v6 index must report is_snapshot() == true
+      auto loaded_v6 = Index::load(path_v6);
+      assert(loaded_v6.is_snapshot());
+      assert(loaded_v6.files().size() == 1);
+      assert(loaded_v6.options().persist_corpus);
+
+      // Ephemeral from_documents indexes
+      IndexOptions opt_eph_v5;
+      opt_eph_v5.persist_corpus = false;
+      auto eph_v5 = Index::from_documents({{"a.txt", "doc content\n"}}, opt_eph_v5);
+      assert(!eph_v5.is_snapshot());
+      assert(!eph_v5.fresh()); // Ephemeral indexes are never fresh against filesystem
+
+      IndexOptions opt_eph_v6;
+      opt_eph_v6.persist_corpus = true;
+      auto eph_v6 = Index::from_documents({{"a.txt", "doc content\n"}}, opt_eph_v6);
+      assert(eph_v6.is_snapshot());
+      assert(!eph_v6.fresh());
+
+      fs::remove_all(base);
+    }
+
+    // 2. Snapshot vs live view behavior across filesystem modifications
+    {
+      auto base = fs::temp_directory_path() / "pergrep_m08_fs_mutation";
+      fs::remove_all(base);
+      auto root = base / "corpus";
+      fs::create_directories(root);
+
+      std::string content_1 = "alpha beta gamma delta\n";
+      std::string content_2 = "omega psi chi phi\n";
+      {
+        std::ofstream f(root / "doc1.txt", std::ios::binary);
+        f << content_1;
+      }
+      {
+        std::ofstream f(root / "doc2.txt", std::ios::binary);
+        f << content_2;
+      }
+
+      // Build and save v5 (live view) and v6 (snapshot)
+      IndexOptions opt_v5;
+      opt_v5.persist_corpus = false;
+      auto idx_v5 = Index::build(root, opt_v5);
+      auto path_v5 = base / "idx_v5.bin";
+      idx_v5.save(path_v5);
+
+      IndexOptions opt_v6;
+      opt_v6.persist_corpus = true;
+      auto idx_v6 = Index::build(root, opt_v6);
+      auto path_v6 = base / "idx_v6.bin";
+      idx_v6.save(path_v6);
+
+      assert(idx_v5.fresh());
+      assert(idx_v6.fresh());
+
+      // Load v6 snapshot before mutation
+      auto loaded_snapshot = Index::load(path_v6);
+      assert(loaded_snapshot.is_snapshot());
+
+      // Perform filesystem modifications:
+      // (a) Mutate doc1.txt content
+      // (b) Delete doc2.txt
+      // (c) Add new doc3.txt
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      {
+        std::ofstream f(root / "doc1.txt", std::ios::binary | std::ios::trunc);
+        f << "MUTATED content for doc1\n";
+      }
+      fs::remove(root / "doc2.txt");
+      {
+        std::ofstream f(root / "doc3.txt", std::ios::binary);
+        f << "new file doc3\n";
+      }
+
+      // (1) Freshness checks on existing handles must report false
+      assert(!idx_v5.fresh());
+      assert(!idx_v6.fresh());
+      assert(!loaded_snapshot.fresh());
+
+      // (2) Loading v5 live view index must throw because indexed doc2.txt disappeared
+      bool v5_load_failed = false;
+      try {
+        (void)Index::load(path_v5);
+      } catch (const std::exception& e) {
+        v5_load_failed = true;
+        std::string what = e.what();
+        assert(what.find("disappeared") != std::string::npos || what.find("cannot open") != std::string::npos);
+      }
+      assert(v5_load_failed);
+
+      // (3) Loading v6 snapshot index must succeed despite deleted & mutated files
+      auto loaded_after_mutation = Index::load(path_v6);
+      assert(loaded_after_mutation.is_snapshot());
+      assert(loaded_after_mutation.files().size() == 2);
+      assert(loaded_after_mutation.content(0) == content_1);
+      assert(loaded_after_mutation.content(1) == content_2);
+
+      // Search on loaded v6 snapshot must return exact original matches invariant to filesystem
+      Searcher s(loaded_after_mutation);
+      auto pat1 = Pattern::compile("gamma", {.kind = PatternKind::Fixed});
+      auto m1 = s.find(pat1);
+      assert(m1.size() == 1);
+      assert(m1[0].file_id == 0);
+
+      auto pat2 = Pattern::compile("omega", {.kind = PatternKind::Fixed});
+      auto m2 = s.find(pat2);
+      assert(m2.size() == 1);
+      assert(m2[0].file_id == 1);
+
+      fs::remove_all(base);
+    }
+
+    // 3. Truncated and corrupted index loading (invalid magic, truncated file, invalid version)
+    {
+      auto base = fs::temp_directory_path() / "pergrep_m08_corruption";
+      fs::remove_all(base);
+      fs::create_directories(base / "corpus");
+      {
+        std::ofstream f(base / "corpus" / "a.txt", std::ios::binary);
+        f << "corrupt test content\n";
+      }
+
+      IndexOptions opt_v6;
+      opt_v6.persist_corpus = true;
+      auto valid_idx = Index::build(base / "corpus", opt_v6);
+      auto valid_path = base / "valid.bin";
+      valid_idx.save(valid_path);
+
+      std::ifstream in(valid_path, std::ios::binary);
+      std::string valid_bytes((std::istreambuf_iterator<char>(in)), {});
+      in.close();
+      assert(valid_bytes.size() >= 16);
+
+      // (a) Invalid magic header
+      {
+        auto bad_magic_path = base / "bad_magic.bin";
+        std::string bad_magic = valid_bytes;
+        bad_magic[0] = 'N';
+        bad_magic[1] = 'O';
+        bad_magic[2] = 'T';
+        bad_magic[3] = 'P';
+        bad_magic[4] = 'E';
+        bad_magic[5] = 'R';
+        bad_magic[6] = 'G';
+        bad_magic[7] = 'R';
+        {
+          std::ofstream out(bad_magic_path, std::ios::binary | std::ios::trunc);
+          out.write(bad_magic.data(), bad_magic.size());
+        }
+        bool threw = false;
+        try {
+          (void)Index::load(bad_magic_path);
+        } catch (const std::runtime_error& e) {
+          threw = true;
+          std::string msg = e.what();
+          assert(msg.find("truncated") != std::string::npos || msg.find("cannot open") != std::string::npos);
+        }
+        assert(threw);
+      }
+
+      // (b) Truncated files (0 bytes, 4 bytes, 8 bytes, 11 bytes < header, partial header)
+      for (size_t trunc_len : {size_t(0), size_t(4), size_t(8), size_t(11)}) {
+        auto trunc_path = base / ("trunc_" + std::to_string(trunc_len) + ".bin");
+        {
+          std::ofstream out(trunc_path, std::ios::binary | std::ios::trunc);
+          if (trunc_len > 0) {
+            out.write(valid_bytes.data(), std::min(trunc_len, valid_bytes.size()));
+          }
+        }
+        bool threw = false;
+        try {
+          (void)Index::load(trunc_path);
+        } catch (const std::runtime_error& e) {
+          threw = true;
+          std::string msg = e.what();
+          assert(msg.find("truncated") != std::string::npos);
+        }
+        assert(threw);
+      }
+
+      // (c) Unsupported / invalid version numbers (e.g. 0, 4, 7, 9999, 0xFFFFFFFF)
+      for (uint32_t bad_ver : {0u, 1u, 4u, 7u, 100u, 0xFFFFFFFFu}) {
+        auto bad_ver_path = base / ("bad_ver_" + std::to_string(bad_ver) + ".bin");
+        std::string bad_ver_bytes = valid_bytes;
+        std::memcpy(&bad_ver_bytes[8], &bad_ver, sizeof(bad_ver));
+        {
+          std::ofstream out(bad_ver_path, std::ios::binary | std::ios::trunc);
+          out.write(bad_ver_bytes.data(), bad_ver_bytes.size());
+        }
+        bool threw = false;
+        try {
+          (void)Index::load(bad_ver_path);
+        } catch (const std::runtime_error& e) {
+          threw = true;
+          std::string msg = e.what();
+          assert(msg.find("unsupported pergrep index version") != std::string::npos);
+        }
+        assert(threw);
+      }
+
+      fs::remove_all(base);
+    }
+
+    std::cerr << "M0.8 done\n" << std::flush;
+  }
   }
 
   return 0;

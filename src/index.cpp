@@ -318,6 +318,9 @@ uint64_t Index::corpus_bytes() const noexcept {
 uint64_t Index::index_bytes() const noexcept {
     return impl_ ? impl_->bytes() : 0;
 }
+bool Index::is_snapshot() const noexcept {
+    return impl_ ? impl_->opt.persist_corpus : false;
+}
 const void* Index::debug_index_data() const noexcept {
     return impl_ ? static_cast<const void*>(impl_.get()) : nullptr;
 }
