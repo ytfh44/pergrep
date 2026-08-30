@@ -66,8 +66,17 @@ Every scenario emits a `SCENARIO` descriptor and a `METRIC` line with these dime
 - workload: corpus bytes, query count, iteration count;
 - lifecycle: `index_build_ms`, `search_time_ms`, and `search_ms_per_query`;
 - performance: `throughput_mb_s` (bytes searched divided by measured search time);
-- optimizer evidence: `verified_kb`, `candidate_chunks`, and `candidate_blocks`;
+- optimizer evidence: `logical_unique_kb` (deduplicated source ranges), `physically_touched_kb`
+  (verifier slices, including overlap; legacy `verified_kb` alias), `index_probe_kb`,
+  and `index_probe_operations`;
+- candidate counts: `candidate_chunks`, `candidate_blocks`, and `candidate_files`;
+- verifier/resource timing: `verifier_cpu_ms` (process CPU time after plan selection).
 - result invariant: `matches` and `correctness=pass` from indexed-vs-reference comparison.
+
+The matrix intentionally does not report allocation or page-fault timing: the current public
+API has no portable per-search measurement for either event. Candidate counts are emitted
+from the filter stage, while byte counters describe only verifier source slices and index rows;
+none of these counters participates in matching or plan selection.
 
 Release gates should retain the per-scenario lines rather than relying only on aggregate
 metrics. Aggregate fields remain for compatibility with existing benchmark consumers.

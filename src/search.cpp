@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
@@ -19,6 +20,66 @@
 namespace pergrep {
 using detail::QueryDesc;
 namespace {
+struct StatsRecorder {
+    SearchStats* stats = nullptr;
+    const detail::IndexData& index;
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> touched;
+    std::unordered_set<std::uint32_t> candidate_file_ids;
+
+    StatsRecorder(SearchStats* s, const detail::IndexData& i) : stats(s), index(i) {
+        if (stats) touched.resize(index.infos.size());
+    }
+
+    void note_candidates(const std::vector<std::uint32_t>& chunks) {
+        if (!stats) return;
+        stats->candidate_chunks += chunks.size();
+        for (auto ci : chunks) {
+            if (ci < index.chunks.size()) candidate_file_ids.insert(index.chunks[ci].file_id);
+        }
+    }
+
+    void note_all_chunks() {
+        if (!stats) return;
+        stats->candidate_chunks += index.chunks.size();
+        for (const auto& chunk : index.chunks) candidate_file_ids.insert(chunk.file_id);
+    }
+
+    void note_probe(std::size_t bytes) {
+        if (!stats) return;
+        stats->index_probe_bytes += bytes;
+        ++stats->index_probe_operations;
+    }
+
+    void touch(std::uint32_t file_id, std::uint64_t begin, std::uint64_t end) {
+        if (!stats || begin >= end || file_id >= touched.size()) return;
+        const auto bytes = end - begin;
+        stats->physically_touched_bytes += bytes;
+        stats->verified_bytes += bytes; // legacy alias for physical work
+        touched[file_id].push_back({begin, end});
+    }
+
+    void finish() {
+        if (!stats) return;
+        for (auto& ranges : touched) {
+            if (ranges.empty()) continue;
+            std::sort(ranges.begin(), ranges.end());
+            std::uint64_t begin = ranges.front().first;
+            std::uint64_t end = ranges.front().second;
+            for (std::size_t i = 1; i < ranges.size(); ++i) {
+                if (ranges[i].first > end) {
+                    stats->logical_unique_bytes += end - begin;
+                    begin = ranges[i].first;
+                    end = ranges[i].second;
+                } else if (ranges[i].second > end) {
+                    end = ranges[i].second;
+                }
+            }
+            stats->logical_unique_bytes += end - begin;
+        }
+        stats->candidate_files = candidate_file_ids.size();
+    }
+};
+
 
 struct DecodedRune { UChar32 cp = U_SENTINEL; std::size_t next = 0; bool ok = false; };
 DecodedRune decode_rune(std::string_view s, std::size_t pos) {
@@ -54,7 +115,8 @@ bool unicode_icase_equal_at(std::string_view s, std::string_view q, std::size_t 
     return true;
 }
 
-void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q, std::vector<uint32_t>& out) {
+void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
+                      std::vector<uint32_t>& out, StatsRecorder* rec = nullptr) {
     if (g.gids.empty()) return;
     auto const& qc = q.classes[g.lg - 9];
     if (qc.empty()) {
@@ -68,6 +130,7 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q, std
             unsigned bit = std::countr_zero(mask64);
             uint32_t row = uint32_t(ww) * 64 + bit;
             auto p = g.bits.data() + (size_t)row * g.words;
+            if (rec) rec->note_probe(static_cast<std::size_t>(g.words) * sizeof(std::uint64_t));
             for (uint32_t j = 0; j < g.words; ++j) c[j] &= p[j];
             mask64 &= mask64 - 1;
         }
@@ -86,7 +149,8 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q, std
     }
 }
 
-std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_view lit) {
+std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_view lit,
+                                       StatsRecorder* rec = nullptr) {
     std::vector<uint32_t> out;
     if (lit.size() < 4 || lit.size() > I.opt.chunk_overlap) {
         out.resize(I.chunks.size());
@@ -95,7 +159,7 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
     }
     auto q = detail::compile_qgram_query(lit);
     for (auto const& g : I.groups) {
-        group_candidates(g, q, out);
+        group_candidates(g, q, out, rec);
     }
     std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
         if (I.chunks[a].file_id != I.chunks[b].file_id)
@@ -107,6 +171,7 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
+
 
 size_t choose_rare_byte(const detail::IndexData& I, std::string_view q) {
     if (q.empty()) return 0;
@@ -288,19 +353,20 @@ std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_vie
 //   files union). This guarantees no false negatives for long literals crossing 32 KiB boundaries.
 // - Block Bloom is conservative: each block's Bloom may have false positives but never false
 //   negatives; intersection of q-gram rows can only over-approximate candidate blocks.
-std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(const detail::IndexData& I, std::string_view q, SearchStats* st) {
+std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(
+    const detail::IndexData& I, std::string_view q, StatsRecorder* rec) {
     std::vector<std::pair<uint32_t, uint32_t>> out;
     if (q.empty()) {
         out.reserve(I.chunks.size());
         for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) out.push_back({ci, 0});
-        if (st) {
-            st->candidate_chunks += I.chunks.size();
-            st->candidate_blocks += out.size();
+        if (rec && rec->stats) {
+            rec->note_all_chunks();
+            rec->stats->candidate_blocks += out.size();
         }
         return out;
     }
-    auto cv = chunk_candidates(I, q);
-    if (st) st->candidate_chunks += cv.size();
+    auto cv = chunk_candidates(I, q, rec);
+    if (rec) rec->note_candidates(cv);
     auto hs = planned_hashes(I, q);
     std::vector<uint8_t> bm;
     for (auto ci : cv) {
@@ -318,6 +384,7 @@ std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(const detail::
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         for (auto r : rows) {
             const uint8_t* ptr = I.pos.data() + d.off + static_cast<size_t>(r) * d.mask_bytes;
+            if (rec) rec->note_probe(d.mask_bytes);
             bool any = false;
             for (uint32_t j = 0; j < d.mask_bytes; ++j) {
                 bm[j] &= ptr[j];
@@ -337,7 +404,7 @@ std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(const detail::
             }
         }
     }
-    if (st) st->candidate_blocks += out.size();
+    if (rec && rec->stats) rec->stats->candidate_blocks += out.size();
     return out;
 }
 
@@ -553,6 +620,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
+    StatsRecorder accounting(stats, I);
     std::vector<Match> out;
     // QO-4 cost model: estimate selectivity via qgram_freq/byte_freq and chunk pruning rate.
     // Computes per-verifier cost (verified_bytes + k*candidate_chunks) and picks cheapest.
@@ -565,14 +633,13 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->estimated_selectivity = qc.selectivity;
     }
-
-
+    const auto verifier_start = stats ? std::clock() : std::clock_t(0);
     if (opt.invert_match) {
-        if (stats) stats->candidate_chunks += I.chunks.size();
+        accounting.note_all_chunks();
         for (uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
             if (!opt.include_binary && I.infos[fid].binary) continue;
             const auto& data = I.loaded[fid].data;
-            if (stats) stats->verified_bytes += data.size();
+            accounting.touch(fid, 0, data.size());
             std::size_t b = 0;
             while (b < data.size() || (b == 0 && data.empty())) {
                 auto e = data.find(static_cast<char>(opt.record_separator), b);
@@ -610,12 +677,9 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
 
         // Safe cross-chunk fallback: literals longer than chunk_overlap may straddle two chunks.
         // Chunk-level pruning would miss such matches (no single chunk contains the full literal).
-        // We therefore fall back to whole-file scanning over the union of candidate files
-        // (conservative files union from chunk_candidates). The rare-byte anchor scan over the
-        // entire file guarantees no false negatives, even when the literal crosses the 32 KiB boundary.
         if (q.size() > I.opt.chunk_overlap) {
-            auto cv = chunk_candidates(I, q);
-            if (stats) stats->candidate_chunks += cv.size();
+            auto cv = chunk_candidates(I, q, &accounting);
+            accounting.note_candidates(cv);
             std::vector<uint32_t> files;
             for (auto ci : cv) {
                 if (files.empty() || files.back() != I.chunks[ci].file_id) {
@@ -626,7 +690,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             for (auto fid : files) {
                 if (!opt.include_binary && I.infos[fid].binary) continue;
                 const auto& data = I.loaded[fid].data;
-                if (stats) stats->verified_bytes += data.size();
+                accounting.touch(fid, 0, data.size());
                 size_t pos = 0;
                 size_t max_pos = data.size() + (q.empty() ? 1 : 0);
                 while (pos < max_pos) {
@@ -671,8 +735,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         //   pruning at block granularity would be unsafe. Chunk-level pruning is conservative and
         //   defers word/line checks to exact verification.
         } else if (icase || p.impl_->opt.word || p.impl_->opt.line) {
-            auto cv = chunk_candidates(I, icase ? std::string_view{} : q);
-            if (stats) stats->candidate_chunks += cv.size();
+            auto cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
+            accounting.note_candidates(cv);
             std::unordered_set<uint32_t> done_chunks;
             size_t a = choose_rare_byte(I, q);
             std::unordered_map<uint32_t, uint64_t> next;
@@ -681,7 +745,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
                 if (done_chunks.insert(ci).second) {
                     auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin, z.ext_end - z.core_begin);
-                    if (stats) stats->verified_bytes += v.size();
+                    accounting.touch(z.file_id, z.core_begin, z.ext_end);
                     size_t pos = 0;
                     const auto core = z.core_end - z.core_begin;
                     const auto max_start = core + (q.empty() ? 1 : 0);
@@ -735,8 +799,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         //   limited to the block's core range (+64 lookahead for q-gram overlap). This is conservative
         //   (no false negatives) and typically reduces verified bytes by orders of magnitude for rare literals.
         } else if (q.size() <= 64) {
-            auto blocks = fixed_candidate_blocks(I, q, stats);
             size_t a = choose_rare_byte(I, q);
+            auto blocks = fixed_candidate_blocks(I, q, &accounting);
             std::unordered_map<uint32_t, uint64_t> next;
             for (auto [ci, bi] : blocks) {
                 auto z = I.chunks[ci];
@@ -747,9 +811,9 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 uint32_t core = std::min<uint32_t>(I.pos_block, (z.core_end - z.core_begin) - rb);
                 uint32_t re = std::min<uint32_t>(z.ext_end - z.core_begin, rb + I.pos_block + 64);
                 auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin + rb, re - rb);
-                if (stats) stats->verified_bytes += v.size();
                 size_t pos = 0;
                 const auto max_start = static_cast<size_t>(core) + (q.empty() ? 1 : 0);
+                accounting.touch(z.file_id, z.core_begin + rb, z.core_begin + re);
                 while (pos < max_start) {
                     size_t local_end = 0;
                     auto x = anchor_find(v, q, a, pos, max_start, false, &local_end);
@@ -776,15 +840,15 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         // and verifying at chunk granularity avoids the per-block Bloom overhead. This path
         // remains conservative (chunk candidate set is a superset of true matches).
         } else {
-            auto cv = chunk_candidates(I, q);
-            if (stats) stats->candidate_chunks += cv.size();
+            auto cv = chunk_candidates(I, q, &accounting);
+            accounting.note_candidates(cv);
             size_t a = choose_rare_byte(I, q);
             std::unordered_map<uint32_t, uint64_t> next;
             for (auto ci : cv) {
                 auto z = I.chunks[ci];
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
                 auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin, z.ext_end - z.core_begin);
-                if (stats) stats->verified_bytes += v.size();
+                accounting.touch(z.file_id, z.core_begin, z.ext_end);
                 size_t pos = 0;
                 while (pos < z.core_end - z.core_begin) {
                     size_t local_end = 0;
@@ -823,7 +887,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     if (m.size() > best_lit.size()) best_lit = m;
                 }
                 if (!best_lit.empty()) {
-                    auto bcv = chunk_candidates(I, best_lit);
+                    auto bcv = chunk_candidates(I, best_lit, &accounting);
                     cv.insert(cv.end(), bcv.begin(), bcv.end());
                 }
             }
@@ -835,8 +899,9 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     if (m.size() > lit.size()) lit = m;
                 }
             }
-            cv = chunk_candidates(I, lit);
+            cv = chunk_candidates(I, lit, &accounting);
         }
+        accounting.note_candidates(cv);
         std::vector<uint32_t> files;
         for (auto ci : cv) {
             if (files.empty() || files.back() != I.chunks[ci].file_id) {
@@ -848,7 +913,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             auto const& data = I.loaded[fid].data;
             if (!lit.empty() && lit.size() < 4 && p.impl_->opt.case_mode == CaseMode::Sensitive &&
                 data.find(lit) == std::string::npos) continue;
-            if (stats) stats->verified_bytes += data.size();
+            accounting.touch(fid, 0, data.size());
             const auto remain = [&]() { return opt.max_matches ? opt.max_matches - out.size() : 0; };
             if (p.impl_->opt.multiline) {
                 auto ms = detail::regex_find_all(p.impl_->re, data, p.impl_->opt, opt.overlapping, fid, 0, remain(), opt.record_separator);
@@ -878,7 +943,16 @@ done:
     if (opt.max_matches && out.size() > opt.max_matches) {
         out.resize(opt.max_matches);
     }
-    if (stats) stats->matches = out.size();
+    if (stats) {
+        accounting.finish();
+        stats->matches = out.size();
+        const auto elapsed = std::clock() - verifier_start;
+        if (elapsed > 0) {
+            stats->verifier_cpu_ns =
+                static_cast<std::uint64_t>((static_cast<long double>(elapsed) * 1000000000.0L) /
+                                            static_cast<long double>(CLOCKS_PER_SEC));
+        }
+    }
     return out;
 }
 

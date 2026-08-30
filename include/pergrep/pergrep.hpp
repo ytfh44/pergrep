@@ -131,11 +131,35 @@ struct Match {
     std::vector<Capture> captures;
 };
 
+// Search accounting uses source-byte offsets, not allocator or OS-I/O events.
+// `physically_touched_bytes` is the sum of verifier slices (overlap is counted
+// once per slice); `logical_unique_bytes` is the union of those slices within
+// each file (overlap and repeated chunk/block lookahead are counted once).
+// `index_probe_bytes`/`index_probe_operations` count bytes read and row probes
+// against the in-memory candidate indexes. Candidate fields are counts of
+// candidates emitted by the corresponding filter stage. `candidate_chunks` and
+// `candidate_blocks` retain their legacy names and map directly to the new
+// candidate chunk/block counts; `verified_bytes` maps to
+// `physically_touched_bytes`. `verifier_cpu_ns` is process CPU time spent in
+// candidate generation and exact verification after plan selection. Allocation
+// and page-fault timing is intentionally not reported because this API has no
+// portable per-search measurement for either event.
+// The C API intentionally exposes only its historical four-field prefix until
+// a size-aware statistics entry point is added; these extended fields are
+// currently C++ and benchmark-only.
 struct SearchStats {
+    // Legacy fields retain source/header compatibility within this 0.1.0
+    // tree; stable binary compatibility belongs to a future versioned stats API.
     std::uint64_t candidate_chunks = 0;
     std::uint64_t candidate_blocks = 0;
     std::uint64_t verified_bytes = 0;
     std::uint64_t matches = 0;
+    std::uint64_t logical_unique_bytes = 0;
+    std::uint64_t physically_touched_bytes = 0;
+    std::uint64_t index_probe_bytes = 0;
+    std::uint64_t index_probe_operations = 0;
+    std::uint64_t candidate_files = 0;
+    std::uint64_t verifier_cpu_ns = 0;
     // QO-4 cost model: which verifier was chosen for this search.
     // Set by Searcher::find(); default is FixedRareByte for fixed literals
     // and RegexBruteForce for regex with no pruning. Used for per-flavor
