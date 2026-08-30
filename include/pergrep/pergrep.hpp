@@ -113,6 +113,9 @@ struct SearchOptions {
     bool include_binary = false;
     std::uint64_t max_matches = 0; // 0 = unlimited
     unsigned char record_separator = '\n'; // logical record terminator; NUL for rg --null-data
+    // Optional eligible file-ID scope. An empty span means all indexed files.
+    // Callers must keep the referenced IDs alive for the duration of the search.
+    std::span<const std::uint32_t> eligible_file_ids = {};
 };
 
 struct Capture {

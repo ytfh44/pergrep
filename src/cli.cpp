@@ -714,8 +714,11 @@ int main(int argc, char** argv) {
         auto ignore = a.stdin_haystack ? std::vector<IgnoreRule>{} : load_ignore(root, a);
         auto tm = effective_type_map(a);
         std::vector<uint8_t> allowed(idx->files().size());
-        for (uint32_t i=0; i<allowed.size(); ++i) allowed[i] = allowed_path(root, idx->files()[i].path, idx->files()[i], a, ignore, selectors, tm);
-
+        std::vector<uint32_t> eligible_file_ids;
+        for (uint32_t i = 0; i < allowed.size(); ++i) {
+            allowed[i] = allowed_path(root, idx->files()[i].path, idx->files()[i], a, ignore, selectors, tm);
+            if (allowed[i]) eligible_file_ids.push_back(i);
+        }
         if (a.files_mode) {
             std::vector<uint32_t> ids; for(uint32_t i=0;i<allowed.size();++i)if(allowed[i])ids.push_back(i);
             auto key=[&](uint32_t i){return idx->files()[i].path;}; bool rev=a.sort.rfind("reverse:",0)==0; std::string kind=rev?a.sort.substr(8):a.sort;
@@ -736,7 +739,8 @@ int main(int argc, char** argv) {
         core_opt.max_matches = 0;
         core_opt.include_binary = true;
         core_opt.record_separator = a.null_data ? '\0' : '\n';
-        if (!(a.max_count_set && a.max_count == 0)) {
+        core_opt.eligible_file_ids = eligible_file_ids;
+        if (!eligible_file_ids.empty() && !(a.max_count_set && a.max_count == 0)) {
             for (auto& ps : a.patterns) {
                 auto p = Pattern::compile(ps, a.popt);
                 SearchStats st;

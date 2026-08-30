@@ -25,23 +25,40 @@ struct StatsRecorder {
     const detail::IndexData& index;
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> touched;
     std::unordered_set<std::uint32_t> candidate_file_ids;
+    std::vector<std::uint8_t> eligible;
 
-    StatsRecorder(SearchStats* s, const detail::IndexData& i) : stats(s), index(i) {
+    StatsRecorder(SearchStats* s, const detail::IndexData& i,
+                  std::span<const std::uint32_t> eligible_file_ids = {})
+        : stats(s), index(i) {
         if (stats) touched.resize(index.infos.size());
+        if (!eligible_file_ids.empty()) {
+            eligible.assign(index.infos.size(), 0);
+            for (auto fid : eligible_file_ids) {
+                if (fid < eligible.size()) eligible[fid] = 1;
+            }
+        }
+    }
+
+    bool allows(std::uint32_t file_id) const noexcept {
+        return eligible.empty() || (file_id < eligible.size() && eligible[file_id]);
     }
 
     void note_candidates(const std::vector<std::uint32_t>& chunks) {
         if (!stats) return;
-        stats->candidate_chunks += chunks.size();
         for (auto ci : chunks) {
-            if (ci < index.chunks.size()) candidate_file_ids.insert(index.chunks[ci].file_id);
+            if (ci >= index.chunks.size() || !allows(index.chunks[ci].file_id)) continue;
+            ++stats->candidate_chunks;
+            candidate_file_ids.insert(index.chunks[ci].file_id);
         }
     }
 
     void note_all_chunks() {
         if (!stats) return;
-        stats->candidate_chunks += index.chunks.size();
-        for (const auto& chunk : index.chunks) candidate_file_ids.insert(chunk.file_id);
+        for (const auto& chunk : index.chunks) {
+            if (!allows(chunk.file_id)) continue;
+            ++stats->candidate_chunks;
+            candidate_file_ids.insert(chunk.file_id);
+        }
     }
 
     void note_probe(std::size_t bytes) {
@@ -51,7 +68,7 @@ struct StatsRecorder {
     }
 
     void touch(std::uint32_t file_id, std::uint64_t begin, std::uint64_t end) {
-        if (!stats || begin >= end || file_id >= touched.size()) return;
+        if (!stats || !allows(file_id) || begin >= end || file_id >= touched.size()) return;
         const auto bytes = end - begin;
         stats->physically_touched_bytes += bytes;
         stats->verified_bytes += bytes; // legacy alias for physical work
@@ -94,14 +111,6 @@ DecodedRune decode_prev(std::string_view s, std::size_t pos) {
     if (cp < 0) return {static_cast<unsigned char>(s[pos-1]), pos-1, true};
     return {cp, static_cast<std::size_t>(i), true};
 }
-bool unicode_word_cp(UChar32 cp) {
-    return u_isalnum(cp) ||
-           u_charType(cp) == U_CONNECTOR_PUNCTUATION ||
-           u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
-           u_charType(cp) == U_NON_SPACING_MARK ||
-           u_charType(cp) == U_COMBINING_SPACING_MARK ||
-           u_charType(cp) == U_ENCLOSING_MARK;
-}
 bool unicode_icase_equal_at(std::string_view s, std::string_view q, std::size_t pos, std::size_t* end = nullptr) {
     std::size_t sp = pos, qp = 0;
     while (qp < q.size()) {
@@ -114,13 +123,22 @@ bool unicode_icase_equal_at(std::string_view s, std::string_view q, std::size_t 
     if (end) *end = sp;
     return true;
 }
-
+bool unicode_word_cp(UChar32 cp) {
+    return u_isalnum(cp) ||
+           u_charType(cp) == U_CONNECTOR_PUNCTUATION ||
+           u_hasBinaryProperty(cp, UCHAR_JOIN_CONTROL) ||
+           u_charType(cp) == U_NON_SPACING_MARK ||
+           u_charType(cp) == U_COMBINING_SPACING_MARK ||
+           u_charType(cp) == U_ENCLOSING_MARK;
+}
 void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
                       std::vector<uint32_t>& out, StatsRecorder* rec = nullptr) {
     if (g.gids.empty()) return;
     auto const& qc = q.classes[g.lg - 9];
     if (qc.empty()) {
-        out.insert(out.end(), g.gids.begin(), g.gids.end());
+        for (auto ci : g.gids) {
+            if (!rec || rec->allows(rec->index.chunks[ci].file_id)) out.push_back(ci);
+        }
         return;
     }
     std::vector<uint64_t> c(g.words, ~0ull);
@@ -143,7 +161,10 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
         while (z) {
             unsigned b = std::countr_zero(z);
             uint32_t li = w * 64 + b;
-            if (li < g.gids.size()) out.push_back(g.gids[li]);
+            if (li < g.gids.size()) {
+                auto ci = g.gids[li];
+                if (!rec || rec->allows(rec->index.chunks[ci].file_id)) out.push_back(ci);
+            }
             z &= z - 1;
         }
     }
@@ -153,8 +174,10 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
                                        StatsRecorder* rec = nullptr) {
     std::vector<uint32_t> out;
     if (lit.size() < 4 || lit.size() > I.opt.chunk_overlap) {
-        out.resize(I.chunks.size());
-        std::iota(out.begin(), out.end(), 0);
+        out.reserve(I.chunks.size());
+        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+            if (!rec || rec->allows(I.chunks[ci].file_id)) out.push_back(ci);
+        }
         return out;
     }
     auto q = detail::compile_qgram_query(lit);
@@ -358,7 +381,9 @@ std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(
     std::vector<std::pair<uint32_t, uint32_t>> out;
     if (q.empty()) {
         out.reserve(I.chunks.size());
-        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) out.push_back({ci, 0});
+        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+            if (!rec || rec->allows(I.chunks[ci].file_id)) out.push_back({ci, 0});
+        }
         if (rec && rec->stats) {
             rec->note_all_chunks();
             rec->stats->candidate_blocks += out.size();
@@ -620,7 +645,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
-    StatsRecorder accounting(stats, I);
+    StatsRecorder accounting(stats, I, opt.eligible_file_ids);
     std::vector<Match> out;
     // QO-4 cost model: estimate selectivity via qgram_freq/byte_freq and chunk pruning rate.
     // Computes per-verifier cost (verified_bytes + k*candidate_chunks) and picks cheapest.
@@ -637,6 +662,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (opt.invert_match) {
         accounting.note_all_chunks();
         for (uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+            if (!accounting.allows(fid)) continue;
             if (!opt.include_binary && I.infos[fid].binary) continue;
             const auto& data = I.loaded[fid].data;
             accounting.touch(fid, 0, data.size());
@@ -962,6 +988,13 @@ std::vector<uint32_t> Searcher::files(const Pattern& p, SearchOptions opt, Searc
     auto find_opt = opt;
     find_opt.max_matches = 0;
     auto ms = find(p, find_opt, stats);
+    std::vector<uint8_t> eligible(I.infos.size(), 1);
+    if (!opt.eligible_file_ids.empty()) {
+        std::fill(eligible.begin(), eligible.end(), 0);
+        for (auto fid : opt.eligible_file_ids) {
+            if (fid < eligible.size()) eligible[fid] = 1;
+        }
+    }
     std::vector<uint8_t> hit(I.infos.size(), 0);
     for (const auto& m : ms) {
         if (m.file_id < hit.size()) hit[m.file_id] = 1;
@@ -969,6 +1002,7 @@ std::vector<uint32_t> Searcher::files(const Pattern& p, SearchOptions opt, Searc
     std::vector<uint32_t> out;
     if (opt.files_without_match) {
         for (uint32_t i = 0; i < hit.size(); ++i) {
+            if (!eligible[i]) continue;
             if (!opt.include_binary && I.infos[i].binary) continue;
             if (!hit[i]) {
                 out.push_back(i);
@@ -977,6 +1011,7 @@ std::vector<uint32_t> Searcher::files(const Pattern& p, SearchOptions opt, Searc
         }
     } else {
         for (uint32_t i = 0; i < hit.size(); ++i) {
+            if (!eligible[i]) continue;
             if (!opt.include_binary && I.infos[i].binary) continue;
             if (hit[i]) {
                 out.push_back(i);
