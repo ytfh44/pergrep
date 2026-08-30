@@ -13,6 +13,10 @@
 - `nfa_search` prefix jump + `search.cpp` multi-branch union pruning + pure-literal fast path
 - Persistent index `v5` field-by-field serialization + `IndexOptions` upper/lower bound validation
 
+### M1.4 — Physical operator capability inventory
+
+[`docs/physical-operator-capabilities.md`](physical-operator-capabilities.md) is the ownership note and source-of-truth inventory for the pre-scheduler physical operators, their exact backends, option boundaries, fallback behavior, and `SearchStats` evidence. It is documentation only: current `Searcher::find` dispatch remains hard-coded, while `PlanKey`/cost-model results remain annotations until QO-4 adds an actual scheduler.
+
 ## Decomposition into Scoped Autoresearch Subtasks
 
 ### QO-1 — Literal & Branch Analyzer
