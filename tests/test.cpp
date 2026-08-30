@@ -587,6 +587,10 @@ int main(){
       // Regular search: alternation ordering, greediness, nullable and
       // zero-width matches, captures, and multiline/dotall behavior.
       {"(alpha|beta)", {}, {}},
+      {"a|ab", {}, {}},
+      {"a|", {}, {}},
+      {"a|(ab|ac)", {}, {}},
+      {"(?<letter>a|ab)", {}, {}},
       {"(?<word>[A-Za-z]+)-([0-9]+)", {}, {}},
       {"a+?", {}, {}},
       {"a*", nullable, limited},
@@ -948,6 +952,50 @@ int main(){
       assert(prog.exact_literal == prog.query_ir.exact_literal);
       assert(&prog.ir() == &prog.query_ir);
     };
+    auto check_filter = [&](std::string pat, PatternOptions opt,
+                            std::vector<std::string> candidates) {
+      auto prog = parse_regex(pat, opt);
+      auto unfactored = pergrep::detail::query_filter(prog.ast);
+      const auto& factored = prog.query_ir.filter;
+      for (const auto& candidate : candidates)
+        assert(unfactored.matches(candidate) == factored.matches(candidate));
+    };
+    // Filter factoring is candidate-only: a|ab reduces to Atom("a"), while
+    // the exact AST still retains both ordered alternatives.
+    {
+      auto prog = parse_regex("a|ab", {});
+      assert(std::holds_alternative<pergrep::detail::FilterExpr::Atom>(
+          prog.query_ir.filter.value));
+      assert(std::get<pergrep::detail::FilterExpr::Atom>(
+          prog.query_ir.filter.value).literal == "a");
+      check_filter("a|ab", {}, {"", "b", "a", "ab", "cab", "xyzab"});
+    }
+    // Empty branches, captures, nested alternation, and positive lookaround
+    // must all preserve the raw filter's candidate set.
+    check_filter("a|", {}, {"", "b", "a", "ab"});
+    check_filter("a|(ab|ac)", {}, {"", "b", "a", "ab", "ac", "zzac"});
+    {
+      PatternOptions pcre2; pcre2.engine = Engine::Pcre2Compat;
+      check_filter(R"((?=(a))(a|ab))", pcre2,
+                   {"", "b", "a", "ab", "za", "zab"});
+    }
+    // Scoped record boundaries and NUL bytes are ordinary candidate bytes;
+    // the filter never changes separator or selector semantics.
+    check_filter(R"(a\x00b)", {}, {std::string("a\0b", 3),
+                                   std::string("a\0c", 3),
+                                   std::string("xa\0by", 5)});
+    {
+      using F = pergrep::detail::FilterExpr;
+      auto conjunction = F::and_({F::atom("ab"), F::atom("cd")});
+      assert(!conjunction.matches("ab"));
+      assert(conjunction.matches("xxabyycdzz"));
+      auto disjunction = F::or_({F::atom("ab"), F::atom("cd")});
+      assert(disjunction.matches("xxcdzz"));
+      assert(F::true_().matches(""));
+      auto cse = F::or_({F::atom("ab"), F::atom("ab")}).simplified();
+      assert(std::holds_alternative<F::Atom>(cse.value));
+      assert(std::get<F::Atom>(cse.value).literal == "ab");
+    }
     // Canonical QueryIR and compatibility views agree across nested groups.
     check_ir_access_paths("((foo)(bar))", {});
     // Alternation keeps both global and per-branch metadata in one IR.
