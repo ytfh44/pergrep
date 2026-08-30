@@ -38,6 +38,27 @@ In shadow evaluation mode:
 - The default scheduler selects the chosen plan $P_{\text{chosen}}$ without altering default dispatch or search semantics.
 - During or following execution, actual metrics (observed latency, verified bytes, candidate chunks/blocks) are recorded.
 - Counterfactual costs for alternative candidates are estimated or measured to evaluate if an alternate plan would have executed with lower actual cost.
+### M1.6 lifecycle and observation status
+
+M1.6 remains measurement-only: normal Searcher::find executes exactly the existing
+chosen path and does not dispatch, replay, or mutate state for alternatives. A shadow
+record is built after that search from the stable candidate enumeration and the chosen
+operator's counters. PlanCandidateMetrics::ObservationStatus has three meanings:
+
+- Observed: the operator actually executed and its measured cost/counters are valid.
+- CounterfactualEstimate: a prediction for an eligible but unexecuted operator; it is
+  useful for comparison but is excluded from regret and rank-inversion calculations.
+- Unobserved: no measurement or counterfactual execution was recorded.
+
+A chosen plan is always the observation anchor. A fallback is reported as a loss only when
+the chosen plan and that fallback both have Observed measurements; an unmeasured
+fallback cannot produce regret. Candidate records are sorted by verifier identity and
+name, and workload groups are sorted by (workload_key, semantic_mode). The semantic
+mode key is derived from the complete PlanKey, including fixed/regex, overlap, max,
+invert, files, record separator, selector scope, index capabilities, and transformed-input
+identity. Probe bytes/operations, verification bytes, and verifier CPU time are measured
+when available; allocation and page-fault fields explicitly report unavailable rather than
+pretending that an unavailable counter is zero.
 
 ### M1.3 PlanKey Construction
 Plan selection and any future plan cache are keyed by an explicit `PlanKey` (`include/pergrep/pergrep.hpp`): `PatternOptions` (all 9 fields), `SearchOptions` (`overlapping`, `invert_match`, `files_with/without_match`, `max_matches`, `record_separator`, `include_binary`, `eligible_file_ids` sorted deduped), `IndexOptions` capabilities (`chunk_bytes`, `chunk_overlap`, `positional_block_bytes`, `positional_budget_ratio`, `planned_qgrams`, `include_hidden`, `follow_symlinks`, `persist_corpus`), and `transformed_input_identity`. `hash()` is deterministic FNV-64 with bitwise double handling; `operator==` compares all fields. `Searcher::find` routes through `make_plan_key` → `estimateCost(PlanKey, IndexData)`; distinct keys never reuse a cached plan (fallback to recompute). No path assumes default newline, non-overlap, or positive matching.

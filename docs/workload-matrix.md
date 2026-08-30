@@ -1,6 +1,6 @@
-# M0.3/M1.5 Workload and Lifecycle Matrix
+# M0.3/M1.5/M1.6 Workload and Lifecycle Matrix
 
-**Matrix version: 3** (`kWorkloadMatrixVersion = 3` in `bench/workload_matrix.hpp`)
+**Matrix version: 4** (kWorkloadMatrixVersion = 4 in bench/workload_matrix.hpp)
 
 This is the stable workload contract for benchmark and release-gate work. Later milestones
 may add query or corpus cases to a class, but may not silently redefine a class, phase, or
@@ -87,6 +87,16 @@ Every scenario emits a `SCENARIO` descriptor, a `METRIC scenario=...` line, and 
   observed work lower, never invalidate an exact match.
 - **Verifier/resource timing**: `verifier_cpu_ms` (process CPU time after plan selection);
 - **Result invariant**: `matches` and `correctness=pass` from indexed-vs-reference comparison.
+- **M1.6 shadow planner**: each query also emits the chosen operator, canonical
+  plan_key_hash/semantic_mode, predicted work for every enumerated candidate, and
+  observed work only for operators that actually executed. SHADOW_CANDIDATE records
+  carry predicted_cost, actual_cost, verification bytes, index probes, and an explicit
+  observation status; unexecuted candidates are never counted as regret.
+- **Optional resources**: allocation counts/bytes and per-search page faults are emitted
+  as available or unavailable; unavailable counters are not interpreted as zero.
+- **Regret grouping**: aggregate shadow reports group by workload key and semantic mode
+  (which includes all PlanKey semantics: fixed/regex, overlap, max, invert, files, NUL/CRLF,
+  and selector scope), with stable candidate and group ordering.
 
 Release gates should retain the per-scenario lines rather than relying only on aggregate
 metrics. Aggregate fields remain for compatibility with existing benchmark consumers.

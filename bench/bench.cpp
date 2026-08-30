@@ -41,6 +41,15 @@ struct QueryTotals {
     double plan_regret = 0.0;
     double prediction_error = 0.0;
     bool is_fallback = false;
+    std::uint64_t plan_key_hash = 0;
+    std::string semantic_mode;
+    double measured_cost = 0.0;
+    std::uint64_t observed_candidate_count = 0;
+    std::uint64_t actual_verification_bytes = 0;
+    std::uint64_t actual_index_probe_bytes = 0;
+    std::uint64_t actual_index_probe_operations = 0;
+    bool allocation_metrics_available = false;
+    bool page_fault_metrics_available = false;
 };
 
 struct ScenarioTotals {
@@ -219,6 +228,15 @@ void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_
     totals.verifier_cpu_ns += stats.verifier_cpu_ns;
     totals.matches += match_count;
     totals.predicted_candidate_chunks += stats.predicted_candidate_chunks;
+    totals.plan_key_hash = stats.plan_key_hash;
+    totals.semantic_mode = stats.semantic_mode;
+    totals.measured_cost = stats.measured_cost;
+    totals.observed_candidate_count = 1;
+    totals.actual_verification_bytes = stats.physically_touched_bytes;
+    totals.actual_index_probe_bytes = stats.index_probe_bytes;
+    totals.actual_index_probe_operations = stats.index_probe_operations;
+    totals.allocation_metrics_available = stats.allocation_metrics_available;
+    totals.page_fault_metrics_available = stats.page_fault_metrics_available;
     totals.predicted_candidate_blocks += stats.predicted_candidate_blocks;
     totals.predicted_verified_bytes += stats.predicted_verified_bytes;
     totals.prediction_error_bound_chunks += stats.prediction_error_bound_chunks;
@@ -309,9 +327,16 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
             chosen.actual_verified_bytes = stats.physically_touched_bytes;
             chosen.actual_candidate_chunks = stats.candidate_chunks;
             chosen.actual_candidate_blocks = stats.candidate_blocks;
+            chosen.actual_index_probe_bytes = stats.index_probe_bytes;
+            chosen.actual_index_probe_operations = stats.index_probe_operations;
+            chosen.actual_verification_bytes = stats.physically_touched_bytes;
+            chosen.actual_verifier_cpu_ns = stats.verifier_cpu_ns;
+            chosen.allocation_metrics_available = stats.allocation_metrics_available;
+            chosen.page_fault_metrics_available = stats.page_fault_metrics_available;
             chosen.is_fallback = stats.verifier_fallback;
             chosen.chosen = true;
             chosen.actual_observed = true;
+            chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
             for (auto& cand : candidates) {
                 if (to_string(cand.verifier) == stats.verifier) {
                     cand.actual_cost = chosen.actual_cost;
@@ -320,12 +345,22 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                     cand.actual_verified_bytes = chosen.actual_verified_bytes;
                     cand.actual_candidate_chunks = chosen.actual_candidate_chunks;
                     cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
+                    cand.actual_index_probe_bytes = chosen.actual_index_probe_bytes;
+                    cand.actual_index_probe_operations = chosen.actual_index_probe_operations;
+                    cand.actual_verification_bytes = chosen.actual_verification_bytes;
+                    cand.actual_verifier_cpu_ns = chosen.actual_verifier_cpu_ns;
+                    cand.allocation_metrics_available = chosen.allocation_metrics_available;
+                    cand.page_fault_metrics_available = chosen.page_fault_metrics_available;
                     cand.chosen = true;
                     cand.actual_observed = true;
+                        cand.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                     cand.is_fallback = stats.verifier_fallback;
                 }
             }
             auto reg = compute_plan_regret(chosen, candidates, scenario.queries[q].name);
+            reg.workload_key = scenario.name;
+            reg.semantic_mode = stats.semantic_mode;
+            reg.plan_key_hash = stats.plan_key_hash;
             totals.query_regrets.push_back(reg);
             totals.per_query[q].prediction_error = reg.prediction_error;
         }
@@ -364,9 +399,16 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                 chosen.actual_verified_bytes = stats.physically_touched_bytes;
                 chosen.actual_candidate_chunks = stats.candidate_chunks;
                 chosen.actual_candidate_blocks = stats.candidate_blocks;
+            chosen.actual_index_probe_bytes = stats.index_probe_bytes;
+            chosen.actual_index_probe_operations = stats.index_probe_operations;
+            chosen.actual_verification_bytes = stats.physically_touched_bytes;
+            chosen.actual_verifier_cpu_ns = stats.verifier_cpu_ns;
+            chosen.allocation_metrics_available = stats.allocation_metrics_available;
+            chosen.page_fault_metrics_available = stats.page_fault_metrics_available;
                 chosen.is_fallback = stats.verifier_fallback;
                 chosen.chosen = true;
                 chosen.actual_observed = true;
+            chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                 for (auto& cand : candidates) {
                     if (to_string(cand.verifier) == stats.verifier) {
                         cand.actual_cost = chosen.actual_cost;
@@ -374,13 +416,23 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                         cand.actual_verified_bytes = chosen.actual_verified_bytes;
                         cand.actual_candidate_chunks = chosen.actual_candidate_chunks;
                         cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
+                    cand.actual_index_probe_bytes = chosen.actual_index_probe_bytes;
+                    cand.actual_index_probe_operations = chosen.actual_index_probe_operations;
+                    cand.actual_verification_bytes = chosen.actual_verification_bytes;
+                    cand.actual_verifier_cpu_ns = chosen.actual_verifier_cpu_ns;
+                    cand.allocation_metrics_available = chosen.allocation_metrics_available;
+                    cand.page_fault_metrics_available = chosen.page_fault_metrics_available;
                         chosen.verifier = cand.verifier;
                         cand.chosen = true;
                         cand.actual_observed = true;
+                        cand.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                         cand.is_fallback = stats.verifier_fallback;
                     }
                 }
                 auto reg = compute_plan_regret(chosen, candidates, scenario.queries[q].name);
+            reg.workload_key = scenario.name;
+            reg.semantic_mode = stats.semantic_mode;
+            reg.plan_key_hash = stats.plan_key_hash;
                 totals.query_regrets.push_back(reg);
                 totals.per_query[q].prediction_error = reg.prediction_error;
             }
@@ -429,9 +481,16 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
             chosen.actual_verified_bytes = stats.physically_touched_bytes;
             chosen.actual_candidate_chunks = stats.candidate_chunks;
             chosen.actual_candidate_blocks = stats.candidate_blocks;
+            chosen.actual_index_probe_bytes = stats.index_probe_bytes;
+            chosen.actual_index_probe_operations = stats.index_probe_operations;
+            chosen.actual_verification_bytes = stats.physically_touched_bytes;
+            chosen.actual_verifier_cpu_ns = stats.verifier_cpu_ns;
+            chosen.allocation_metrics_available = stats.allocation_metrics_available;
+            chosen.page_fault_metrics_available = stats.page_fault_metrics_available;
             chosen.is_fallback = stats.verifier_fallback;
             chosen.chosen = true;
             chosen.actual_observed = true;
+            chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
             for (auto& cand : candidates) {
                 if (to_string(cand.verifier) == stats.verifier) {
                     cand.actual_cost = chosen.actual_cost;
@@ -439,13 +498,23 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                     cand.actual_verified_bytes = chosen.actual_verified_bytes;
                     cand.actual_candidate_chunks = chosen.actual_candidate_chunks;
                     cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
+                    cand.actual_index_probe_bytes = chosen.actual_index_probe_bytes;
+                    cand.actual_index_probe_operations = chosen.actual_index_probe_operations;
+                    cand.actual_verification_bytes = chosen.actual_verification_bytes;
+                    cand.actual_verifier_cpu_ns = chosen.actual_verifier_cpu_ns;
+                    cand.allocation_metrics_available = chosen.allocation_metrics_available;
+                    cand.page_fault_metrics_available = chosen.page_fault_metrics_available;
                     chosen.verifier = cand.verifier;
                     cand.chosen = true;
                     cand.actual_observed = true;
+                        cand.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                     cand.is_fallback = stats.verifier_fallback;
                 }
             }
             auto reg = compute_plan_regret(chosen, candidates, scenario.queries[q].name);
+            reg.workload_key = scenario.name;
+            reg.semantic_mode = stats.semantic_mode;
+            reg.plan_key_hash = stats.plan_key_hash;
             totals.query_regrets.push_back(reg);
             totals.per_query[q].prediction_error = reg.prediction_error;
         }
@@ -483,9 +552,16 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                 chosen.actual_verified_bytes = stats.physically_touched_bytes;
                 chosen.actual_candidate_chunks = stats.candidate_chunks;
                 chosen.actual_candidate_blocks = stats.candidate_blocks;
+            chosen.actual_index_probe_bytes = stats.index_probe_bytes;
+            chosen.actual_index_probe_operations = stats.index_probe_operations;
+            chosen.actual_verification_bytes = stats.physically_touched_bytes;
+            chosen.actual_verifier_cpu_ns = stats.verifier_cpu_ns;
+            chosen.allocation_metrics_available = stats.allocation_metrics_available;
+            chosen.page_fault_metrics_available = stats.page_fault_metrics_available;
                 chosen.is_fallback = stats.verifier_fallback;
                 chosen.chosen = true;
                 chosen.actual_observed = true;
+            chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                 for (auto& cand : candidates) {
                     if (to_string(cand.verifier) == stats.verifier) {
                         cand.actual_cost = chosen.actual_cost;
@@ -493,13 +569,23 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                         cand.actual_verified_bytes = chosen.actual_verified_bytes;
                         cand.actual_candidate_chunks = chosen.actual_candidate_chunks;
                         cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
+                    cand.actual_index_probe_bytes = chosen.actual_index_probe_bytes;
+                    cand.actual_index_probe_operations = chosen.actual_index_probe_operations;
+                    cand.actual_verification_bytes = chosen.actual_verification_bytes;
+                    cand.actual_verifier_cpu_ns = chosen.actual_verifier_cpu_ns;
+                    cand.allocation_metrics_available = chosen.allocation_metrics_available;
+                    cand.page_fault_metrics_available = chosen.page_fault_metrics_available;
                         chosen.verifier = cand.verifier;
                         cand.chosen = true;
                         cand.actual_observed = true;
+                        cand.observation = PlanCandidateMetrics::ObservationStatus::Observed;
                         cand.is_fallback = stats.verifier_fallback;
                     }
                 }
                 auto reg = compute_plan_regret(chosen, candidates, scenario.queries[q].name);
+            reg.workload_key = scenario.name;
+            reg.semantic_mode = stats.semantic_mode;
+            reg.plan_key_hash = stats.plan_key_hash;
                 totals.query_regrets.push_back(reg);
                 totals.per_query[q].prediction_error = reg.prediction_error;
             }
@@ -680,6 +766,13 @@ int main(int argc, char** argv) {
                   << " matches=" << totals.matches << " correctness=pass\n";
         for (std::size_t query_index = 0; query_index < scenario.queries.size(); ++query_index) {
             const auto& query_totals = totals.per_query[query_index];
+            const PlanRegret* shadow = nullptr;
+            for (const auto& regret : totals.query_regrets) {
+                if (regret.query_name == scenario.queries[query_index].name) {
+                    shadow = &regret;
+                    break;
+                }
+            }
             std::cout << "METRIC query=" << scenario.name << "." << scenario.queries[query_index].name
                       << " family=" << query_totals.family
                       << " search_time_ms=" << query_totals.search_ms
@@ -706,7 +799,32 @@ int main(int argc, char** argv) {
                       << " estimated_selectivity=" << query_totals.estimated_selectivity
                       << " plan_regret=" << query_totals.plan_regret
                       << " prediction_error=" << query_totals.prediction_error
+                      << " plan_key_hash=" << query_totals.plan_key_hash
+                      << " semantic_mode=" << query_totals.semantic_mode
+                      << " measured_cost=" << query_totals.measured_cost
+                      << " observed_candidates=" << query_totals.observed_candidate_count
+                      << " allocation_metrics=" << (query_totals.allocation_metrics_available ? "available" : "unavailable")
+                      << " page_fault_metrics=" << (query_totals.page_fault_metrics_available ? "available" : "unavailable")
                       << " matches=" << query_totals.matches << "\n";
+            if (shadow) {
+                for (const auto& candidate : shadow->candidates) {
+                    std::cout << "SHADOW_CANDIDATE query=" << scenario.name << "."
+                              << scenario.queries[query_index].name
+                              << " operator=" << candidate.name
+                              << " predicted_cost=" << candidate.predicted_cost
+                              << " predicted_selectivity=" << candidate.predicted_selectivity
+                              << " actual_cost=" << candidate.actual_cost
+                              << " observed=" << (candidate.actual_observed ? "true" : "false")
+                              << " observation_status=" << to_string(candidate.observation)
+                              << " verification_bytes=" << candidate.actual_verification_bytes
+                              << " index_probe_bytes=" << candidate.actual_index_probe_bytes
+                              << " index_probe_operations=" << candidate.actual_index_probe_operations
+                              << " verifier_cpu_ns=" << candidate.actual_verifier_cpu_ns
+                              << " allocation_metrics=" << (candidate.allocation_metrics_available ? "available" : "unavailable")
+                              << " page_fault_metrics=" << (candidate.page_fault_metrics_available ? "available" : "unavailable")
+                              << "\n";
+                }
+            }
         }
     }
     const double aggregate_searched_mb = double(aggregate_searched_bytes) / (1024.0 * 1024.0);

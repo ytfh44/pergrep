@@ -643,6 +643,12 @@ std::uint64_t PlanKey::hash() const noexcept {
     h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
     return h;
 }
+std::string semantic_mode_key(const PlanKey& key) {
+    // PlanKey::hash mixes the complete semantic and capability contract. Keep
+    // the prefix explicit so serialized reports distinguish this key from
+    // workload labels and never imply an observed execution.
+    return std::string("plan-key:") + std::to_string(key.hash());
+}
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
     return make_plan_key(pattern, search_options, index.options(), transformed_input_identity);
 }
@@ -1093,6 +1099,14 @@ PlanRegret compute_plan_regret(const PlanCandidateMetrics& chosen,
     regret.actual_cost = chosen.actual_cost;
     regret.is_fallback = chosen.is_fallback;
     regret.candidates = candidates;
+    // Canonical ordering makes the serialized report independent of caller order.
+    std::sort(regret.candidates.begin(), regret.candidates.end(), [](const auto& a, const auto& b) {
+        if (a.verifier != b.verifier) return static_cast<unsigned>(a.verifier) < static_cast<unsigned>(b.verifier);
+        if (a.name != b.name) return a.name < b.name;
+        if (a.predicted_cost != b.predicted_cost) return a.predicted_cost < b.predicted_cost;
+        return a.chosen > b.chosen;
+    });
+    regret.candidate_count = regret.candidates.size();
 
     // The chosen argument is the single observed chosen plan by definition
     std::vector<const PlanCandidateMetrics*> observed;
@@ -1103,13 +1117,14 @@ PlanRegret compute_plan_regret(const PlanCandidateMetrics& chosen,
         if (cand.name == chosen.name && cand.verifier == chosen.verifier) {
             continue;
         }
-        const bool is_obs = cand.actual_observed || (cand.actual_cost > 0.0) ||
-                            (cand.actual_time_ms > 0.0) || (cand.actual_verified_bytes > 0);
+        const bool is_obs = cand.actual_observed ||
+                            cand.observation == PlanCandidateMetrics::ObservationStatus::Observed;
         if (is_obs) {
             observed.push_back(&cand);
         }
     }
 
+    regret.observed_candidate_count = observed.size();
     // If fewer than two observed candidates, report zero regret and no rank inversion
     constexpr double kEpsilon = 1e-9;
     if (observed.size() < 2) {
@@ -1141,6 +1156,7 @@ PlanRegret compute_plan_regret(const PlanCandidateMetrics& chosen,
     regret.prediction_error = std::abs(chosen.predicted_cost - chosen.actual_cost) /
                               std::max(chosen.actual_cost, kEpsilon);
     regret.is_suboptimal = (regret.absolute_regret > 1e-6);
+    regret.observed_fallback_loss = regret.is_suboptimal && !chosen.is_fallback && best->is_fallback;
 
     std::size_t inversions = 0;
     for (std::size_t i = 0; i < observed.size(); ++i) {
@@ -1176,6 +1192,13 @@ ShadowPlanReport evaluate_shadow_plans(const std::vector<PlanRegret>& query_regr
     ShadowPlanReport report;
     report.total_queries = query_regrets.size();
     report.query_regrets = query_regrets;
+    std::sort(report.query_regrets.begin(), report.query_regrets.end(), [](const auto& a, const auto& b) {
+        if (a.workload_key != b.workload_key) return a.workload_key < b.workload_key;
+        if (a.semantic_mode != b.semantic_mode) return a.semantic_mode < b.semantic_mode;
+        if (a.query_name != b.query_name) return a.query_name < b.query_name;
+        if (a.plan_key_hash != b.plan_key_hash) return a.plan_key_hash < b.plan_key_hash;
+        return a.chosen_plan < b.chosen_plan;
+    });
     if (query_regrets.empty()) return report;
 
     std::vector<double> regrets;
@@ -1187,15 +1210,32 @@ ShadowPlanReport evaluate_shadow_plans(const std::vector<PlanRegret>& query_regr
     double sum_error = 0.0;
     double max_r = 0.0;
 
-    for (const auto& r : query_regrets) {
+    for (const auto& r : report.query_regrets) {
         if (r.is_suboptimal) ++report.suboptimal_plan_count;
         if (r.is_fallback) ++report.fallback_count;
+        if (r.observed_candidate_count > 0) ++report.observed_query_count;
+        if (r.observed_fallback_loss) ++report.measured_fallback_loss_count;
         sum_regret += r.relative_regret;
         sum_error += r.prediction_error;
         report.total_excess_cost += r.absolute_regret;
         regrets.push_back(r.relative_regret);
         errors.push_back(r.prediction_error);
         if (r.relative_regret > max_r) max_r = r.relative_regret;
+
+        const bool new_group = report.groups.empty() ||
+            report.groups.back().workload_key != r.workload_key ||
+            report.groups.back().semantic_mode != r.semantic_mode;
+        if (new_group) {
+            report.groups.push_back({r.workload_key, r.semantic_mode, 0, 0, 0, 0.0});
+        }
+        auto& group = report.groups.back();
+        ++group.query_count;
+        if (r.observed_candidate_count > 0) ++group.observed_query_count;
+        if (r.is_suboptimal) ++group.suboptimal_plan_count;
+        group.mean_regret += r.relative_regret;
+    }
+    for (auto& group : report.groups) {
+        if (group.query_count) group.mean_regret /= static_cast<double>(group.query_count);
     }
 
     report.fallback_rate = static_cast<double>(report.fallback_count) / static_cast<double>(report.total_queries);
@@ -1413,6 +1453,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     auto qc = estimateCost(plan_key, I);
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
+        stats->plan_key_hash = plan_key.hash();
+        stats->semantic_mode = semantic_mode_key(plan_key);
         stats->estimated_selectivity = qc.selectivity;
         stats->estimated_cost = qc.cost;
         stats->predicted_candidate_chunks = qc.estimated_candidate_chunks;
@@ -1760,6 +1802,7 @@ done:
         chosen.predicted_cost = qc.cost;
         chosen.predicted_selectivity = qc.selectivity;
         chosen.actual_cost = double(stats->physically_touched_bytes) + 100.0 * double(stats->candidate_chunks);
+        stats->measured_cost = chosen.actual_cost;
         chosen.actual_time_ms = double(stats->verifier_cpu_ns) / 1000000.0;
         chosen.actual_verified_bytes = stats->physically_touched_bytes;
         chosen.actual_candidate_chunks = stats->candidate_chunks;
@@ -1767,6 +1810,16 @@ done:
         chosen.is_fallback = is_fallback_path;
         chosen.chosen = true;
         chosen.actual_observed = true;
+        chosen.observation = PlanCandidateMetrics::ObservationStatus::Observed;
+        chosen.actual_index_probe_bytes = stats->index_probe_bytes;
+        chosen.actual_index_probe_operations = stats->index_probe_operations;
+        chosen.actual_verification_bytes = stats->physically_touched_bytes;
+        chosen.actual_verifier_cpu_ns = stats->verifier_cpu_ns;
+        chosen.actual_allocation_count = stats->allocation_count;
+        chosen.actual_allocation_bytes = stats->allocation_bytes;
+        chosen.actual_page_faults = stats->page_faults;
+        chosen.allocation_metrics_available = stats->allocation_metrics_available;
+        chosen.page_fault_metrics_available = stats->page_fault_metrics_available;
 
         for (auto& cand : candidates) {
             if (cand.verifier == chosen.verifier) {
@@ -1777,9 +1830,21 @@ done:
                 cand.actual_candidate_blocks = chosen.actual_candidate_blocks;
                 cand.chosen = true;
                 cand.actual_observed = true;
+                cand.observation = PlanCandidateMetrics::ObservationStatus::Observed;
+                cand.actual_index_probe_bytes = chosen.actual_index_probe_bytes;
+                cand.actual_index_probe_operations = chosen.actual_index_probe_operations;
+                cand.actual_verification_bytes = chosen.actual_verification_bytes;
+                cand.actual_verifier_cpu_ns = chosen.actual_verifier_cpu_ns;
+                cand.actual_allocation_count = chosen.actual_allocation_count;
+                cand.actual_allocation_bytes = chosen.actual_allocation_bytes;
+                cand.actual_page_faults = chosen.actual_page_faults;
+                cand.allocation_metrics_available = chosen.allocation_metrics_available;
+                cand.page_fault_metrics_available = chosen.page_fault_metrics_available;
             }
         }
         auto reg = compute_plan_regret(chosen, candidates, p.expression());
+        reg.plan_key_hash = plan_key.hash();
+        reg.semantic_mode = semantic_mode_key(plan_key);
         stats->plan_regret = reg.relative_regret;
     }
     return out;
