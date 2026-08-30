@@ -584,18 +584,18 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
     }
     // Regex patterns
     // is_pure_literal fast path: (multiline || !contains sep) matches actual find() dispatch to Fixed
-    if (p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
-        bool sep_in_lit = p.impl_->re.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
+    if (p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
+        bool sep_in_lit = p.impl_->re.query_ir.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
         if (p.impl_->opt.multiline || !sep_in_lit) {
             PatternOptions fopt = p.impl_->opt;
             fopt.kind = PatternKind::Fixed;
-            auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+            auto fixed_pat = Pattern::compile(p.impl_->re.query_ir.exact_literal, fopt);
             return estimateCost(fixed_pat, I, record_separator);
         }
     }
     // Regex with branch_mandatory or mandatory
-    if (!p.impl_->re.branch_mandatory.empty()) {
-        double sel = detail::estimate_branch_selectivity(p.impl_->re.branch_mandatory, I);
+    if (!p.impl_->re.query_ir.branch_mandatory.empty()) {
+        double sel = detail::estimate_branch_selectivity(p.impl_->re.query_ir.branch_mandatory, I);
         qc.selectivity = sel;
         qc.verifier = detail::VerifierKind::RegexChunk;
         qc.estimated_candidate_chunks = total_chunks ? static_cast<uint64_t>(sel * total_chunks) : I.chunks.size();
@@ -604,10 +604,10 @@ detail::QueryCost estimateCost(const Pattern& p, const detail::IndexData& I, uns
         qc.cost = double(qc.estimated_verified_bytes) + 200.0 * double(qc.estimated_candidate_chunks);
         return qc;
     }
-    if (!p.impl_->re.mandatory.empty()) {
+    if (!p.impl_->re.query_ir.mandatory.empty()) {
         // Use rarest mandatory literal (longest is currently chosen for pruning, but cost uses rarest)
         double best = 1.0;
-        for (auto& m : p.impl_->re.mandatory) {
+        for (auto& m : p.impl_->re.query_ir.mandatory) {
             double s = detail::estimate_literal_selectivity(m, I);
             if (s < best) best = s;
         }
@@ -691,17 +691,17 @@ std::vector<PlanCandidateMetrics> estimate_all_candidate_plans(const Pattern& p,
         }
     } else {
         // Regex patterns
-        if (p.impl_ && p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
-            bool sep_in_lit = p.impl_->re.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
+        if (p.impl_ && p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended) {
+            bool sep_in_lit = p.impl_->re.query_ir.exact_literal.find(static_cast<char>(record_separator)) != std::string::npos;
             if (p.impl_->opt.multiline || !sep_in_lit) {
                 PatternOptions fopt = p.impl_->opt;
                 fopt.kind = PatternKind::Fixed;
-                auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+                auto fixed_pat = Pattern::compile(p.impl_->re.query_ir.exact_literal, fopt);
                 return estimate_all_candidate_plans(fixed_pat, I, record_separator);
             }
         }
 
-        if (p.impl_ && (!p.impl_->re.branch_mandatory.empty() || !p.impl_->re.mandatory.empty())) {
+        if (p.impl_ && (!p.impl_->re.query_ir.branch_mandatory.empty() || !p.impl_->re.query_ir.mandatory.empty())) {
             double sel = chosen_cost.selectivity;
             uint64_t est_chunks = chosen_cost.estimated_candidate_chunks;
             uint64_t est_bytes = chosen_cost.estimated_verified_bytes;
@@ -1306,17 +1306,17 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
         }
     } else {
-        if (p.impl_->re.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended &&
-            (p.impl_->opt.multiline || p.impl_->re.exact_literal.find(static_cast<char>(opt.record_separator)) == std::string::npos)) {
+        if (p.impl_->re.query_ir.is_pure_literal && p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.extended &&
+            (p.impl_->opt.multiline || p.impl_->re.query_ir.exact_literal.find(static_cast<char>(opt.record_separator)) == std::string::npos)) {
             PatternOptions fopt = p.impl_->opt;
             fopt.kind = PatternKind::Fixed;
-            auto fixed_pat = Pattern::compile(p.impl_->re.exact_literal, fopt);
+            auto fixed_pat = Pattern::compile(p.impl_->re.query_ir.exact_literal, fopt);
             return find(fixed_pat, opt, stats);
         }
         std::string lit;
         std::vector<uint32_t> cv;
-        if (p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.branch_mandatory.empty()) {
-            for (const auto& branch : p.impl_->re.branch_mandatory) {
+        if (p.impl_->opt.case_mode != CaseMode::Insensitive && !p.impl_->re.query_ir.branch_mandatory.empty()) {
+            for (const auto& branch : p.impl_->re.query_ir.branch_mandatory) {
                 std::string best_lit;
                 for (const auto& m : branch) {
                     if (m.size() > best_lit.size()) best_lit = m;
@@ -1330,7 +1330,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             cv.erase(std::unique(cv.begin(), cv.end()), cv.end());
         } else {
             if (p.impl_->opt.case_mode != CaseMode::Insensitive) {
-                for (auto& m : p.impl_->re.mandatory) {
+                for (auto& m : p.impl_->re.query_ir.mandatory) {
                     if (m.size() > lit.size()) lit = m;
                 }
             }

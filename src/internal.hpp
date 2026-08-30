@@ -141,14 +141,29 @@ struct RegexProgram {
     int groups = 0;
     std::vector<std::string> group_names;
     bool extended = false;
-    // QueryIR fields — kept as direct members for backward compatibility;
-    // semantics are defined on QueryIR above. New code should prefer
-    // `QueryIR ir = analyze_query(ast, extended)` and read ir.*.
-    std::vector<std::string> mandatory; // == QueryIR::mandatory
-    std::vector<std::string> prefixes;  // == QueryIR::prefixes
-    std::vector<std::vector<std::string>> branch_mandatory; // == QueryIR::branch_mandatory
-    bool is_pure_literal = false; // == QueryIR::is_pure_literal
-    std::string exact_literal;    // == QueryIR::exact_literal
+
+    // Canonical optimizer representation. Parsing is the only construction
+    // path that installs this value; planners and verifiers must read it.
+    QueryIR query_ir;
+    const QueryIR& ir() const noexcept { return query_ir; }
+    void install_query_ir(QueryIR value) {
+        query_ir = std::move(value);
+        // Legacy direct members remain source-compatible derived views.
+        // They are synchronized here and must not be mutated independently.
+        mandatory = query_ir.mandatory;
+        prefixes = query_ir.prefixes;
+        branch_mandatory = query_ir.branch_mandatory;
+        is_pure_literal = query_ir.is_pure_literal;
+        exact_literal = query_ir.exact_literal;
+    }
+
+    // Compatibility views for existing internal callers/tests. The
+    // authoritative values are query_ir.*; these are derived at construction.
+    std::vector<std::string> mandatory; // == query_ir.mandatory
+    std::vector<std::string> prefixes;  // == query_ir.prefixes
+    std::vector<std::vector<std::string>> branch_mandatory; // == query_ir.branch_mandatory
+    bool is_pure_literal = false; // == query_ir.is_pure_literal
+    std::string exact_literal;    // == query_ir.exact_literal
     std::vector<NfaInst> nfa;
     std::int32_t nfa_start = -1;
 };
