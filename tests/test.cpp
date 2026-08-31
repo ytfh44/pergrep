@@ -21,6 +21,18 @@ using namespace pergrep;
 using namespace pergrep::benchmark;
 static Index corpus(std::string s){ return Index::from_documents({{"a.txt",std::move(s)}}); }
 static bool throws_compile(std::string p, PatternOptions o={}){try{(void)Pattern::compile(std::move(p),o);return false;}catch(...){return true;}}
+static std::vector<Match> full_reference(const Index& index, const Pattern& pattern, const SearchOptions& options){
+  auto program = detail::parse_regex(pattern.expression(), pattern.options());
+  std::vector<Match> out;
+  for (std::uint32_t fid = 0; fid < index.files().size(); ++fid) {
+    auto matches = detail::regex_find_all(program, index.content(fid), pattern.options(), options.overlapping, fid, 0, 0, options.record_separator);
+    for (auto& match : matches) {
+      out.push_back(std::move(match));
+      if (options.max_matches && out.size() >= options.max_matches) return out;
+    }
+  }
+  return out;
+}
 
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
@@ -261,7 +273,7 @@ int main(){
       auto pattern = Pattern::compile(std::move(expression), popt);
       SearchStats bounded_stats{};
       const auto actual = Searcher(indexed).find(pattern, sopt, &bounded_stats);
-      const auto expected = Searcher(reference).find(pattern, sopt);
+      const auto expected = full_reference(reference, pattern, sopt);
       if (bounded) assert(bounded_stats.physical_operator == "RegexBoundedRegion");
       same_matches(actual, expected);
       if (sopt.max_matches) {
