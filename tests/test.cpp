@@ -3491,5 +3491,32 @@ int main(){
       assert(captured_stats.verifier != "FixedPositional");
     }
   }
+  // M2.1 verifier contexts use absolute source-byte coordinates while candidate
+  // ranges only constrain attempted starts (surrounding bytes remain visible).
+  {
+    std::string text = "xfoo!\nfoo\0bar";
+    pergrep::detail::VerifierContext c{text, 100, 100 + text.size(), 101, 105, 101, 102, false, false, '\n', false};
+    assert(c.validate());
+    assert(c.record_view() == "foo!");
+    auto bad = c; bad.candidate_begin = 99; assert(!bad.validate());
+    PatternOptions o;
+    auto p = pergrep::detail::parse_regex(R"(foo)", o);
+    Match m;
+    assert(pergrep::detail::regex_search(p, c, o, &m, 7));
+    assert(m.file_id == 7 && m.start == 101 && m.end == 104);
+    auto bounded = c; bounded.candidate_begin = 102; bounded.candidate_end = 103;
+    assert(!pergrep::detail::regex_search(p, bounded, o, nullptr, 7));
+  }
+  {
+    std::string text = "first\nfoo\nlast";
+    pergrep::detail::VerifierContext c{text, 0, text.size(), 0, text.size(), 6, 10, false, false, '\n', false};
+    PatternOptions o;
+    o.multiline = true;
+    auto begin = pergrep::detail::parse_regex(R"(\Afoo)", o);
+    Match m; assert(!pergrep::detail::regex_search(begin, c, o, &m, 0));
+    auto line = pergrep::detail::parse_regex(R"(^foo$)", o);
+    assert(pergrep::detail::regex_search(line, c, o, &m, 0));
+    assert(m.start == 6 && m.end == 9);
+  }
   return 0;
 }
