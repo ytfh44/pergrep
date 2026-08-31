@@ -1342,6 +1342,65 @@ int main(){
   }
   std::cerr << "M23 QO-2 done\n" << std::flush;
 
+  // M1.9 planned_qgrams contract: the configured value is a shared maximum
+  // for chunk and positional probes; zero means auto (all available rows).
+  {
+    const std::string query = "abcdefghijklmnopqrstu"; // eighteen distinct 4-byte q-grams
+    const std::vector<Document> docs = {
+      {"hit.txt", std::string(4096, 'x') + query + std::string(4096, 'y')},
+      {"miss.txt", std::string(8192, 'z')}
+    };
+    auto reference = Index::from_documents(docs);
+    Searcher ref_searcher(reference);
+    auto pattern = Pattern::compile(query, {.kind = PatternKind::Fixed});
+    const auto expected = ref_searcher.find(pattern);
+    std::uint64_t previous_candidate_blocks = ~std::uint64_t(0);
+    for (const std::size_t configured : {std::size_t(0), std::size_t(1), std::size_t(2),
+                                         std::size_t(8), std::size_t(16), std::size_t(64)}) {
+      IndexOptions options;
+      options.chunk_bytes = 1024;
+      options.chunk_overlap = 128;
+      options.positional_block_bytes = 64;
+      options.planned_qgrams = configured;
+      auto indexed = Index::from_documents(docs, options);
+      Searcher searcher(indexed);
+      SearchStats stats{};
+      const auto actual = searcher.find(pattern, {}, &stats);
+      assert(actual.size() == expected.size());
+      for (std::size_t i = 0; i < actual.size(); ++i)
+        assert(actual[i].file_id == expected[i].file_id && actual[i].start == expected[i].start &&
+               actual[i].end == expected[i].end);
+      const std::size_t available_qgrams = query.size() - 3;
+      const std::uint64_t expected_k = configured == 0 ? available_qgrams :
+          std::min<std::size_t>(configured, available_qgrams);
+      assert(stats.configured_planned_qgrams == configured);
+      assert(stats.effective_k == expected_k);
+      assert(stats.selected_qgram_count == expected_k);
+      assert(stats.selected_qgram_rows == expected_k);
+      assert(stats.index_probe_bytes == stats.chunk_probe_bytes + stats.positional_probe_bytes);
+      assert(stats.index_probe_operations == stats.chunk_probe_operations + stats.positional_probe_operations);
+      if (previous_candidate_blocks != ~std::uint64_t(0) && stats.candidate_blocks != 0)
+        assert(stats.candidate_blocks <= previous_candidate_blocks);
+      if (stats.candidate_blocks != 0) previous_candidate_blocks = stats.candidate_blocks;
+      assert(stats.qgram_fallback_reason == "none" || !stats.qgram_fallback_reason.empty());
+    }
+    SearchOptions inverted;
+    inverted.invert_match = true;
+    SearchStats inverted_stats{};
+    (void)ref_searcher.find(pattern, inverted, &inverted_stats);
+    assert(inverted_stats.effective_k == 0 && inverted_stats.selected_qgram_count == 0 && inverted_stats.selected_qgram_rows == 0);
+    assert(inverted_stats.qgram_fallback_reason == "invert-match-record-scan");
+    // A query with fewer available q-grams clamps deterministically.
+    IndexOptions options; options.planned_qgrams = 64;
+    auto short_index = Index::from_documents(docs, options);
+    Searcher short_searcher(short_index);
+    SearchStats short_stats{};
+    auto short_pattern = Pattern::compile("abcd", {.kind = PatternKind::Fixed});
+    const auto short_actual = short_searcher.find(short_pattern, {}, &short_stats);
+    assert(!short_actual.empty());
+    assert(short_stats.effective_k == 1 && short_stats.selected_qgram_count == 1);
+  }
+
   // QO-3 positional — compile positional filter with safe fallback
   {
     // 1. Positional pruning: rare literal in large corpus should prune candidate_blocks << total blocks.

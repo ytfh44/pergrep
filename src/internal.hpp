@@ -41,6 +41,7 @@ struct QueryDesc {
 };
 std::uint8_t lg_for(std::size_t n);
 QueryDesc compile_qgram_query(std::string_view q);
+QueryDesc compile_qgram_query(std::string_view q, std::span<const std::uint32_t> selected_hashes);
 struct PosDesc {
     std::uint64_t off = 0;
     std::uint16_t m = 0;

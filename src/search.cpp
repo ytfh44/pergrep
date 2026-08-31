@@ -32,6 +32,7 @@ struct FixedDispatchSuppression {
     }
     ~FixedDispatchSuppression() { suppress_guarded_fixed_dispatch = previous; }
 };
+enum class ProbeKind : std::uint8_t { Chunk, Positional };
 struct StatsRecorder {
     SearchStats* stats = nullptr;
     const detail::IndexData& index;
@@ -73,10 +74,24 @@ struct StatsRecorder {
         }
     }
 
-    void note_probe(std::size_t bytes) {
+    void note_probe(std::size_t bytes, ProbeKind kind) {
         if (!stats) return;
         stats->index_probe_bytes += bytes;
         ++stats->index_probe_operations;
+        if (kind == ProbeKind::Chunk) {
+            stats->chunk_probe_bytes += bytes;
+            ++stats->chunk_probe_operations;
+        } else {
+            stats->positional_probe_bytes += bytes;
+            ++stats->positional_probe_operations;
+        }
+    }
+
+    void note_selection(std::size_t count) {
+        if (!stats) return;
+        stats->effective_k = static_cast<std::uint64_t>(count);
+        stats->selected_qgram_count = static_cast<std::uint64_t>(count);
+        stats->selected_qgram_rows = static_cast<std::uint64_t>(count);
     }
 
     void touch(std::uint32_t file_id, std::uint64_t begin, std::uint64_t end) {
@@ -160,7 +175,7 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
             unsigned bit = std::countr_zero(mask64);
             uint32_t row = uint32_t(ww) * 64 + bit;
             auto p = g.bits.data() + (size_t)row * g.words;
-            if (rec) rec->note_probe(static_cast<std::size_t>(g.words) * sizeof(std::uint64_t));
+            if (rec) rec->note_probe(static_cast<std::size_t>(g.words) * sizeof(std::uint64_t), ProbeKind::Chunk);
             for (uint32_t j = 0; j < g.words; ++j) c[j] &= p[j];
             mask64 &= mask64 - 1;
         }
@@ -182,6 +197,8 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
     }
 }
 
+std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_view q);
+
 std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_view lit,
                                        StatsRecorder* rec = nullptr) {
     std::vector<uint32_t> out;
@@ -192,7 +209,9 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
         }
         return out;
     }
-    auto q = detail::compile_qgram_query(lit);
+    auto selected = planned_hashes(I, lit);
+    if (rec) rec->note_selection(selected.size());
+    auto q = detail::compile_qgram_query(lit, selected);
     for (auto const& g : I.groups) {
         group_candidates(g, q, out, rec);
     }
@@ -262,60 +281,29 @@ size_t anchor_find(std::string_view s, std::string_view q, size_t anchor, size_t
     return std::string_view::npos;
 }
 
-// Adaptive k helper: chooses how many q-grams to use for positional filtering.
-// - Short query (<=4 bytes, i.e. 0-1 distinct q-grams): k=1 (or 0 if <4, meaning no q-gram filter).
-// - Otherwise k = min(planned_qgrams, num_unique_qgrams, budget_based_k) where
-//   budget_based_k is derived from positional_budget_ratio and chunk_bytes.
-// - For long literals (many distinct q-grams) budget is relaxed up to 8 for
-//   better pruning; this still respects the 8-cap and never increases false
-//   negatives because using more q-grams can only tighten the intersection,
-//   while capping at 8 bounds positional row lookups per chunk.
-// Conservative fallback: k==0 means no positional q-gram filter -> all chunks
-// pass (zero false negatives).
+// Deterministic q-gram budget contract shared by chunk and positional filters.
+// `planned_qgrams == 0` means auto (all available distinct hash rows); positive
+// values are a maximum and clamp only to the available distinct query rows.
+// No cost-derived or fixed eight-row cap is applied. A selected subset remains
+// conservative because every indexed q-gram row is a necessary condition.
 size_t adaptive_k(const detail::IndexData& I, std::string_view q) {
     if (q.size() < 4) return 0;
-    if (q.size() <= 4) return 1;
-    // Count distinct 4-byte q-gram hashes in the query (per-query distinctness).
     std::unordered_set<uint32_t> uniq;
     uniq.reserve(q.size());
-    for (size_t i = 0; i + 4 <= q.size(); ++i) {
-        uniq.insert(detail::hash4((const unsigned char*)q.data() + i));
-    }
-    size_t num_unique = uniq.size();
-    if (num_unique == 0) return 0;
-    size_t planned = I.opt.planned_qgrams;
-    // Cost model: each positional q-gram probe costs roughly one row (m * mask_bytes).
-    // Derive a budget-based cap from index memory budget:
-    //   budget_bytes ~= chunk_bytes * positional_budget_ratio
-    //   budget_based_k ~= budget_bytes / 4096, clamped to [1,8].
-    // This ties k to both knobs the user controls (chunk size and budget ratio)
-    // and keeps the per-chunk row intersection cheap.
-    double budget_bytes = double(I.opt.chunk_bytes) * I.opt.positional_budget_ratio;
-    size_t budget_based_k = 1;
-    if (budget_bytes > 0) {
-        budget_based_k = static_cast<size_t>(budget_bytes / 4096.0);
-        if (budget_based_k < 1) budget_based_k = 1;
-        if (budget_based_k > 8) budget_based_k = 8;
-    }
-    // Long literals carry many distinct q-grams; relax budget slightly for
-    // better pruning (still capped at 8). This is the "adaptive" part:
-    // short queries stay at 1, long queries can use up to 8 rarest q-grams.
-    if (num_unique >= 6 && q.size() >= 12) {
-        budget_based_k = std::min<size_t>(8, budget_based_k + 2);
-    }
-    if (q.size() >= 20) {
-        budget_based_k = std::min<size_t>(8, budget_based_k + 1);
-    }
-    size_t k = std::min({planned, num_unique, budget_based_k});
-    // Ensure at least 1 for any query that actually has a q-gram.
-    if (k == 0) k = 1;
-    return k;
+    for (size_t i = 0; i + 4 <= q.size(); ++i)
+        uniq.insert(detail::hash4(reinterpret_cast<const unsigned char*>(q.data()) + i));
+    const size_t available = uniq.size();
+    if (available == 0) return 0;
+    return I.opt.planned_qgrams == 0
+        ? available
+        : std::min(I.opt.planned_qgrams, available);
 }
 
 // Rarity-aware q-gram planner. Planner ordering uses exact q-gram chunk
 // frequency, widened by the corresponding legacy hash-bucket chunk frequency.
 // The returned hashes remain the legacy hash values consumed by conservative
-// Bloom filters; only planner ordering changes.
+// Bloom filters; planner ordering and the explicitly configured probe budget
+// determine the selected safe subset shared by chunk and positional filters.
 std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_view q) {
     std::vector<std::pair<uint32_t, std::uint64_t>> ranked;
     if (q.size() < 4) return {};
@@ -353,17 +341,8 @@ std::vector<uint32_t> planned_hashes(const detail::IndexData& I, std::string_vie
     }
     size_t k = adaptive_k(I, q);
     if (k == 0) return {};
-    if (I.planner_stats_ready && I.chunks.size() > 40) {
-        const auto common_thresh = I.chunks.size() / 10;
-        std::vector<uint32_t> filtered;
-        filtered.reserve(h.size());
-        for (auto hash : h) {
-            if (I.hash_chunk_freq[hash & 65535u] <= common_thresh)
-                filtered.push_back(hash);
-        }
-        if (filtered.empty()) return {};
-        h.swap(filtered);
-    }
+    // Never discard all rows based on a frequency heuristic: an empty result
+    // would be an unsafe rejection rather than a conservative widening.
     if (h.size() > k) h.resize(k);
     return h;
 }
@@ -398,6 +377,7 @@ std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(
     auto cv = chunk_candidates(I, q, rec);
     if (rec) rec->note_candidates(cv);
     auto hs = planned_hashes(I, q);
+    if (rec) rec->note_selection(hs.size());
     std::vector<uint8_t> bm;
     for (auto ci : cv) {
         auto d = I.pos_desc[ci];
@@ -414,7 +394,7 @@ std::vector<std::pair<uint32_t, uint32_t>> fixed_candidate_blocks(
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         for (auto r : rows) {
             const uint8_t* ptr = I.pos.data() + d.off + static_cast<size_t>(r) * d.mask_bytes;
-            if (rec) rec->note_probe(d.mask_bytes);
+            if (rec) rec->note_probe(d.mask_bytes, ProbeKind::Positional);
             bool any = false;
             for (uint32_t j = 0; j < d.mask_bytes; ++j) {
                 bm[j] &= ptr[j];
@@ -480,20 +460,6 @@ static std::uint64_t scoped_chunk_count(const detail::IndexData& I,
     for (const auto& c : I.chunks) n += scope_contains(scope, c.file_id);
     return n;
 }
-static std::uint64_t scoped_ids(const std::vector<std::uint32_t>& ids,
-                                std::span<const std::uint32_t> scope,
-                                const detail::IndexData& I, bool chunks) {
-    if (scope.empty()) return ids.size();
-    if (!chunks) {
-        std::uint64_t n = 0;
-        for (auto id : ids) n += scope_contains(scope, id);
-        return n;
-    }
-    std::uint64_t n = 0;
-    for (auto id : ids)
-        if (id < I.chunks.size() && scope_contains(scope, I.chunks[id].file_id)) ++n;
-    return n;
-}
 static std::uint64_t scoped_hash_chunks(const detail::IndexData& I, std::uint32_t bucket,
                                         std::span<const std::uint32_t> scope) {
     if (!I.planner_stats_ready) return I.chunks.size();
@@ -543,16 +509,12 @@ static double estimate_literal_selectivity_impl(
     if (lit.size() < 4 || total_chunks == 0) return 1.0;
     if (!I.planner_stats_ready) return 1.0;
     double selectivity = 1.0;
-    for (std::size_t i = 0; i + 4 <= lit.size(); ++i) {
-        const auto* p = reinterpret_cast<const unsigned char*>(lit.data() + i);
-        const auto key = detail::qgram4_key(p);
-        const auto hash = detail::hash4(p) & 65535u;
-        std::uint64_t exact = 0;
-        if (auto it = I.exact_qgrams.find(key); it != I.exact_qgrams.end())
-            exact = scoped_ids(it->second.chunk_ids, scope, I, true);
-        const auto conservative = scoped_hash_chunks(I, hash, scope);
+    // Mirror the execution planner: estimates must describe the selected
+    // budgeted rows, not every query window and not a hidden eight-row cap.
+    const auto selected = planned_hashes(I, lit);
+    for (const auto hash : selected) {
         const auto candidates = std::min<std::uint64_t>(
-            total_chunks, std::max(exact, conservative));
+            total_chunks, scoped_hash_chunks(I, hash & 65535u, scope));
         selectivity = std::min(selectivity, double(candidates) / double(total_chunks));
     }
     return std::clamp(selectivity, 0.0, 1.0);
@@ -595,7 +557,7 @@ static bool fixed_guard_eligible(const PlanKey& key, const detail::IndexData& I)
         io.positional_budget_ratio != I.opt.positional_budget_ratio || io.planned_qgrams != I.opt.planned_qgrams ||
         io.include_hidden != I.opt.include_hidden || io.follow_symlinks != I.opt.follow_symlinks ||
         io.persist_corpus != I.opt.persist_corpus) return false;
-    if (!I.planner_stats_ready || I.pos_block == 0 || io.planned_qgrams == 0 ||
+    if (!I.planner_stats_ready || I.pos_block == 0 ||
         I.pos_desc.size() != I.chunks.size() || I.pos.empty()) return false;
     // Excluding binary inputs makes the binary policy invariant for every
     // candidate backend. Callers that opt into binary or have binary files use
@@ -636,7 +598,13 @@ static FixedPlanCosts fixed_plan_costs(const PlanKey& key, const detail::IndexDa
     c.whole_bytes = scoped_extended_bytes(I, scope);
     // Coefficients are calibrated to M1.6 shadow units: index probes and
     // candidate enumeration are charged separately from source verification.
-    c.positional = 0.5 * double(c.positional_bytes) + 50.0 * double(c.blocks) + 10.0 * double(c.chunks);
+    const auto selected_qgrams = adaptive_k(I, key.pattern_expression);
+    // Charge the rows actually selected by the shared q-gram budget. This is
+    // deliberately independent of positional_budget_ratio: that ratio sizes
+    // the index, while planned_qgrams controls query probes.
+    c.positional = 0.5 * double(c.positional_bytes) + 50.0 * double(c.blocks) +
+                   10.0 * double(c.chunks) +
+                   double(selected_qgrams) * double(c.chunks);
     c.chunk = double(c.chunk_bytes) + 100.0 * double(c.chunks);
     c.whole_file = double(c.whole_bytes) + 100.0 * double(c.chunks);
     return c;
@@ -1543,6 +1511,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         stats->objective = to_string(effective_objective);
         stats->candidate_order = "file-id,offset";
         stats->candidate_order_preserved = true;
+        stats->configured_planned_qgrams = static_cast<std::uint64_t>(I.opt.planned_qgrams);
+        stats->qgram_fallback_reason = "none";
     }
     std::vector<Match> out;
     const auto search_start = std::chrono::steady_clock::now();
@@ -1559,6 +1529,16 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     // conservative hash-bucket bounds are never used to reject candidates.
     PlanKey plan_key = make_plan_key(p, opt, I.opt, 0);
     auto qc = estimateCost(plan_key, I);
+    if (stats && p.is_fixed()) {
+        const auto q = std::string_view(p.impl_->expr);
+        const auto selected = planned_hashes(I, q);
+        stats->effective_k = static_cast<std::uint64_t>(adaptive_k(I, q));
+        stats->selected_qgram_count = static_cast<std::uint64_t>(selected.size());
+        stats->selected_qgram_rows = static_cast<std::uint64_t>(selected.size());
+        if (q.size() < 4) stats->qgram_fallback_reason = "query-fewer-than-4-bytes";
+    } else if (stats) {
+        stats->qgram_fallback_reason = "not-fixed-literal";
+    }
     const bool guarded_fixed_dispatch = !suppress_guarded_fixed_dispatch && p.is_fixed() &&
                                         qc.guarded_dispatch && fixed_guard_eligible(plan_key, I);
     if (stats) {
@@ -1620,6 +1600,12 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     };
     if (stop_requested()) goto done;
     if (opt.invert_match) {
+        if (stats) stats->qgram_fallback_reason = "invert-match-record-scan";
+        if (stats) {
+            stats->effective_k = 0;
+            stats->selected_qgram_count = 0;
+            stats->selected_qgram_rows = 0;
+        }
         accounting.note_all_chunks();
         for (uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
             if (stop_requested()) goto done;
@@ -1675,6 +1661,8 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         // it is selected only when its calibrated estimate beats both indexed paths.
         if (q.size() > I.opt.chunk_overlap ||
             (guarded_fixed_dispatch && qc.fixed_operator == detail::FixedPhysicalOperator::WholeFile)) {
+            if (stats) stats->qgram_fallback_reason =
+                q.size() > I.opt.chunk_overlap ? "literal-exceeds-chunk-overlap" : "planner-selected-whole-file";
             auto cv = chunk_candidates(I, q, &accounting);
             accounting.note_candidates(cv);
             std::vector<uint32_t> files;
@@ -1740,6 +1728,17 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         //   pruning at block granularity would be unsafe. Chunk-level pruning is conservative and
         } else if (icase || p.impl_->opt.word || p.impl_->opt.line ||
                    (guarded_fixed_dispatch && qc.fixed_operator == detail::FixedPhysicalOperator::Chunk)) {
+            if (stats) {
+                if (icase) stats->qgram_fallback_reason = "case-insensitive";
+                else if (p.impl_->opt.word) stats->qgram_fallback_reason = "word-boundary";
+                else if (p.impl_->opt.line) stats->qgram_fallback_reason = "line-boundary";
+                else stats->qgram_fallback_reason = "planner-selected-chunk";
+            }
+            if (stats && icase) {
+                stats->effective_k = 0;
+                stats->selected_qgram_count = 0;
+                stats->selected_qgram_rows = 0;
+            }
             auto cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
             accounting.note_candidates(cv);
             std::unordered_set<uint32_t> done_chunks;
@@ -1805,12 +1804,14 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
         // Positional block filtering for short case-sensitive fixed literals.
         // For q.size() <= 64 we use the positional Bloom to prune at block granularity:
-        // - planned_hashes selects the rarest q-grams of the query (adaptive k) to minimize false positives.
+        // - planned_hashes selects the rarest q-grams under the shared planned_qgrams
+        //   budget (0 means auto), minimizing false positives without a hidden cap.
         // - fixed_candidate_blocks intersects the corresponding Bloom rows per chunk, producing a small
         //   set of (chunk, block) candidates. Each candidate is verified with an exact rare-byte scan
         //   limited to the block's core range (+64 lookahead for q-gram overlap). This is conservative
         //   (no false negatives) and typically reduces verified bytes by orders of magnitude for rare literals.
         } else if (q.size() <= 64) {
+            if (stats && q.size() >= 4) stats->qgram_fallback_reason = "none";
             size_t a = choose_rare_byte(I, q);
             auto blocks = fixed_candidate_blocks(I, q, &accounting);
             std::unordered_map<uint32_t, uint64_t> next;
@@ -1860,6 +1861,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         // and verifying at chunk granularity avoids the per-block Bloom overhead. This path
         // remains conservative (chunk candidate set is a superset of true matches).
         } else {
+            if (stats) stats->qgram_fallback_reason = "literal-longer-than-positional-range";
             auto cv = chunk_candidates(I, q, &accounting);
             accounting.note_candidates(cv);
             size_t a = choose_rare_byte(I, q);
@@ -2074,6 +2076,17 @@ std::vector<uint32_t> Searcher::files(const Pattern& p, SearchOptions opt, Searc
                            opt.objective == SearchObjective::OrderedPrefix ? "ordered-prefix" : "exhaustive";
         stats->candidate_order = "file-id";
         stats->candidate_order_preserved = true;
+        stats->configured_planned_qgrams = static_cast<std::uint64_t>(I.opt.planned_qgrams);
+        if (p.is_fixed()) {
+            const auto q = std::string_view(p.impl_->expr);
+            const auto selected = planned_hashes(I, q);
+            stats->effective_k = static_cast<std::uint64_t>(adaptive_k(I, q));
+            stats->selected_qgram_count = static_cast<std::uint64_t>(selected.size());
+            stats->selected_qgram_rows = static_cast<std::uint64_t>(selected.size());
+            if (q.size() < 4) stats->qgram_fallback_reason = "query-fewer-than-4-bytes";
+        } else {
+            stats->qgram_fallback_reason = "not-fixed-literal";
+        }
     }
     // A first-hit file query must retain file order. Probe each eligible file
     // with a one-file scope; this is intentionally conservative and never

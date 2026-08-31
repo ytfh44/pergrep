@@ -60,6 +60,9 @@ struct IndexOptions {
     std::size_t positional_block_bytes = 256;
     // Default positional-layer memory ratio (~37.5% of chunk bytes as N-positional rows).
     double positional_budget_ratio = 0.50;
+    // Maximum number of distinct 4-byte q-gram hash rows probed per query.
+    // 0 means auto: use every available query q-gram. Values above the
+    // available q-gram count clamp to that count; no hidden low cap applies.
     std::size_t planned_qgrams = 4;
     bool include_hidden = true; // filtering is normally done by the CLI layer.
     bool follow_symlinks = false;
@@ -274,6 +277,17 @@ struct SearchStats {
     bool early_stopped = false;
     bool candidate_order_preserved = true;
     bool cancellation_requested = false;
+    // M1.9 q-gram probe telemetry. These fields are C++-only and appended
+    // after the historical statistics prefix; the C ABI is unchanged.
+    std::uint64_t configured_planned_qgrams = 0;
+    std::uint64_t effective_k = 0;
+    std::uint64_t selected_qgram_count = 0;
+    std::uint64_t selected_qgram_rows = 0;
+    std::uint64_t positional_probe_bytes = 0;
+    std::uint64_t positional_probe_operations = 0;
+    std::uint64_t chunk_probe_bytes = 0;
+    std::uint64_t chunk_probe_operations = 0;
+    std::string qgram_fallback_reason = "none";
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
