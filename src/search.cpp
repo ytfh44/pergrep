@@ -2212,7 +2212,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             bounded_branches.push_back(std::move(candidate));
         }
         detail::RegexAnalysis bounded_analysis;
-        const bool bounded_region_eligible =
+        const bool bounded_region_requested =
+            p.impl_->re.query_ir.mandatory.size() >= 2 ||
+            (split_branches && std::all_of(branch_lists.begin(), branch_lists.end(),
+                                           [](const auto& branch) { return branch.size() >= 2; }));
+        const bool bounded_region_eligible = bounded_region_requested &&
             bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis);
         if (bounded_region_eligible && !bounded_branches.empty()) {
             if (stats) stats->physical_operator = "RegexBoundedRegion";
@@ -2309,7 +2313,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         // A rejected region plan must never turn an empty/uncertain candidate
         // set into a false negative. Run the existing exact verifier over all
         // indexed chunks instead; the fallback is explicit in SearchStats.
-        if (!bounded_region_eligible) {
+        if (bounded_region_requested && !bounded_region_eligible) {
             regex_region_fallback = true;
             cv.clear();
             cv.reserve(I.chunks.size());
@@ -2330,6 +2334,13 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                          analysis.requires_word_start || analysis.requires_word_end) stats->qgram_fallback_reason = "missing-boundary-context";
                 else stats->qgram_fallback_reason = "region-analysis-unsupported";
             }
+        } else if (stats && !bounded_region_requested) {
+            const auto analysis = p.impl_->re.context_analysis(opt.record_separator);
+            if (analysis.has_unbounded_repeat) stats->qgram_fallback_reason = "unbounded-repeat";
+            else if (analysis.repeat_limit_applied) stats->qgram_fallback_reason = "repeat-resource-limit";
+            else if (analysis.has_backreference) stats->qgram_fallback_reason = "backreference";
+            else if (analysis.has_lookahead || analysis.has_lookbehind) stats->qgram_fallback_reason = "lookaround";
+            else if (analysis.rune_upper.is_unknown() || analysis.byte_upper.is_unknown()) stats->qgram_fallback_reason = "unknown-unicode-width";
         }
         accounting.note_candidates(cv);
         std::vector<uint32_t> files;

@@ -3843,12 +3843,12 @@ int main(){
     };
     assert_regex_fallback("foo.*bar", {}, "unbounded-repeat");
     assert_regex_fallback(".*", {}, "unbounded-repeat");
-    assert_regex_fallback("(?=foo)foo", {.engine = Engine::Pcre2Compat}, "lookaround");
-    assert_regex_fallback("(?<=foo)bar", {.engine = Engine::Pcre2Compat}, "lookaround");
+    assert_regex_fallback("foo(?=123)bar", {.engine = Engine::Pcre2Compat}, "lookaround");
+    assert_regex_fallback("foo(?<=123)bar", {.engine = Engine::Pcre2Compat}, "lookaround");
     assert_regex_fallback("(foo)\\1", {.engine = Engine::Pcre2Compat}, "backreference");
     // A finite-looking pattern can still have unknown UTF-8 width under case
     // folding; it must not acquire a guessed region bound.
-    assert_regex_fallback("foo.bar", {.case_mode = CaseMode::Insensitive}, "unknown-unicode-width");
+    assert_regex_fallback("foo.bar.baz", {.case_mode = CaseMode::Insensitive}, "unknown-unicode-width");
     // A finite repeat above the VM resource cap is not a valid region bound.
     assert_regex_fallback("foo.{10001}bar", {}, "repeat-resource-limit");
     // Unbounded repeats remain explicit conservative fallbacks.
