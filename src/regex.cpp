@@ -488,7 +488,7 @@ private:
 struct NfaThread { int pc=-1; std::size_t start=0; std::vector<std::pair<std::size_t,std::size_t>> caps; };
 
 Rune context_rune_at(const VerifierContext& c, std::size_t pos) {
-    if (!c.validate() || pos < c.record_begin || pos >= c.record_end) return {};
+    if (!c.validate() || pos < c.record_begin || pos >= c.record_end || !c.region_contains(pos)) return {};
     auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
     if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
     return r;
@@ -496,7 +496,7 @@ Rune context_rune_at(const VerifierContext& c, std::size_t pos) {
 Rune context_rune_before(const VerifierContext& c, std::size_t pos) {
     if (!c.validate() || pos <= c.source_begin || (pos <= c.record_begin && !c.left_context_available) || pos > c.record_end) return {};
     auto p = pos - 1;
-    if (p < c.source_begin) return {};
+    if (p < c.source_begin || !c.region_contains(p)) return {};
     auto r = rune_before(c.source, pos - static_cast<std::size_t>(c.source_begin));
     if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
     return r;
@@ -504,13 +504,13 @@ Rune context_rune_before(const VerifierContext& c, std::size_t pos) {
 Rune context_rune_right(const VerifierContext& c, std::size_t pos) {
     if (!c.validate()) return {};
     if (pos < c.record_end) return context_rune_at(c, pos);
-    if (pos != c.record_end || !c.right_context_available || pos >= c.source_end) return {};
+    if (pos != c.record_end || !c.right_context_available || pos >= c.source_end || !c.region_contains(pos)) return {};
     auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
     if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
     return r;
 }
 unsigned char context_byte(const VerifierContext& c, std::size_t pos) {
-    if (!c.contains(pos)) return 0;
+    if (!c.region_contains(pos)) return 0;
     return static_cast<unsigned char>(c.source[pos - static_cast<std::size_t>(c.source_begin)]);
 }
 bool assert_begin(const NfaInst&i,const VerifierContext& c,std::size_t pos,unsigned char sep){return pos==c.record_begin||(i.multiline&&pos>c.source_begin&&context_byte(c,pos-1)==sep);}

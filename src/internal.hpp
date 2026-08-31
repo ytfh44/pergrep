@@ -182,9 +182,9 @@ struct QueryIR {
 // `record_begin/end` delimit the logical record (the separator and a CRLF
 // terminator are outside it). `candidate_begin/end` is the planned, half-open
 // range of start offsets to attempt; its end may be record_end + 1 so the
-// empty match at the record end remains a valid candidate. It narrows starts
-// only (M2.3 owns bounded-region execution), never the bytes visible to an
-// attempted match. Source/record bounds, context-availability flags, separator
+// empty match at the record end remains a valid candidate. M2.3 can additionally
+// bound visible bytes to a proven execution region; otherwise bytes visible to an
+// attempted match are the full source. Source/record bounds, context-availability flags, separator
 // and CRLF policy are authoritative; derived views are convenience helpers.
 struct VerifierContext {
     std::string_view source;
@@ -198,18 +198,29 @@ struct VerifierContext {
     bool right_context_available = false;
     unsigned char separator = '\n';
     bool crlf = false;
+    // Optional execution region. A zero/zero pair keeps the historical full-source visibility;
+    // a non-empty pair bounds bytes visible to the verifier while all returned coordinates remain absolute.
+    std::uint64_t region_begin = 0;
+    std::uint64_t region_end = 0;
+    bool bounded_region = false;
 
     bool validate() const noexcept {
         if (source_end < source_begin || source_end - source_begin != source.size()) return false;
         if (record_begin < source_begin || record_end < record_begin || record_end > source_end) return false;
         if (candidate_begin < record_begin || candidate_end < candidate_begin) return false;
         if (record_end == std::numeric_limits<std::uint64_t>::max()) return false;
-        return candidate_end <= record_end + 1;
+        if (candidate_end > record_end + 1) return false;
+        if (bounded_region && (region_begin < source_begin || region_end < region_begin || region_end > source_end)) return false;
+        return true;
     }
     std::string_view record_view() const noexcept {
         if (!validate()) return {};
         return source.substr(static_cast<std::size_t>(record_begin - source_begin),
                              static_cast<std::size_t>(record_end - record_begin));
+    }
+    bool region_contains(std::uint64_t absolute) const noexcept {
+        if (!bounded_region) return contains(absolute);
+        return absolute >= region_begin && absolute < region_end;
     }
     bool contains(std::uint64_t absolute) const noexcept {
         return absolute >= source_begin && absolute < source_end;

@@ -80,8 +80,8 @@
 M2.2 reports the existing 10,000-repeat, 8,192-byte lookbehind, and 50,000-state VM limits without changing them or claiming unsupported precision.
 Finite AST repeat maxima remain finite semantic bounds even when above 10,000; `repeat_limit_applied` records that the unchanged VM execution cap is relevant and does not convert a finite fact into an unknown bound.
 
-### M2.3 — Bounded-Region Execution (Future)
-M2.3 may consume proven metadata for bounded-region verification. It is explicitly not implemented here: no candidate-range narrowing, region dispatch, or matcher execution change.
+### M2.3 — Bounded-Region Execution
+The verifier now has a guarded bounded-region operator for a narrow regular subset: sensitive, non-nullable, finite-width patterns with a proven mandatory literal and no lookaround, backreferences, or boundary-dependent flags. It derives absolute candidate-start ranges from the M2.2 byte upper bound, runs the existing matcher against only the corresponding bounded source regions, and preserves absolute match/capture coordinates and file/offset ordering. Unsupported or ambiguous patterns retain the full-record/full-file verifier path.
 
 ## M1.8 — Objective-Aware First-Hit and Ordered Prefix
 
