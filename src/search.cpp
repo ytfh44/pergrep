@@ -138,6 +138,36 @@ std::vector<std::shared_ptr<detail::RegexNode>> top_level_branches(
     if (root->kind == detail::RegexNode::Kind::Alt) return root->children;
     return {root};
 }
+
+bool regex_has_kind(const std::shared_ptr<detail::RegexNode>& node, detail::RegexNode::Kind kind) {
+    if (!node) return false;
+    if (node->kind == kind) return true;
+    return std::any_of(node->children.begin(), node->children.end(),
+                       [kind](const auto& child) { return regex_has_kind(child, kind); });
+}
+
+bool regex_has_repeat_limit(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (node->kind == detail::RegexNode::Kind::Repeat &&
+        node->max > 10000 && node->max != std::numeric_limits<std::size_t>::max()) return true;
+    return std::any_of(node->children.begin(), node->children.end(), regex_has_repeat_limit);
+}
+
+bool regex_has_unbounded_repeat(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (node->kind == detail::RegexNode::Kind::Repeat &&
+        node->max == std::numeric_limits<std::size_t>::max()) return true;
+    return std::any_of(node->children.begin(), node->children.end(), regex_has_unbounded_repeat);
+}
+
+bool regex_has_region_fallback_construct(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (regex_has_unbounded_repeat(node) || regex_has_repeat_limit(node) ||
+        regex_has_kind(node, detail::RegexNode::Kind::BackRef) ||
+        regex_has_kind(node, detail::RegexNode::Kind::LookAhead) ||
+        regex_has_kind(node, detail::RegexNode::Kind::LookBehind)) return true;
+    return false;
+}
 bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
                              unsigned char separator, detail::RegexAnalysis* analysis) {
     // Region execution is safe for all regular boundary modes: boundary
@@ -2211,13 +2241,9 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             bounded_branches.push_back(std::move(candidate));
         }
-        const auto region_metadata = p.impl_->re.context_analysis(opt.record_separator);
         const bool unsupported_region =
-            !region_metadata.byte_upper.is_finite() || !region_metadata.rune_upper.is_finite() ||
-            region_metadata.repeat_limit_applied || region_metadata.lookbehind_limit_applied ||
-            region_metadata.has_backreference || region_metadata.has_lookahead ||
-            region_metadata.has_lookbehind || region_metadata.has_unbounded_repeat ||
-            region_metadata.byte_upper.is_unknown() || region_metadata.rune_upper.is_unknown();
+            p.impl_->re.extended || p.impl_->opt.case_mode != CaseMode::Sensitive ||
+            regex_has_region_fallback_construct(p.impl_->re.ast);
         detail::RegexAnalysis bounded_analysis;
         const bool bounded_region_requested =
             p.impl_->re.query_ir.mandatory.size() >= 2 || unsupported_region ||
@@ -2342,12 +2368,13 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 else stats->qgram_fallback_reason = "region-analysis-unsupported";
             }
         } else if (stats && !bounded_region_requested) {
-            const auto analysis = p.impl_->re.context_analysis(opt.record_separator);
-            if (analysis.has_unbounded_repeat) stats->qgram_fallback_reason = "unbounded-repeat";
-            else if (analysis.repeat_limit_applied) stats->qgram_fallback_reason = "repeat-resource-limit";
-            else if (analysis.has_backreference) stats->qgram_fallback_reason = "backreference";
-            else if (analysis.has_lookahead || analysis.has_lookbehind) stats->qgram_fallback_reason = "lookaround";
-            else if (analysis.rune_upper.is_unknown() || analysis.byte_upper.is_unknown()) stats->qgram_fallback_reason = "unknown-unicode-width";
+            if (regex_has_unbounded_repeat(p.impl_->re.ast)) stats->qgram_fallback_reason = "unbounded-repeat";
+            else if (regex_has_repeat_limit(p.impl_->re.ast)) stats->qgram_fallback_reason = "repeat-resource-limit";
+            else if (regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::BackRef)) stats->qgram_fallback_reason = "backreference";
+            else if (regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::LookAhead) ||
+                     regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::LookBehind)) stats->qgram_fallback_reason = "lookaround";
+            else if (p.impl_->opt.case_mode != CaseMode::Sensitive) stats->qgram_fallback_reason = "unknown-unicode-width";
+            else if (p.impl_->re.extended) stats->qgram_fallback_reason = "region-analysis-unsupported";
         }
         accounting.note_candidates(cv);
         std::vector<uint32_t> files;
