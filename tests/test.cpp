@@ -180,6 +180,38 @@ int main(){
     assert(fallback_stats.physical_operator != "RegexBoundedRegion");
     assert(fallback_matches.size() == matches.size());
   }
+  // M2.6 interval-aware joins: mandatory literals may be in separate
+  // positional blocks/chunks, while unrelated co-occurrences remain verifier
+  // false positives and unbounded distances retain the fallback.
+  {
+    std::string data(600, 'x');
+    data.replace(60, 3, "foo");
+    data.replace(220, 3, "bar");
+    data.replace(550, 3, "bar");
+    IndexOptions small; small.chunk_bytes = 64; small.chunk_overlap = 32;
+    auto indexed_idx = Index::from_documents({{"joins.txt", data}}, small);
+    auto reference_idx = Index::from_documents({{"joins.txt", data}}, {.chunk_bytes = 4096, .chunk_overlap = 512});
+    Searcher indexed(indexed_idx), reference(reference_idx);
+    auto pattern = Pattern::compile(R"(foo.{0,200}bar)");
+    SearchStats indexed_stats{};
+    const auto actual = indexed.find(pattern, {}, &indexed_stats);
+    const auto expected = reference.find(pattern);
+    assert(indexed_stats.physical_operator == "RegexBoundedRegion");
+    assert(actual.size() == expected.size() && actual.size() == 1);
+    assert(actual[0].start == 60 && actual[0].end == 223);
+    assert(indexed_stats.verified_bytes < data.size());
+
+    std::string branches(500, 'x');
+    branches.replace(40, 3, "foo"); branches.replace(180, 3, "bar");
+    branches.replace(300, 3, "baz"); branches.replace(420, 3, "qux");
+    auto branch_idx = Index::from_documents({{"branches.txt", branches}}, small);
+    SearchStats branch_stats{};
+    auto branch_pattern = Pattern::compile(R"(foo.{0,160}bar|baz.{0,160}qux)");
+    auto branch_matches = Searcher(branch_idx).find(branch_pattern, {}, &branch_stats);
+    assert(branch_stats.physical_operator == "RegexBoundedRegion");
+    assert(branch_matches.size() == 2);
+    assert(branch_matches[0].start == 40 && branch_matches[1].start == 300);
+  }
   // M2.4 boundary oracle: bounded regular verification must agree with the
   // complete-record/file reference for every boundary policy. Region ends are
   // optimization limits, never implicit record or file endpoints.

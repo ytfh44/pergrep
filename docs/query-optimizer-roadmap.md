@@ -85,6 +85,8 @@ The verifier uses a guarded bounded-region operator for sensitive, non-nullable,
 
 ### M2.4 — Boundary-Preserving Bounded Verification
 Boundary metadata is explicit: record bounds exclude separators (including CRLF terminators), multiline mode retains the complete file as one source, trailing separators do not create an implicit record, and custom/NUL separators remain distinct from payload NUL bytes. Record-local anchors (`^`/`$`, `\A`/`\z`) consult the established record/separator policy, and word assertions decode adjacent Unicode runes from source even when they lie outside the execution region. Region endpoints never become implicit file or record endpoints. Extended, unbounded, or otherwise ambiguous patterns retain the established full-record/full-file fallback.
+### M2.6 — Interval-Aware Multi-Literal Candidate Joins
+For a finite regular branch, each mandatory literal is compiled to a match-start interval using its relative minimum/maximum offset. Occurrence intervals are intersected across literals, then expanded by proven verifier halo and merged before bounded execution. The join is branch-local and operates on complete records, so literals in separate blocks or chunks remain candidates; if offsets are unknown or unbounded, the existing conservative full verifier path is retained.
 
 ## M1.8 — Objective-Aware First-Hit and Ordered Prefix
 

@@ -130,19 +130,37 @@ struct BoundedRegexRegion {
     std::uint64_t region_end = 0;
 };
 
+std::vector<std::shared_ptr<detail::RegexNode>> top_level_branches(
+    const std::shared_ptr<detail::RegexNode>& root) {
+    if (!root) return {};
+    if (root->kind == detail::RegexNode::Kind::Group && !root->children.empty())
+        return top_level_branches(root->children.front());
+    if (root->kind == detail::RegexNode::Kind::Alt) return root->children;
+    return {root};
+}
 bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
                              unsigned char separator, detail::RegexAnalysis* analysis) {
     // Region execution is safe for all regular boundary modes: boundary
     // assertions consult source/record metadata, while only rune consumption
     // is clipped to the execution region. Extended constructs stay on the
     // established full verifier because their context can be data-dependent.
-    if (re.extended || re.groups > 1 || re.query_ir.mandatory.size() < 2 ||
+    const bool multi_mandatory = re.query_ir.mandatory.size() >= 2;
+    auto branches = top_level_branches(re.ast);
+    bool branch_multi_mandatory = !re.query_ir.branch_mandatory.empty() &&
+        std::all_of(re.query_ir.branch_mandatory.begin(), re.query_ir.branch_mandatory.end(),
+                    [](const auto& branch) { return branch.size() >= 2; });
+    if (!branch_multi_mandatory && branches.size() > 1) {
+        branch_multi_mandatory = std::all_of(branches.begin(), branches.end(), [](const auto& branch) {
+            return detail::query_mandatory(branch).size() >= 2;
+        });
+    }
+    if (re.extended || re.groups > 1 || (!multi_mandatory && !branch_multi_mandatory) ||
         opt.case_mode != CaseMode::Sensitive) return false;
     auto a = re.context_analysis(separator);
     if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
     if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
     if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat) return false;
-    if (re.query_ir.mandatory.empty()) return false;
+    if (re.query_ir.mandatory.empty() && !branch_multi_mandatory) return false;
     for (const auto& literal : re.query_ir.mandatory)
         if (literal.empty() || literal.size() > a.byte_upper.value) return false;
     if (analysis) *analysis = std::move(a);
@@ -181,6 +199,149 @@ std::vector<BoundedRegexRegion> bounded_regex_regions(std::string_view record, s
         at = record.find(literal, at + 1);
     }
     return regions;
+}
+// M2.6 interval-aware candidate joins.
+struct LiteralOffsetConstraint {
+    std::string literal;
+    std::uint64_t min_start = 0;
+    std::uint64_t max_start = 0;
+};
+struct LiteralOffsetSummary {
+    std::uint64_t min_width = 0, max_width = 0;
+    bool finite = true, mandatory_known = true;
+    std::vector<LiteralOffsetConstraint> literals;
+};
+std::uint64_t sat_add(std::uint64_t a, std::uint64_t b) noexcept {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+        ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+std::uint64_t sat_mul(std::uint64_t a, std::uint64_t b) noexcept {
+    return a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a
+        ? std::numeric_limits<std::uint64_t>::max() : a * b;
+}
+LiteralOffsetSummary literal_offsets(const std::shared_ptr<detail::RegexNode>& node) {
+    using K = detail::RegexNode::Kind;
+    LiteralOffsetSummary out;
+    if (!node) return out;
+    switch (node->kind) {
+    case K::Empty: case K::Begin: case K::End: case K::AbsBegin: case K::AbsEnd:
+    case K::EndNewline: case K::WordBoundary: case K::WordStartHalf: case K::WordEndHalf:
+        return out;
+    case K::Literal:
+        out.min_width = out.max_width = node->literal.size();
+        if (!node->literal.empty() && !node->icase)
+            out.literals.push_back({node->literal, 0, 0});
+        return out;
+    case K::Dot: case K::Class:
+        out.min_width = 1; out.max_width = 4; return out;
+    case K::Group:
+        return node->children.empty() ? out : literal_offsets(node->children.front());
+    case K::Concat: {
+        std::uint64_t min_prefix = 0, max_prefix = 0;
+        for (const auto& child : node->children) {
+            auto part = literal_offsets(child);
+            out.finite = out.finite && part.finite;
+            out.mandatory_known = out.mandatory_known && part.mandatory_known;
+            for (auto literal : part.literals) {
+                literal.min_start = sat_add(min_prefix, literal.min_start);
+                literal.max_start = sat_add(max_prefix, literal.max_start);
+                out.literals.push_back(std::move(literal));
+            }
+            min_prefix = sat_add(min_prefix, part.min_width);
+            max_prefix = sat_add(max_prefix, part.max_width);
+        }
+        out.min_width = min_prefix; out.max_width = max_prefix; return out;
+    }
+    case K::Alt: {
+        bool first = true;
+        for (const auto& child : node->children) {
+            auto part = literal_offsets(child);
+            out.finite = out.finite && part.finite;
+            if (first) { out.min_width = part.min_width; out.max_width = part.max_width; first = false; }
+            else { out.min_width = std::min(out.min_width, part.min_width); out.max_width = std::max(out.max_width, part.max_width); }
+        }
+        out.mandatory_known = false; out.literals.clear(); return out;
+    }
+    case K::Repeat: {
+        if (node->children.empty()) return out;
+        auto part = literal_offsets(node->children.front());
+        out.finite = part.finite && node->max != SIZE_MAX;
+        out.mandatory_known = part.mandatory_known && node->min != 0;
+        out.min_width = sat_mul(part.min_width, node->min);
+        out.max_width = node->max == SIZE_MAX ? std::numeric_limits<std::uint64_t>::max()
+                                              : sat_mul(part.max_width, node->max);
+        if (node->min == 0 || node->max == SIZE_MAX) return out;
+        for (auto literal : part.literals) {
+            literal.min_start = 0;
+            literal.max_start = out.max_width > literal.literal.size()
+                ? out.max_width - literal.literal.size() : 0;
+            out.literals.push_back(std::move(literal));
+        }
+        return out;
+    }
+    default:
+        out.finite = false; out.mandatory_known = false; return out;
+    }
+}
+std::vector<BoundedRegexRegion> bounded_regex_regions_joined(
+    std::string_view record, std::uint64_t record_begin, std::uint64_t record_end,
+    const std::vector<LiteralOffsetConstraint>& constraints,
+    const detail::RegexAnalysis& analysis) {
+    if (constraints.empty() || record.empty()) return {};
+    using Interval = std::pair<std::uint64_t, std::uint64_t>;
+    std::vector<Interval> joined;
+    for (const auto& constraint : constraints) {
+        if (constraint.literal.empty()) return {};
+        std::vector<Interval> current;
+        for (std::size_t at = record.find(constraint.literal);
+             at != std::string_view::npos;) {
+            const auto offset = static_cast<std::uint64_t>(at);
+            if (record_begin > std::numeric_limits<std::uint64_t>::max() - offset) break;
+            const auto absolute = record_begin + offset;
+            if (absolute >= record_begin && absolute - record_begin >= constraint.min_start) {
+                const auto low = absolute > constraint.max_start
+                    ? std::max(record_begin, absolute - constraint.max_start) : record_begin;
+                const auto start = absolute - constraint.min_start;
+                const auto record_limit = record_end == std::numeric_limits<std::uint64_t>::max() ? record_end : record_end + 1;
+                const auto high = std::min(record_limit, sat_add(start, 1));
+                if (low < high) current.push_back({low, high});
+            }
+            if (at > record.size() - constraint.literal.size()) break;
+            at = record.find(constraint.literal, at + 1);
+        }
+        if (current.empty()) return {};
+        if (joined.empty()) { joined = std::move(current); continue; }
+        std::vector<Interval> next;
+        std::size_t i = 0, j = 0;
+        while (i < joined.size() && j < current.size()) {
+            const auto begin = std::max(joined[i].first, current[j].first);
+            const auto end = std::min(joined[i].second, current[j].second);
+            if (begin < end) next.push_back({begin, end});
+            if (joined[i].second < current[j].second) ++i; else ++j;
+        }
+        if (next.empty()) return {};
+        joined = std::move(next);
+    }
+    std::vector<BoundedRegexRegion> regions;
+    const auto width = analysis.byte_upper.value;
+    const auto lookahead = analysis.forward_lookahead_bytes.value;
+    const auto back = analysis.backward_lookbehind_bytes.value;
+    for (const auto [begin, end] : joined) {
+        const auto region_begin = begin > back ? std::max(record_begin, begin - back) : record_begin;
+        const auto region_end = std::min(record_end, sat_add(end, sat_add(width, lookahead)));
+        if (begin < end && region_begin < region_end)
+            regions.push_back({begin, end, region_begin, region_end});
+    }
+    std::vector<BoundedRegexRegion> merged;
+    for (const auto& next : regions) {
+        if (!merged.empty() && next.candidate_begin <= merged.back().candidate_end) {
+            auto& current = merged.back();
+            current.candidate_end = std::max(current.candidate_end, next.candidate_end);
+            current.region_begin = std::min(current.region_begin, next.region_begin);
+            current.region_end = std::max(current.region_end, next.region_end);
+        } else merged.push_back(next);
+    }
+    return merged;
 }
 
 
@@ -2000,13 +2161,53 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             cv = chunk_candidates(I, lit, &accounting);
         }
-        detail::RegexAnalysis bounded_analysis;
-        std::string bounded_literal;
-        for (const auto& candidate : p.impl_->re.query_ir.mandatory) {
-            if (candidate.size() > bounded_literal.size()) bounded_literal = candidate;
+        struct BoundedBranch {
+            std::string anchor;
+            std::vector<LiteralOffsetConstraint> constraints;
+            bool joined = false;
+        };
+        std::vector<BoundedBranch> bounded_branches;
+        const auto branches = top_level_branches(p.impl_->re.ast);
+        const auto& configured_branch_lists = p.impl_->re.query_ir.branch_mandatory;
+        std::vector<std::vector<std::string>> derived_branch_lists;
+        if (configured_branch_lists.empty() && branches.size() > 1) {
+            derived_branch_lists.reserve(branches.size());
+            for (const auto& branch : branches) derived_branch_lists.push_back(detail::query_mandatory(branch));
         }
+        const auto& branch_lists = configured_branch_lists.empty() ? derived_branch_lists : configured_branch_lists;
+        const bool split_branches = !branch_lists.empty() && branch_lists.size() == branches.size();
+        const std::size_t branch_count = split_branches ? branches.size() : std::size_t{1};
+        for (std::size_t branch_index = 0; branch_index < branch_count; ++branch_index) {
+            const auto& required = split_branches ? branch_lists[branch_index] : p.impl_->re.query_ir.mandatory;
+            BoundedBranch candidate;
+            for (const auto& literal : required) {
+                if (literal.size() > candidate.anchor.size()) candidate.anchor = literal;
+            }
+            if (candidate.anchor.empty()) continue;
+            const auto summary = literal_offsets(branches.empty() ? p.impl_->re.ast : branches[split_branches ? branch_index : 0]);
+            if (summary.finite && required.size() >= 2) {
+                std::vector<bool> used(summary.literals.size(), false);
+                bool complete = true;
+                for (const auto& literal : required) {
+                    bool found = false;
+                    for (std::size_t i = 0; i < summary.literals.size(); ++i) {
+                        if (!used[i] && summary.literals[i].literal == literal) {
+                            used[i] = true;
+                            candidate.constraints.push_back(summary.literals[i]);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) { complete = false; break; }
+                }
+                candidate.joined = complete && candidate.constraints.size() == required.size();
+                if (!candidate.joined) candidate.constraints.clear();
+            }
+            bounded_branches.push_back(std::move(candidate));
+        }
+        detail::RegexAnalysis bounded_analysis;
         if (bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis) &&
-            !bounded_literal.empty()) {
+            !bounded_branches.empty()) {
             if (stats) stats->physical_operator = "RegexBoundedRegion";
             const auto& bounded_cv = cv;
             accounting.note_candidates(bounded_cv);
@@ -2027,8 +2228,32 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     const auto record = std::string_view(data).substr(
                         static_cast<std::size_t>(record_begin),
                         static_cast<std::size_t>(record_end - record_begin));
-                    const auto regions = bounded_regex_regions(record, record_begin, record_end,
-                                                               bounded_literal, bounded_analysis);
+                    std::vector<BoundedRegexRegion> regions;
+                    for (const auto& branch : bounded_branches) {
+                        std::vector<BoundedRegexRegion> branch_regions;
+                        if (branch.joined) {
+                            branch_regions = bounded_regex_regions_joined(record, record_begin, record_end,
+                                                                          branch.constraints, bounded_analysis);
+                        } else {
+                            branch_regions = bounded_regex_regions(record, record_begin, record_end,
+                                                                   branch.anchor, bounded_analysis);
+                        }
+                        regions.insert(regions.end(), branch_regions.begin(), branch_regions.end());
+                    }
+                    std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
+                        if (a.candidate_begin != b.candidate_begin) return a.candidate_begin < b.candidate_begin;
+                        return a.candidate_end < b.candidate_end;
+                    });
+                    std::vector<BoundedRegexRegion> merged_regions;
+                    for (const auto& next : regions) {
+                        if (!merged_regions.empty() && next.candidate_begin <= merged_regions.back().candidate_end) {
+                            auto& current = merged_regions.back();
+                            current.candidate_end = std::max(current.candidate_end, next.candidate_end);
+                            current.region_begin = std::min(current.region_begin, next.region_begin);
+                            current.region_end = std::max(current.region_end, next.region_end);
+                        } else merged_regions.push_back(next);
+                    }
+                    regions.swap(merged_regions);
                     for (const auto& bounded : regions) {
                         if (stop_requested()) return false;
                         detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
