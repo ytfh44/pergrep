@@ -157,9 +157,20 @@ bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions
     if (re.extended || re.groups > 1 || (!multi_mandatory && !branch_multi_mandatory) ||
         opt.case_mode != CaseMode::Sensitive) return false;
     auto a = re.context_analysis(separator);
+    // A region is only valid when every width is proven finite. In particular,
+    // the VM's repeat/lookbehind limits are execution safeguards, not bounds we
+    // may substitute into a candidate region: doing so can reject a true match.
     if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
-    if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
+    if (!a.rune_upper.is_finite() || !a.forward_lookahead_bytes.is_finite() ||
+        !a.backward_lookbehind_bytes.is_finite() || a.repeat_limit_applied ||
+        a.lookbehind_limit_applied) return false;
     if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat) return false;
+    // Boundary assertions require context outside the clipped region. The
+    // normal Searcher has that context, but a bounded plan must not assume it
+    // when a caller supplies a sliced/missing-context verifier input.
+    if (a.requires_record_boundary || a.requires_absolute_begin || a.requires_absolute_end ||
+        a.requires_line_begin || a.requires_line_end || a.requires_word_boundary ||
+        a.requires_word_start || a.requires_word_end) return false;
     if (re.query_ir.mandatory.empty() && !branch_multi_mandatory) return false;
     for (const auto& literal : re.query_ir.mandatory)
         if (literal.empty() || literal.size() > a.byte_upper.value) return false;
@@ -1735,6 +1746,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         stats->qgram_fallback_reason = "none";
     }
     std::vector<Match> out;
+    bool regex_region_fallback = false;
     const auto search_start = std::chrono::steady_clock::now();
     const auto total_blocks = [&] {
         std::size_t n = 0;
@@ -2206,8 +2218,9 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             bounded_branches.push_back(std::move(candidate));
         }
         detail::RegexAnalysis bounded_analysis;
-        if (bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis) &&
-            !bounded_branches.empty()) {
+        const bool bounded_region_eligible =
+            bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis);
+        if (bounded_region_eligible && !bounded_branches.empty()) {
             if (stats) stats->physical_operator = "RegexBoundedRegion";
             const auto& bounded_cv = cv;
             accounting.note_candidates(bounded_cv);
@@ -2298,6 +2311,32 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             goto done;
         }
+
+        // A rejected region plan must never turn an empty/uncertain candidate
+        // set into a false negative. Run the existing exact verifier over all
+        // indexed chunks instead; the fallback is explicit in SearchStats.
+        if (!bounded_region_eligible) {
+            regex_region_fallback = true;
+            cv.clear();
+            cv.reserve(I.chunks.size());
+            for (std::uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+                if (accounting.allows(I.chunks[ci].file_id)) cv.push_back(ci);
+            }
+            if (stats) {
+                const auto analysis = p.impl_->re.context_analysis(opt.record_separator);
+                stats->verifier = "RegexBruteForce";
+                stats->physical_operator = "RegexBruteForce";
+                stats->verifier_fallback = true;
+                if (analysis.has_unbounded_repeat) stats->qgram_fallback_reason = "unbounded-repeat";
+                else if (analysis.repeat_limit_applied) stats->qgram_fallback_reason = "repeat-resource-limit";
+                else if (analysis.has_backreference) stats->qgram_fallback_reason = "backreference";
+                else if (analysis.has_lookahead || analysis.has_lookbehind) stats->qgram_fallback_reason = "lookaround";
+                else if (analysis.rune_upper.is_unknown() || analysis.byte_upper.is_unknown()) stats->qgram_fallback_reason = "unknown-unicode-width";
+                else if (analysis.requires_record_boundary || analysis.requires_word_boundary ||
+                         analysis.requires_word_start || analysis.requires_word_end) stats->qgram_fallback_reason = "missing-boundary-context";
+                else stats->qgram_fallback_reason = "region-analysis-unsupported";
+            }
+        }
         accounting.note_candidates(cv);
         std::vector<uint32_t> files;
         for (auto ci : cv) {
@@ -2375,12 +2414,13 @@ done:
                                             static_cast<long double>(CLOCKS_PER_SEC));
         }
         const bool is_fallback_path = opt.invert_match || (qc.verifier == detail::VerifierKind::RegexBruteForce) ||
-                                      (p.is_fixed() && !guarded_fixed_dispatch);
+                                      regex_region_fallback || (p.is_fixed() && !guarded_fixed_dispatch);
         stats->verifier_fallback = is_fallback_path;
         auto candidates = detail::estimate_all_candidate_plans(plan_key, I);
         PlanCandidateMetrics chosen;
         chosen.name = stats->verifier;
-        chosen.verifier = static_cast<VerifierKind>(qc.verifier);
+        chosen.verifier = regex_region_fallback ? VerifierKind::RegexBruteForce
+                                               : static_cast<VerifierKind>(qc.verifier);
         chosen.predicted_cost = qc.cost;
         chosen.predicted_selectivity = qc.selectivity;
         chosen.actual_cost = double(stats->physically_touched_bytes) + 100.0 * double(stats->candidate_chunks);

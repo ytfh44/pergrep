@@ -3811,5 +3811,49 @@ int main(){
     assert(pergrep::detail::regex_search(line, c, o, &m, 0));
     assert(m.start == 6 && m.end == 9);
   }
+  // M2.7: unsupported/uncertain region plans must use the exact verifier
+  // over the complete corpus and expose the reason rather than becoming an
+  // empty candidate set or claiming a bounded plan.
+  {
+    Index fallback_idx = Index::from_documents({
+      {"a.txt", "prefix foo123xxbar suffix\n"},
+      {"b.txt", "no match here\n"},
+      {"c.txt", "foo\n"}
+    });
+    Searcher fallback_searcher(fallback_idx);
+    auto assert_regex_fallback = [&](const char* expression, PatternOptions options,
+                                     const char* reason) {
+      SearchStats stats;
+      const auto pattern = Pattern::compile(expression, options);
+      const auto actual = fallback_searcher.find(pattern, {}, &stats);
+      const auto expected = Searcher(Index::from_documents({
+        {"a.txt", "prefix foo123xxbar suffix\n"},
+        {"b.txt", "no match here\n"},
+        {"c.txt", "foo\n"}
+      })).find(pattern);
+      assert(actual.size() == expected.size());
+      for (std::size_t i = 0; i < actual.size(); ++i) {
+        assert(actual[i].file_id == expected[i].file_id);
+        assert(actual[i].start == expected[i].start);
+        assert(actual[i].end == expected[i].end);
+      }
+      assert(stats.verifier_fallback);
+      assert(stats.physical_operator == "RegexBruteForce");
+      assert(stats.qgram_fallback_reason == reason);
+    };
+    assert_regex_fallback("foo.*bar", {}, "unbounded-repeat");
+    assert_regex_fallback(".*", {}, "unbounded-repeat");
+    assert_regex_fallback("(?=foo)foo", {.engine = Engine::Pcre2Compat}, "lookaround");
+    assert_regex_fallback("(?<=foo)bar", {.engine = Engine::Pcre2Compat}, "lookaround");
+    assert_regex_fallback("(foo)\\1", {.engine = Engine::Pcre2Compat}, "backreference");
+    // A finite-looking pattern can still have unknown UTF-8 width under case
+    // folding; it must not acquire a guessed region bound.
+    assert_regex_fallback("foo.bar", {.case_mode = CaseMode::Insensitive}, "unknown-unicode-width");
+    assert_regex_fallback("^foo.bar$", {}, "missing-boundary-context");
+    // A finite repeat above the VM resource cap is not a valid region bound.
+    assert_regex_fallback("foo.{10001}bar", {}, "repeat-resource-limit");
+    // Unbounded repeats remain explicit conservative fallbacks.
+    assert_regex_fallback("foo.*bar", {.case_mode = CaseMode::Insensitive}, "unbounded-repeat");
+  }
   return 0;
 }
