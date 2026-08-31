@@ -162,7 +162,10 @@ std::vector<BoundedRegexRegion> bounded_regex_regions(std::string_view record, s
         const auto absolute = record_begin + static_cast<std::uint64_t>(at);
         const auto begin = absolute > start_slack ? std::max(record_begin, absolute - start_slack) : record_begin;
         const auto end = std::min(record_end + 1, absolute + 1);
-        const auto region_end = std::min(record_end, end + width + analysis.forward_lookahead_bytes.value);
+        const auto lookahead = analysis.forward_lookahead_bytes.value;
+        const auto extension = width > std::numeric_limits<std::uint64_t>::max() - lookahead
+            ? std::numeric_limits<std::uint64_t>::max() : width + lookahead;
+        const auto region_end = record_end - end < extension ? record_end : end + extension;
         if (begin < end && begin < region_end) {
             BoundedRegexRegion next{begin, end, begin, region_end};
             if (!regions.empty() && next.candidate_begin <= regions.back().candidate_end) {
