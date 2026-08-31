@@ -50,6 +50,15 @@ struct QueryTotals {
     std::uint64_t actual_verification_bytes = 0;
     std::uint64_t actual_index_probe_bytes = 0;
     std::uint64_t actual_index_probe_operations = 0;
+    std::uint64_t configured_planned_qgrams = 0;
+    std::uint64_t effective_k = 0;
+    std::uint64_t selected_qgram_count = 0;
+    std::uint64_t selected_qgram_rows = 0;
+    std::uint64_t positional_probe_bytes = 0;
+    std::uint64_t positional_probe_operations = 0;
+    std::uint64_t chunk_probe_bytes = 0;
+    std::uint64_t chunk_probe_operations = 0;
+    std::string qgram_fallback_reason = "none";
     bool allocation_metrics_available = false;
     bool page_fault_metrics_available = false;
 };
@@ -237,6 +246,15 @@ void add_stats(QueryTotals& totals, const SearchStats& stats, std::size_t match_
     totals.actual_verification_bytes = stats.physically_touched_bytes;
     totals.actual_index_probe_bytes = stats.index_probe_bytes;
     totals.actual_index_probe_operations = stats.index_probe_operations;
+    totals.configured_planned_qgrams = stats.configured_planned_qgrams;
+    totals.effective_k = stats.effective_k;
+    totals.selected_qgram_count = stats.selected_qgram_count;
+    totals.selected_qgram_rows = stats.selected_qgram_rows;
+    totals.positional_probe_bytes = stats.positional_probe_bytes;
+    totals.positional_probe_operations = stats.positional_probe_operations;
+    totals.chunk_probe_bytes = stats.chunk_probe_bytes;
+    totals.chunk_probe_operations = stats.chunk_probe_operations;
+    totals.qgram_fallback_reason = stats.qgram_fallback_reason;
     totals.allocation_metrics_available = stats.allocation_metrics_available;
     totals.page_fault_metrics_available = stats.page_fault_metrics_available;
     totals.predicted_candidate_blocks += stats.predicted_candidate_blocks;
@@ -789,6 +807,15 @@ int main(int argc, char** argv) {
                       << " verified_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
                       << " index_probe_kb=" << (double(query_totals.index_probe_bytes) / 1024.0)
                       << " index_probe_operations=" << query_totals.index_probe_operations
+                      << " configured_planned_qgrams=" << query_totals.configured_planned_qgrams
+                      << " effective_k=" << query_totals.effective_k
+                      << " selected_qgram_count=" << query_totals.selected_qgram_count
+                      << " selected_qgram_rows=" << query_totals.selected_qgram_rows
+                      << " positional_probe_kb=" << (double(query_totals.positional_probe_bytes) / 1024.0)
+                      << " positional_probe_operations=" << query_totals.positional_probe_operations
+                      << " chunk_probe_kb=" << (double(query_totals.chunk_probe_bytes) / 1024.0)
+                      << " chunk_probe_operations=" << query_totals.chunk_probe_operations
+                      << " qgram_fallback_reason=" << query_totals.qgram_fallback_reason
                       << " candidate_chunks=" << query_totals.candidate_chunks
                       << " candidate_blocks=" << query_totals.candidate_blocks
                       << " predicted_candidate_chunks=" << query_totals.predicted_candidate_chunks

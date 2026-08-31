@@ -28,9 +28,10 @@
 
 ### QO-2 — Q-gram Rarity Planner
 - **Scope**: `src/index.cpp` (`byte_freq`/`qgram_freq` stats), `src/search.cpp` (`planned_hashes`/`compile_qgram_query`)
-- **Deliverable**: **Rarity Planner** that sorts all query 4-grams by `qgram_freq`, selects the rarest `k` (adaptive `planned_qgrams`, budgeted by `chunk_bytes`/`positional_block_bytes` and `positional_budget_ratio`)
-- **Correctness**: Any subset remains conservative (only reduces candidates, never introduces false negatives); `k=0` degenerates to full scan
-- **Metrics**: `verified_kb`, `candidate_chunks` Pareto vs `k`
+- **Deliverable**: **Rarity Planner** that deterministically sorts distinct query 4-gram hash rows by frequency and selects the rarest `k` for both chunk and positional candidate filters. `IndexOptions::planned_qgrams` is a maximum probe budget; `0` means auto (all available rows), and positive values clamp only to the number available (there is no hidden 8-row cap).
+- **Value contract**: for a query with `a` distinct hash rows, effective `k` is `a` when configured `0`, otherwise `min(configured, a)`. Thus configured values `0`, `1`, `2`, `8`, `16`, and `64` select `a`, `1`, `min(2,a)`, `min(8,a)`, `min(16,a)`, and `min(64,a)` rows respectively. Queries shorter than four bytes have `a=0` and use the documented conservative full-candidate fallback.
+- **Correctness**: Any selected subset remains conservative (only widens candidate sets relative to the full intersection, never introduces false negatives); exact verification and operator dispatch remain unchanged.
+- **Metrics**: C++ `SearchStats` exposes configured/effective/selected q-gram rows, chunk and positional probe bytes/operations, and a deterministic fallback reason; benchmark output uses these names rather than implying all query q-grams are probed.
 - **Branch**: `autoresearch/qo-2-qgram-rarity`
 
 ### QO-3 — Positional Filter Compiler

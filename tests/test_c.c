@@ -57,9 +57,9 @@ int main(void){
         assert(err != NULL);
         pg_error_free(err);
 
-        // Invalid planned_qgrams (< 1)
+        // Invalid planned_qgrams (> 64); zero is the supported auto mode.
         bad_opt = pg_index_options_default();
-        bad_opt.planned_qgrams = 0;
+        bad_opt.planned_qgrams = 65;
         err = NULL;
         idx = pg_index_build(".", &bad_opt, &err);
         assert(idx == NULL);

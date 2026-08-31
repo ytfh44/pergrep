@@ -11,7 +11,35 @@
 #endif
 namespace pergrep::detail {
 std::uint8_t lg_for(std::size_t n){std::size_t want=std::clamp<std::size_t>(n*2,512,65536);std::uint8_t lg=9;for(std::size_t b=512;b<want&&lg<16;b<<=1)++lg;return lg;}
-QueryDesc compile_qgram_query(std::string_view q){QueryDesc d;if(q.size()>=4)for(size_t i=0;i+4<=q.size();++i)d.hashes.push_back(hash4((const unsigned char*)q.data()+i));for(uint8_t lg=9;lg<=16;++lg){uint32_t mask=(1u<<lg)-1;std::vector<uint16_t>b;for(uint32_t h:d.hashes)b.push_back(h&mask);std::sort(b.begin(),b.end());b.erase(std::unique(b.begin(),b.end()),b.end());auto&v=d.classes[lg-9];for(auto x:b){uint16_t w=x>>6;uint64_t m=1ull<<(x&63);if(!v.empty()&&v.back().first==w)v.back().second|=m;else v.push_back({w,m});}}return d;}
+QueryDesc compile_qgram_query(std::string_view q){
+    QueryDesc d;
+    if(q.size()>=4) for(size_t i=0;i+4<=q.size();++i) d.hashes.push_back(hash4((const unsigned char*)q.data()+i));
+    for(uint8_t lg=9;lg<=16;++lg){
+        uint32_t mask=(1u<<lg)-1; std::vector<uint16_t>b;
+        for(uint32_t h:d.hashes) b.push_back(h&mask);
+        std::sort(b.begin(),b.end()); b.erase(std::unique(b.begin(),b.end()),b.end());
+        auto&v=d.classes[lg-9];
+        for(auto x:b){ uint16_t w=x>>6; uint64_t m=1ull<<(x&63);
+            if(!v.empty()&&v.back().first==w) v.back().second|=m; else v.push_back({w,m});
+        }
+    }
+    return d;
+}
+QueryDesc compile_qgram_query(std::string_view q, std::span<const std::uint32_t> selected_hashes){
+    QueryDesc d;
+    d.hashes.assign(selected_hashes.begin(), selected_hashes.end());
+    for(uint8_t lg=9;lg<=16;++lg){
+        uint32_t mask=(1u<<lg)-1; std::vector<uint16_t>b;
+        for(uint32_t h:d.hashes) b.push_back(static_cast<uint16_t>(h&mask));
+        std::sort(b.begin(),b.end()); b.erase(std::unique(b.begin(),b.end()),b.end());
+        auto&v=d.classes[lg-9];
+        for(auto x:b){ uint16_t w=x>>6; uint64_t m=1ull<<(x&63);
+            if(!v.empty()&&v.back().first==w) v.back().second|=m; else v.push_back({w,m});
+        }
+    }
+    (void)q;
+    return d;
+}
 }
 
 namespace pergrep {
@@ -106,8 +134,8 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         throw std::runtime_error("pergrep: positional_block_bytes out of range [16, 1048576]");
     if (opt.chunk_overlap > opt.chunk_bytes / 2)
         throw std::runtime_error("pergrep: chunk_overlap must be <= chunk_bytes / 2");
-    if (opt.planned_qgrams < 1 || opt.planned_qgrams > 64)
-        throw std::runtime_error("pergrep: planned_qgrams out of range [1, 64]");
+    if (opt.planned_qgrams > 64)
+        throw std::runtime_error("pergrep: planned_qgrams out of range [0, 64]");
     if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
         throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
     auto I = std::make_shared<Impl>();
@@ -269,8 +297,8 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
         throw std::runtime_error("pergrep: positional_block_bytes out of range [16, 1048576]");
     if (opt.chunk_overlap > opt.chunk_bytes / 2)
         throw std::runtime_error("pergrep: chunk_overlap must be <= chunk_bytes / 2");
-    if (opt.planned_qgrams < 1 || opt.planned_qgrams > 64)
-        throw std::runtime_error("pergrep: planned_qgrams must be at least 1");
+    if (opt.planned_qgrams > 64)
+        throw std::runtime_error("pergrep: planned_qgrams out of range [0, 64]");
     if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
         throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
 
