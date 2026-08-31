@@ -2211,9 +2211,16 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             bounded_branches.push_back(std::move(candidate));
         }
+        const auto region_metadata = p.impl_->re.context_analysis(opt.record_separator);
+        const bool unsupported_region =
+            !region_metadata.byte_upper.is_finite() || !region_metadata.rune_upper.is_finite() ||
+            region_metadata.repeat_limit_applied || region_metadata.lookbehind_limit_applied ||
+            region_metadata.has_backreference || region_metadata.has_lookahead ||
+            region_metadata.has_lookbehind || region_metadata.has_unbounded_repeat ||
+            region_metadata.byte_upper.is_unknown() || region_metadata.rune_upper.is_unknown();
         detail::RegexAnalysis bounded_analysis;
         const bool bounded_region_requested =
-            p.impl_->re.query_ir.mandatory.size() >= 2 ||
+            p.impl_->re.query_ir.mandatory.size() >= 2 || unsupported_region ||
             (split_branches && std::all_of(branch_lists.begin(), branch_lists.end(),
                                            [](const auto& branch) { return branch.size() >= 2; }));
         const bool bounded_region_eligible = bounded_region_requested &&
