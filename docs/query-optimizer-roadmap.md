@@ -61,6 +61,27 @@
 - **Correctness**: Plan selection routed through `PlanKey`-based cost model; distinct keys force recompute/fallback. Exact AST/NFA/VM execution unchanged.
 - **Tests**: Deterministic distinctness for each semantic input (NUL vs LF, overlap, max_matches, invert/files, binary, eligible ids, index options, PatternOptions fields, transformed identity) and `std::hash` stability.
 - **Branch**: `autoresearch/m1.3-plan-key` (M1.3)
+### M2.2 — Conservative Byte/Rune Width and Context Analysis
+- **Scope**: src/regex.cpp, src/internal.hpp, internal tests
+- **Metadata**: RegexAnalysis records source-byte and decoded-rune lower/upper widths, lookahead/lookbehind context, nullability, record/line/absolute/word anchor requirements, effective scoped-node flags, and VM resource-limit notes. RegexBound::Finite, Unknown, and Unbounded are distinct; unknown/unbounded facts never become finite bounds.
+- **Ownership**: computed after line/word parser wrappers are attached; advisory metadata only. Exact AST/NFA/VM matching, captures, ordering, overlap, and progress remain authoritative. Record separator (LF by default, or explicit NUL/custom byte) is a search input, not AST ownership.
+
+| Node kind | Conservative rule |
+|---|---|
+| Empty/assertions/anchors | zero span; explicit boundary/anchor requirements |
+| Literal | exact source bytes/runes when sensitive; folded byte width Unknown |
+| Dot/Class | one rune; source bytes 1..4 |
+| Concat/Alt | sum or min/max; overflow and unknown/unbounded states propagate |
+| Group | child metadata |
+| LookAhead/LookBehind | zero span; child upper width is forward/backward context |
+| BackRef | Unknown lower and Unbounded upper (capture-dependent) |
+| Repeat | AST min/max multiplication; existing VM caps remain notes, not execution changes |
+
+M2.2 reports the existing 10,000-repeat, 8,192-byte lookbehind, and 50,000-state VM limits without changing them or claiming unsupported precision.
+Finite AST repeat maxima remain finite semantic bounds even when above 10,000; `repeat_limit_applied` records that the unchanged VM execution cap is relevant and does not convert a finite fact into an unknown bound.
+
+### M2.3 — Bounded-Region Execution (Future)
+M2.3 may consume proven metadata for bounded-region verification. It is explicitly not implemented here: no candidate-range narrowing, region dispatch, or matcher execution change.
 
 ## M1.8 — Objective-Aware First-Hit and Ordered Prefix
 

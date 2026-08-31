@@ -223,6 +223,45 @@ std::vector<std::string> query_prefixes(const std::shared_ptr<RegexNode>& n);
 std::vector<std::vector<std::string>> query_branch_mandatory(const std::shared_ptr<RegexNode>& n);
 bool query_is_pure_literal(const std::shared_ptr<RegexNode>& n, std::string& out);
 QueryIR analyze_query(const std::shared_ptr<RegexNode>& ast, bool extended);
+// M2.2 conservative AST metadata. Bounds are source units: byte widths are
+// UTF-8/source-byte offsets and rune widths are decoded code points. The
+// analyzer is metadata only; RegexNode/NFA/VM remain the semantic authority.
+struct RegexBound {
+    enum class State : std::uint8_t { Finite, Unknown, Unbounded };
+    State state = State::Finite;
+    std::uint64_t value = 0;
+    static RegexBound finite(std::uint64_t n) noexcept { return {State::Finite, n}; }
+    static RegexBound unknown() noexcept { return {State::Unknown, 0}; }
+    static RegexBound unbounded() noexcept { return {State::Unbounded, 0}; }
+    bool is_finite() const noexcept { return state == State::Finite; }
+    bool is_unknown() const noexcept { return state == State::Unknown; }
+    bool is_unbounded() const noexcept { return state == State::Unbounded; }
+};
+struct RegexAnalysis {
+    RegexBound byte_lower = RegexBound::finite(0), byte_upper = RegexBound::finite(0);
+    RegexBound rune_lower = RegexBound::finite(0), rune_upper = RegexBound::finite(0);
+    RegexBound forward_lookahead_bytes = RegexBound::finite(0);
+    RegexBound forward_lookahead_runes = RegexBound::finite(0);
+    RegexBound backward_lookbehind_bytes = RegexBound::finite(0);
+    RegexBound backward_lookbehind_runes = RegexBound::finite(0);
+    bool nullable = false, nullable_known = true;
+    bool requires_record_boundary = false;
+    bool requires_absolute_begin = false, requires_absolute_end = false;
+    bool requires_line_begin = false, requires_line_end = false;
+    bool requires_word_boundary = false, requires_word_start = false, requires_word_end = false;
+    bool icase = false, unicode = true, dotall = false, multiline = false, crlf = false;
+    bool contains_nul = false, custom_separator = false, separator_is_nul = false;
+    unsigned char record_separator = '\n';
+    bool has_backreference = false, has_lookahead = false, has_lookbehind = false;
+    bool has_unbounded_repeat = false, repeat_limit_applied = false;
+    bool lookbehind_limit_applied = false, vm_state_limit_relevant = false;
+    std::uint64_t repeat_limit = 10000, lookbehind_limit = 8192, vm_state_limit = 50000;
+    std::vector<std::string> notes;
+};
+// Canonical deterministic M2.2 analyzer. This is metadata only; exact matching
+// remains owned by RegexNode/NFA/VM. The separator is a search input.
+RegexAnalysis analyze_regex(const std::shared_ptr<RegexNode>& ast,
+                           unsigned char record_separator = '\n');
 
 struct RegexProgram {
     std::shared_ptr<RegexNode> ast;
@@ -230,6 +269,9 @@ struct RegexProgram {
     std::vector<std::string> group_names;
     bool extended = false;
 
+    // M2.2 canonical context/width metadata, computed after parse wrappers are attached.
+    // This is advisory only: exact matching remains owned by the AST/NFA/VM.
+    RegexAnalysis context_analysis() const { return analyze_regex(ast, '\n'); }
     // Canonical optimizer representation. Parsing is the only construction
     // path that installs this value; planners and verifiers must read it.
     QueryIR query_ir;
