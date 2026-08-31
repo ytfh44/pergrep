@@ -138,6 +138,36 @@ std::vector<std::shared_ptr<detail::RegexNode>> top_level_branches(
     if (root->kind == detail::RegexNode::Kind::Alt) return root->children;
     return {root};
 }
+
+bool regex_has_kind(const std::shared_ptr<detail::RegexNode>& node, detail::RegexNode::Kind kind) {
+    if (!node) return false;
+    if (node->kind == kind) return true;
+    return std::any_of(node->children.begin(), node->children.end(),
+                       [kind](const auto& child) { return regex_has_kind(child, kind); });
+}
+
+bool regex_has_repeat_limit(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (node->kind == detail::RegexNode::Kind::Repeat &&
+        node->max > 10000 && node->max != std::numeric_limits<std::size_t>::max()) return true;
+    return std::any_of(node->children.begin(), node->children.end(), regex_has_repeat_limit);
+}
+
+bool regex_has_unbounded_repeat(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (node->kind == detail::RegexNode::Kind::Repeat &&
+        node->max == std::numeric_limits<std::size_t>::max()) return true;
+    return std::any_of(node->children.begin(), node->children.end(), regex_has_unbounded_repeat);
+}
+
+bool regex_has_region_fallback_construct(const std::shared_ptr<detail::RegexNode>& node) {
+    if (!node) return false;
+    if (regex_has_unbounded_repeat(node) || regex_has_repeat_limit(node) ||
+        regex_has_kind(node, detail::RegexNode::Kind::BackRef) ||
+        regex_has_kind(node, detail::RegexNode::Kind::LookAhead) ||
+        regex_has_kind(node, detail::RegexNode::Kind::LookBehind)) return true;
+    return false;
+}
 bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
                              unsigned char separator, detail::RegexAnalysis* analysis) {
     // Region execution is safe for all regular boundary modes: boundary
@@ -157,8 +187,13 @@ bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions
     if (re.extended || re.groups > 1 || (!multi_mandatory && !branch_multi_mandatory) ||
         opt.case_mode != CaseMode::Sensitive) return false;
     auto a = re.context_analysis(separator);
+    // A region is only valid when every width is proven finite. In particular,
+    // the VM's repeat/lookbehind limits are execution safeguards, not bounds we
+    // may substitute into a candidate region: doing so can reject a true match.
     if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
-    if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
+    if (!a.rune_upper.is_finite() || !a.forward_lookahead_bytes.is_finite() ||
+        !a.backward_lookbehind_bytes.is_finite() || a.repeat_limit_applied ||
+        a.lookbehind_limit_applied) return false;
     if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat) return false;
     if (re.query_ir.mandatory.empty() && !branch_multi_mandatory) return false;
     for (const auto& literal : re.query_ir.mandatory)
@@ -1735,6 +1770,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         stats->qgram_fallback_reason = "none";
     }
     std::vector<Match> out;
+    bool regex_region_fallback = false;
     const auto search_start = std::chrono::steady_clock::now();
     const auto total_blocks = [&] {
         std::size_t n = 0;
@@ -2205,9 +2241,17 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             bounded_branches.push_back(std::move(candidate));
         }
+        const bool unsupported_region =
+            p.impl_->re.extended || p.impl_->opt.case_mode != CaseMode::Sensitive ||
+            regex_has_region_fallback_construct(p.impl_->re.ast);
         detail::RegexAnalysis bounded_analysis;
-        if (bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis) &&
-            !bounded_branches.empty()) {
+        const bool bounded_region_requested =
+            p.impl_->re.query_ir.mandatory.size() >= 2 || unsupported_region ||
+            (split_branches && std::all_of(branch_lists.begin(), branch_lists.end(),
+                                           [](const auto& branch) { return branch.size() >= 2; }));
+        const bool bounded_region_eligible = bounded_region_requested &&
+            bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis);
+        if (bounded_region_eligible && !bounded_branches.empty()) {
             if (stats) stats->physical_operator = "RegexBoundedRegion";
             const auto& bounded_cv = cv;
             accounting.note_candidates(bounded_cv);
@@ -2298,6 +2342,40 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             }
             goto done;
         }
+
+        // A rejected region plan must never turn an empty/uncertain candidate
+        // set into a false negative. Run the existing exact verifier over all
+        // indexed chunks instead; the fallback is explicit in SearchStats.
+        if (bounded_region_requested && !bounded_region_eligible) {
+            regex_region_fallback = true;
+            cv.clear();
+            cv.reserve(I.chunks.size());
+            for (std::uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+                if (accounting.allows(I.chunks[ci].file_id)) cv.push_back(ci);
+            }
+            if (stats) {
+                const auto analysis = p.impl_->re.context_analysis(opt.record_separator);
+                stats->verifier = "RegexBruteForce";
+                stats->physical_operator = "RegexBruteForce";
+                stats->verifier_fallback = true;
+                if (analysis.has_unbounded_repeat) stats->qgram_fallback_reason = "unbounded-repeat";
+                else if (analysis.repeat_limit_applied) stats->qgram_fallback_reason = "repeat-resource-limit";
+                else if (analysis.has_backreference) stats->qgram_fallback_reason = "backreference";
+                else if (analysis.has_lookahead || analysis.has_lookbehind) stats->qgram_fallback_reason = "lookaround";
+                else if (analysis.rune_upper.is_unknown() || analysis.byte_upper.is_unknown()) stats->qgram_fallback_reason = "unknown-unicode-width";
+                else if (analysis.requires_record_boundary || analysis.requires_word_boundary ||
+                         analysis.requires_word_start || analysis.requires_word_end) stats->qgram_fallback_reason = "missing-boundary-context";
+                else stats->qgram_fallback_reason = "region-analysis-unsupported";
+            }
+        } else if (stats && !bounded_region_requested) {
+            if (regex_has_unbounded_repeat(p.impl_->re.ast)) stats->qgram_fallback_reason = "unbounded-repeat";
+            else if (regex_has_repeat_limit(p.impl_->re.ast)) stats->qgram_fallback_reason = "repeat-resource-limit";
+            else if (regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::BackRef)) stats->qgram_fallback_reason = "backreference";
+            else if (regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::LookAhead) ||
+                     regex_has_kind(p.impl_->re.ast, detail::RegexNode::Kind::LookBehind)) stats->qgram_fallback_reason = "lookaround";
+            else if (p.impl_->opt.case_mode != CaseMode::Sensitive) stats->qgram_fallback_reason = "unknown-unicode-width";
+            else if (p.impl_->re.extended) stats->qgram_fallback_reason = "region-analysis-unsupported";
+        }
         accounting.note_candidates(cv);
         std::vector<uint32_t> files;
         for (auto ci : cv) {
@@ -2375,12 +2453,13 @@ done:
                                             static_cast<long double>(CLOCKS_PER_SEC));
         }
         const bool is_fallback_path = opt.invert_match || (qc.verifier == detail::VerifierKind::RegexBruteForce) ||
-                                      (p.is_fixed() && !guarded_fixed_dispatch);
+                                      regex_region_fallback || (p.is_fixed() && !guarded_fixed_dispatch);
         stats->verifier_fallback = is_fallback_path;
         auto candidates = detail::estimate_all_candidate_plans(plan_key, I);
         PlanCandidateMetrics chosen;
         chosen.name = stats->verifier;
-        chosen.verifier = static_cast<VerifierKind>(qc.verifier);
+        chosen.verifier = regex_region_fallback ? VerifierKind::RegexBruteForce
+                                               : static_cast<VerifierKind>(qc.verifier);
         chosen.predicted_cost = qc.cost;
         chosen.predicted_selectivity = qc.selectivity;
         chosen.actual_cost = double(stats->physically_touched_bytes) + 100.0 * double(stats->candidate_chunks);
