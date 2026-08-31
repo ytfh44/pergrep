@@ -675,7 +675,46 @@ std::vector<State> eval(const std::shared_ptr<RegexNode>&n,const VerifierContext
 }
 
 } // namespace
-
+namespace {
+using RB = RegexBound;
+using RA = RegexAnalysis;
+RB add_bound(RB a, RB b) noexcept { if (a.is_unbounded() || b.is_unbounded()) return RB::unbounded(); if (a.is_unknown() || b.is_unknown()) return RB::unknown(); if (a.value > std::numeric_limits<std::uint64_t>::max() - b.value) return RB::unbounded(); return RB::finite(a.value + b.value); }
+RB mul_bound(RB a, std::uint64_t n) noexcept { if (n == 0) return RB::finite(0); if (a.is_unbounded()) return RB::unbounded(); if (a.is_unknown()) return RB::unknown(); if (a.value > std::numeric_limits<std::uint64_t>::max() / n) return RB::unbounded(); return RB::finite(a.value * n); }
+RB max_bound(RB a, RB b) noexcept { if (a.is_unbounded() || b.is_unbounded()) return RB::unbounded(); if (a.is_unknown() || b.is_unknown()) return RB::unknown(); return RB::finite(std::max(a.value, b.value)); }
+RB min_bound(RB a, RB b) noexcept { if (a.is_unbounded() || b.is_unbounded() || a.is_unknown() || b.is_unknown()) return RB::unknown(); return RB::finite(std::min(a.value, b.value)); }
+void merge_analysis(RA& d, const RA& s) {
+    d.forward_lookahead_bytes=max_bound(d.forward_lookahead_bytes,s.forward_lookahead_bytes); d.forward_lookahead_runes=max_bound(d.forward_lookahead_runes,s.forward_lookahead_runes); d.backward_lookbehind_bytes=max_bound(d.backward_lookbehind_bytes,s.backward_lookbehind_bytes); d.backward_lookbehind_runes=max_bound(d.backward_lookbehind_runes,s.backward_lookbehind_runes);
+    d.requires_record_boundary|=s.requires_record_boundary; d.requires_absolute_begin|=s.requires_absolute_begin; d.requires_absolute_end|=s.requires_absolute_end; d.requires_line_begin|=s.requires_line_begin; d.requires_line_end|=s.requires_line_end; d.requires_word_boundary|=s.requires_word_boundary; d.requires_word_start|=s.requires_word_start; d.requires_word_end|=s.requires_word_end;
+    d.icase|=s.icase; d.unicode|=s.unicode; d.dotall|=s.dotall; d.multiline|=s.multiline; d.crlf|=s.crlf; d.contains_nul|=s.contains_nul; d.has_backreference|=s.has_backreference; d.has_lookahead|=s.has_lookahead; d.has_lookbehind|=s.has_lookbehind; d.has_unbounded_repeat|=s.has_unbounded_repeat; d.repeat_limit_applied|=s.repeat_limit_applied; d.lookbehind_limit_applied|=s.lookbehind_limit_applied; d.vm_state_limit_relevant|=s.vm_state_limit_relevant; for(const auto& note:s.notes)if(std::find(d.notes.begin(),d.notes.end(),note)==d.notes.end())d.notes.push_back(note);
+}
+RA analyze_regex_node(const std::shared_ptr<RegexNode>& n, unsigned char sep) {
+    RA o; o.record_separator=sep; o.custom_separator=sep!='\n'; o.separator_is_nul=sep=='\0'; o.contains_nul=sep=='\0'; if(!n){o.notes.emplace_back("null AST node treated as empty metadata");return o;}
+    o.icase=n->icase; o.unicode=n->unicode; o.dotall=n->dotall; o.multiline=n->multiline; o.crlf=n->crlf; using K=RegexNode::Kind;
+    auto child=[&](std::size_t i){return i<n->children.size()&&n->children[i]?analyze_regex_node(n->children[i],sep):RA{};};
+    auto one=[&](){o.byte_lower=RB::finite(1);o.byte_upper=RB::finite(4);o.rune_lower=o.rune_upper=RB::finite(1);};
+    switch(n->kind){
+    case K::Empty:o.nullable=true;break;
+    case K::Literal:{std::size_t p=0,rn=0;while(p<n->literal.size()){auto r=rune_at(n->literal,p);p=(!r.ok||r.next<=p)?p+1:r.next;++rn;}o.rune_lower=o.rune_upper=RB::finite(rn);o.contains_nul|=n->literal.find('\0')!=std::string::npos;if(n->icase){o.byte_lower=RB::unknown();o.byte_upper=RB::unknown();o.notes.emplace_back("case-folded literal has unknown UTF-8 byte width");}else{o.byte_lower=o.byte_upper=RB::finite(n->literal.size());}o.nullable=n->literal.empty();break;}
+    case K::Dot:case K::Class:one();break;
+    case K::Begin:o.nullable=true;o.requires_record_boundary=true;o.requires_line_begin=n->multiline;o.backward_lookbehind_bytes=RB::finite(n->crlf?2:1);o.backward_lookbehind_runes=RB::finite(1);break;
+    case K::End:case K::EndNewline:o.nullable=true;o.requires_record_boundary=true;o.requires_line_end=n->multiline;o.forward_lookahead_bytes=RB::finite(n->crlf?2:1);o.forward_lookahead_runes=RB::finite(1);break;
+    case K::AbsBegin:o.nullable=true;o.requires_absolute_begin=true;break;
+    case K::AbsEnd:o.nullable=true;o.requires_absolute_end=true;break;
+    case K::WordBoundary:o.nullable=true;o.requires_word_boundary=true;o.backward_lookbehind_bytes=RB::finite(4);o.forward_lookahead_bytes=RB::finite(4);o.backward_lookbehind_runes=o.forward_lookahead_runes=RB::finite(1);break;
+    case K::WordStartHalf:o.nullable=true;o.requires_word_start=true;o.backward_lookbehind_bytes=RB::finite(4);o.backward_lookbehind_runes=RB::finite(1);break;
+    case K::WordEndHalf:o.nullable=true;o.requires_word_end=true;o.forward_lookahead_bytes=RB::finite(4);o.forward_lookahead_runes=RB::finite(1);break;
+    case K::Group:{o=child(0);o.record_separator=sep;o.custom_separator=sep!='\n';break;}
+    case K::Concat:{o.byte_lower=o.byte_upper=o.rune_lower=o.rune_upper=RB::finite(0);o.nullable=true;o.vm_state_limit_relevant=n->children.size()>1;for(const auto&cp:n->children){auto c=cp?analyze_regex_node(cp,sep):RA{};o.byte_lower=add_bound(o.byte_lower,c.byte_lower);o.byte_upper=add_bound(o.byte_upper,c.byte_upper);o.rune_lower=add_bound(o.rune_lower,c.rune_lower);o.rune_upper=add_bound(o.rune_upper,c.rune_upper);o.nullable&=c.nullable;o.nullable_known&=c.nullable_known;merge_analysis(o,c);}break;}
+    case K::Alt:{o.vm_state_limit_relevant=n->children.size()>1;if(n->children.empty()){o.nullable=true;break;}bool first=true, any=false, unk=false;for(const auto&cp:n->children){auto c=cp?analyze_regex_node(cp,sep):RA{};if(first){o.byte_lower=c.byte_lower;o.byte_upper=c.byte_upper;o.rune_lower=c.rune_lower;o.rune_upper=c.rune_upper;first=false;}else{o.byte_lower=min_bound(o.byte_lower,c.byte_lower);o.byte_upper=max_bound(o.byte_upper,c.byte_upper);o.rune_lower=min_bound(o.rune_lower,c.rune_lower);o.rune_upper=max_bound(o.rune_upper,c.rune_upper);}any|=c.nullable;unk|=!c.nullable_known;merge_analysis(o,c);}o.nullable=any;o.nullable_known=!unk;break;}
+    case K::Repeat:{o.vm_state_limit_relevant=true;auto c=child(0);merge_analysis(o,c);o.nullable=n->min==0||c.nullable;o.nullable_known=c.nullable_known;o.byte_lower=mul_bound(c.byte_lower,n->min);o.rune_lower=mul_bound(c.rune_lower,n->min);if(n->max==SIZE_MAX){o.has_unbounded_repeat=true;o.repeat_limit_applied=true;o.byte_upper=o.rune_upper=RB::unbounded();o.notes.emplace_back("unbounded repeat remains unbounded; VM repeat cap is 10000 iterations");}else if(n->max>10000){o.repeat_limit_applied=true;o.byte_upper=mul_bound(c.byte_upper,n->max);o.rune_upper=mul_bound(c.rune_upper,n->max);o.notes.emplace_back("repeat maximum exceeds VM 10000-iteration limit; upper width is unknown");}else{o.byte_upper=mul_bound(c.byte_upper,n->max);o.rune_upper=mul_bound(c.rune_upper,n->max);}break;}
+    case K::BackRef:o.has_backreference=true;o.nullable_known=false;o.byte_lower=o.rune_lower=RB::unknown();o.byte_upper=o.rune_upper=RB::unbounded();o.notes.emplace_back("backreference width depends on a capture and is unknown/unbounded");break;
+    case K::LookAhead:{auto c=child(0);o.nullable=true;o.has_lookahead=true;o.forward_lookahead_bytes=add_bound(c.byte_upper,c.forward_lookahead_bytes);o.forward_lookahead_runes=add_bound(c.rune_upper,c.forward_lookahead_runes);o.backward_lookbehind_bytes=c.backward_lookbehind_bytes;o.backward_lookbehind_runes=c.backward_lookbehind_runes;merge_analysis(o,c);o.notes.emplace_back("lookahead has zero match width; forward context is metadata only");break;}
+    case K::LookBehind:{auto c=child(0);o.nullable=true;o.has_lookbehind=true;o.lookbehind_limit_applied=true;o.backward_lookbehind_bytes=add_bound(c.byte_upper,c.backward_lookbehind_bytes);o.backward_lookbehind_runes=add_bound(c.rune_upper,c.backward_lookbehind_runes);o.forward_lookahead_bytes=c.forward_lookahead_bytes;o.forward_lookahead_runes=c.forward_lookahead_runes;merge_analysis(o,c);o.notes.emplace_back("lookbehind uses existing 8192-byte VM window; exact execution is unchanged");break;}
+    }
+    if(o.requires_line_begin||o.requires_line_end)o.requires_record_boundary=true;o.record_separator=sep;o.custom_separator=sep!='\n';o.separator_is_nul=sep=='\0';return o;
+}
+}
+RegexAnalysis analyze_regex(const std::shared_ptr<RegexNode>& ast, unsigned char record_separator){return analyze_regex_node(ast,record_separator);}
 namespace {
 bool filter_equal(const FilterExpr& a, const FilterExpr& b) {
     if (a.value.index() != b.value.index()) return false;
@@ -985,6 +1024,8 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     if(opt.line){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::Begin,true),p.ast,mk(RegexNode::Kind::End,true)};p.ast=std::move(c);}
     else if(opt.word){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::WordStartHalf),p.ast,mk(RegexNode::Kind::WordEndHalf)};p.ast=std::move(c);}
     if(!p.extended){NfaCompiler c(p);c.compile(p.ast);}
+    // M2.2 observes the final AST, including line/word wrappers.
+    p.analysis = analyze_regex(p.ast, '\n');
     return p;
 }
 

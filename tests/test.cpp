@@ -23,6 +23,51 @@ static Index corpus(std::string s){ return Index::from_documents({{"a.txt",std::
 static bool throws_compile(std::string p, PatternOptions o={}){try{(void)Pattern::compile(std::move(p),o);return false;}catch(...){return true;}}
 
 int main(){
+  // M2.2 analysis is deterministic metadata; it never participates in matching.
+  {
+    auto literal = detail::parse_regex("abc", {}).analysis;
+    assert(literal.byte_lower.is_finite() && literal.byte_lower.value == 3);
+    assert(literal.byte_upper.is_finite() && literal.byte_upper.value == 3);
+    assert(literal.rune_lower.value == 3 && literal.rune_upper.value == 3);
+    auto unicode = detail::parse_regex("世界", {}).analysis;
+    assert(unicode.byte_lower.value == 6 && unicode.rune_lower.value == 2);
+    auto dot = detail::parse_regex(".", {}).analysis;
+    assert(dot.byte_lower.value == 1 && dot.byte_upper.value == 4 && dot.rune_upper.value == 1);
+    auto alt = detail::parse_regex("a|世界", {}).analysis;
+    assert(alt.byte_lower.value == 1 && alt.byte_upper.value == 6);
+    auto concat = detail::parse_regex("a[0-9]", {}).analysis;
+    assert(concat.byte_lower.value == 2 && concat.byte_upper.value == 5);
+    auto bounded = detail::parse_regex("a{2,4}", {}).analysis;
+    assert(bounded.byte_lower.value == 2 && bounded.byte_upper.value == 4);
+    auto unbounded = detail::parse_regex("a*", {}).analysis;
+    assert(unbounded.has_unbounded_repeat && unbounded.byte_upper.is_unbounded());
+    auto folded = detail::parse_regex("K", PatternOptions{.case_mode=CaseMode::Insensitive}).analysis;
+    assert(!folded.byte_upper.is_finite());
+    PatternOptions line; line.line = true; line.crlf = true;
+    auto line_meta = detail::parse_regex("foo", line).analysis;
+    assert(line_meta.requires_record_boundary && line_meta.requires_line_begin && line_meta.requires_line_end && line_meta.crlf);
+    const auto raw_begin = detail::parse_regex("^", {}).analysis;
+    const auto raw_end = detail::parse_regex("$", {}).analysis;
+    assert(raw_begin.requires_record_boundary && !raw_begin.requires_line_begin);
+    assert(raw_end.requires_record_boundary && !raw_end.requires_line_end);
+    PatternOptions word; word.word = true;
+    auto word_meta = detail::parse_regex("foo", word).analysis;
+    assert(word_meta.requires_word_start && word_meta.requires_word_end);
+    PatternOptions nul; nul.multiline = true;
+    auto nul_meta = detail::analyze_regex(detail::parse_regex("^\\x00$", nul).ast, '\0');
+    assert(nul_meta.record_separator == '\0' && nul_meta.custom_separator && nul_meta.contains_nul);
+    PatternOptions extended; extended.engine = Engine::Pcre2Compat;
+    auto look = detail::parse_regex("a(?=b)", extended).analysis;
+    assert(look.has_lookahead && look.forward_lookahead_bytes.value == 1 && look.byte_upper.value == 1);
+    auto behind = detail::parse_regex("(?<=a)b", extended).analysis;
+    assert(behind.has_lookbehind && behind.backward_lookbehind_bytes.value == 1 && behind.byte_upper.value == 1);
+    auto backref = detail::parse_regex("(a)\\1", extended).analysis;
+    assert(backref.has_backreference && !backref.byte_upper.is_finite());
+    auto capped = std::make_shared<detail::RegexNode>(); capped->kind = detail::RegexNode::Kind::Repeat; capped->min = 1; capped->max = 10001;
+    capped->children.push_back(std::make_shared<detail::RegexNode>()); capped->children[0]->kind = detail::RegexNode::Kind::Literal; capped->children[0]->literal = "a";
+    auto capped_meta = detail::analyze_regex(capped);
+    assert(capped_meta.repeat_limit_applied && capped_meta.byte_upper.is_finite() && capped_meta.byte_upper.value == 10001);
+  }
   {
     auto idx=Index::from_documents({{"a.txt","alpha beta\nbeta gamma\n"},{"b.txt","delta alpha\n"}});
     assert(idx.content(0)=="alpha beta\nbeta gamma\n");
