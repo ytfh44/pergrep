@@ -198,8 +198,9 @@ struct VerifierContext {
     bool right_context_available = false;
     unsigned char separator = '\n';
     bool crlf = false;
-    // Optional execution region. A zero/zero pair keeps the historical full-source visibility;
-    // a non-empty pair bounds bytes visible to the verifier while all returned coordinates remain absolute.
+    // Optional execution region. A zero/zero pair keeps historical full-source
+    // consumption; a non-empty pair clips consuming bytes/runes while boundary
+    // context still follows source/record metadata and coordinates stay absolute.
     std::uint64_t region_begin = 0;
     std::uint64_t region_end = 0;
     bool bounded_region = false;
@@ -261,7 +262,10 @@ struct RegexAnalysis {
     bool requires_line_begin = false, requires_line_end = false;
     bool requires_word_boundary = false, requires_word_start = false, requires_word_end = false;
     bool icase = false, unicode = true, dotall = false, multiline = false, crlf = false;
-    bool contains_nul = false, custom_separator = false, separator_is_nul = false;
+    // contains_nul is the aggregate compatibility flag: it is true when the separator or pattern contains NUL. pattern_contains_nul distinguishes
+    // NUL data from NUL-record framing for bounded verification.
+    bool contains_nul = false, pattern_contains_nul = false;
+    bool custom_separator = false, separator_is_nul = false;
     unsigned char record_separator = '\n';
     bool has_backreference = false, has_lookahead = false, has_lookbehind = false;
     bool has_unbounded_repeat = false, repeat_limit_applied = false;

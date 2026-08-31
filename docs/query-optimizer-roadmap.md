@@ -81,7 +81,10 @@ M2.2 reports the existing 10,000-repeat, 8,192-byte lookbehind, and 50,000-state
 Finite AST repeat maxima remain finite semantic bounds even when above 10,000; `repeat_limit_applied` records that the unchanged VM execution cap is relevant and does not convert a finite fact into an unknown bound.
 
 ### M2.3 — Bounded-Region Execution
-The verifier now has a guarded bounded-region operator for a narrow regular subset: sensitive, non-nullable, finite-width patterns with a proven mandatory literal and no lookaround, backreferences, or boundary-dependent flags. It derives absolute candidate-start ranges from the M2.2 byte upper bound, runs the existing matcher against only the corresponding bounded source regions, and preserves absolute match/capture coordinates and file/offset ordering. Unsupported or ambiguous patterns retain the full-record/full-file verifier path.
+The verifier uses a guarded bounded-region operator for sensitive, non-nullable, finite-width regular patterns with proven mandatory literals. It narrows rune consumption to absolute source regions while preserving record splitting, source/file anchors, captures, and traversal order.
+
+### M2.4 — Boundary-Preserving Bounded Verification
+Boundary metadata is explicit: record bounds exclude separators (including CRLF terminators), multiline mode retains the complete file as one source, trailing separators do not create an implicit record, and custom/NUL separators remain distinct from payload NUL bytes. Record-local anchors (`^`/`$`, `\A`/`\z`) consult the established record/separator policy, and word assertions decode adjacent Unicode runes from source even when they lie outside the execution region. Region endpoints never become implicit file or record endpoints. Extended, unbounded, or otherwise ambiguous patterns retain the established full-record/full-file fallback.
 
 ## M1.8 — Objective-Aware First-Hit and Ordered Prefix
 
