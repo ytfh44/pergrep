@@ -487,30 +487,56 @@ private:
 
 struct NfaThread { int pc=-1; std::size_t start=0; std::vector<std::pair<std::size_t,std::size_t>> caps; };
 
-bool assert_begin(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){return pos==0||(i.multiline&&pos>0&&static_cast<unsigned char>(t[pos-1])==sep);}
-bool assert_end(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){
+Rune context_rune_at(const VerifierContext& c, std::size_t pos) {
+    if (!c.validate() || pos < c.record_begin || pos >= c.record_end) return {};
+    auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
+    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    return r;
+}
+Rune context_rune_before(const VerifierContext& c, std::size_t pos) {
+    if (!c.validate() || pos <= c.source_begin || (pos <= c.record_begin && !c.left_context_available) || pos > c.record_end) return {};
+    auto p = pos - 1;
+    if (p < c.source_begin) return {};
+    auto r = rune_before(c.source, pos - static_cast<std::size_t>(c.source_begin));
+    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    return r;
+}
+Rune context_rune_right(const VerifierContext& c, std::size_t pos) {
+    if (!c.validate()) return {};
+    if (pos < c.record_end) return context_rune_at(c, pos);
+    if (pos != c.record_end || !c.right_context_available || pos >= c.source_end) return {};
+    auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
+    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    return r;
+}
+unsigned char context_byte(const VerifierContext& c, std::size_t pos) {
+    if (!c.contains(pos)) return 0;
+    return static_cast<unsigned char>(c.source[pos - static_cast<std::size_t>(c.source_begin)]);
+}
+bool assert_begin(const NfaInst&i,const VerifierContext& c,std::size_t pos,unsigned char sep){return pos==c.record_begin||(i.multiline&&pos>c.source_begin&&context_byte(c,pos-1)==sep);}
+bool assert_end(const NfaInst&i,const VerifierContext& c,std::size_t pos,unsigned char sep){
     if(i.multiline){
-        bool ok=pos==t.size()||(pos<t.size()&&static_cast<unsigned char>(t[pos])==sep);
-        if(!ok&&i.crlf&&sep=='\n'&&pos+1<t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+        bool ok=pos==c.record_end||(pos<c.record_end&&context_byte(c,pos)==sep);
+        if(!ok&&i.crlf&&sep=='\n'&&pos+1<c.record_end&&context_byte(c,pos)=='\r'&&context_byte(c,pos+1)=='\n') ok=true;
         return ok;
     }
-    bool ok=pos==t.size()||(pos+1==t.size()&&static_cast<unsigned char>(t[pos])==sep);
-    if(!ok&&i.crlf&&sep=='\n'&&pos+2==t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+    bool ok=pos==c.record_end||(pos+1==c.record_end&&context_byte(c,pos)==sep);
+    if(!ok&&i.crlf&&sep=='\n'&&pos+2==c.record_end&&context_byte(c,pos)=='\r'&&context_byte(c,pos+1)=='\n') ok=true;
     return ok;
 }
-bool assert_abs_begin(const NfaInst&,std::string_view,std::size_t pos){return pos==0;}
-bool assert_abs_end(const NfaInst&,std::string_view t,std::size_t pos){return pos==t.size();}
-bool assert_end_newline(const NfaInst&i,std::string_view t,std::size_t pos,unsigned char sep){
-    bool ok=pos==t.size()||(pos+1==t.size()&&static_cast<unsigned char>(t[pos])==sep);
-    if(!ok&&i.crlf&&sep=='\n'&&pos+2==t.size()&&t[pos]=='\r'&&pos+1<t.size()&&t[pos+1]=='\n') ok=true;
+bool assert_abs_begin(const NfaInst&,const VerifierContext& c,std::size_t pos){return pos==c.record_begin;}
+bool assert_abs_end(const NfaInst&,const VerifierContext& c,std::size_t pos){return pos==c.record_end;}
+bool assert_end_newline(const NfaInst&i,const VerifierContext& c,std::size_t pos,unsigned char sep){
+    bool ok=pos==c.record_end||(pos+1==c.record_end&&context_byte(c,pos)==sep);
+    if(!ok&&i.crlf&&sep=='\n'&&pos+2==c.record_end&&context_byte(c,pos)=='\r'&&context_byte(c,pos+1)=='\n') ok=true;
     return ok;
 }
 bool is_word_at(const NfaInst&i,const Rune&r){return r.ok&&(i.unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));}
-bool assert_word(const NfaInst&i,std::string_view t,std::size_t pos){auto l=rune_before(t,pos),r=rune_at(t,pos);bool ok=is_word_at(i,l)!=is_word_at(i,r);return i.negative?!ok:ok;}
-bool assert_word_start_half(const NfaInst&i,std::string_view t,std::size_t pos){return !is_word_at(i,rune_before(t,pos));}
-bool assert_word_end_half(const NfaInst&i,std::string_view t,std::size_t pos){return !is_word_at(i,rune_at(t,pos));}
+bool assert_word(const NfaInst&i,const VerifierContext& c,std::size_t pos){auto l=context_rune_before(c,pos),r=context_rune_right(c,pos);bool ok=is_word_at(i,l)!=is_word_at(i,r);return i.negative?!ok:ok;}
+bool assert_word_start_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_before(c,pos));}
+bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_at(c,pos));}
 
-void add_nfa_thread(const RegexProgram&p,std::string_view text,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint8_t>&seen){
+void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint8_t>&seen){
     std::vector<NfaThread> stack;stack.push_back(std::move(seed));
     while(!stack.empty()){
         auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc])continue;seen[t.pc]=1;const auto&i=p.nfa[t.pc];
@@ -520,14 +546,14 @@ void add_nfa_thread(const RegexProgram&p,std::string_view text,const PatternOpti
             case NfaInst::Op::Split:{auto y=t;push(i.y,std::move(y));push(i.x,std::move(t));break;}
             case NfaInst::Op::SaveStart:if(i.group>=0&&static_cast<std::size_t>(i.group)<t.caps.size())t.caps[i.group].first=pos;push(i.x,std::move(t));break;
             case NfaInst::Op::SaveEnd:if(i.group>=0&&static_cast<std::size_t>(i.group)<t.caps.size())t.caps[i.group].second=pos;push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertBegin:if(assert_begin(i,text,pos,sep))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertEnd:if(assert_end(i,text,pos,sep))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertAbsBegin:if(assert_abs_begin(i,text,pos))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertAbsEnd:if(assert_abs_end(i,text,pos))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertEndNewline:if(assert_end_newline(i,text,pos,sep))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertWord:if(assert_word(i,text,pos))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertWordStartHalf:if(assert_word_start_half(i,text,pos))push(i.x,std::move(t));break;
-            case NfaInst::Op::AssertWordEndHalf:if(assert_word_end_half(i,text,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertBegin:if(assert_begin(i,c,pos,sep))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertEnd:if(assert_end(i,c,pos,sep))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertAbsBegin:if(assert_abs_begin(i,c,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertAbsEnd:if(assert_abs_end(i,c,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertEndNewline:if(assert_end_newline(i,c,pos,sep))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertWord:if(assert_word(i,c,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertWordStartHalf:if(assert_word_start_half(i,c,pos))push(i.x,std::move(t));break;
+            case NfaInst::Op::AssertWordEndHalf:if(assert_word_end_half(i,c,pos))push(i.x,std::move(t));break;
             default:list.push_back(std::move(t));break;
         }
     }
@@ -541,21 +567,22 @@ bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptio
     return false;
 }
 
-bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&o,std::size_t from,Match*out,std::uint32_t file_id,unsigned char sep){
-    if(p.nfa_start<0) return false;
+bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
+    if(!c.validate() || p.nfa_start<0) return false;
     std::vector<NfaThread> cur, next;
     std::vector<std::uint8_t> seen(p.nfa.size()), seen_next(p.nfa.size());
     std::optional<NfaThread> best;
     std::size_t best_end = 0;
-    std::size_t pos = from;
+    std::size_t pos = c.candidate_begin;
     for (;;) {
-        if (cur.empty() && !best && !p.query_ir.prefixes.empty() && pos < text.size()) {
+        if (cur.empty() && !best && pos >= c.candidate_end) break;
+        if (cur.empty() && !best && !p.query_ir.prefixes.empty() && pos < c.record_end) {
             std::size_t next_jump = std::string_view::npos;
             if (p.query_ir.prefixes.size() == 1) {
-                next_jump = text.find(p.query_ir.prefixes[0], pos);
+                next_jump = c.source.find(p.query_ir.prefixes[0], pos - static_cast<std::size_t>(c.source_begin));
             } else {
                 for (const auto& pref : p.query_ir.prefixes) {
-                    auto cand = text.find(pref, pos);
+                    auto cand = c.source.find(pref, pos - static_cast<std::size_t>(c.source_begin));
                     if (cand != std::string_view::npos) {
                         if (next_jump == std::string_view::npos || cand < next_jump) {
                             next_jump = cand;
@@ -563,14 +590,16 @@ bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&
                     }
                 }
             }
-            if (next_jump == std::string_view::npos) break;
-            pos = next_jump;
+            if (next_jump == std::string_view::npos || c.source_begin + next_jump >= c.candidate_end) break;
+            pos = c.source_begin + next_jump;
         }
-        NfaThread start;
-        start.pc = p.nfa_start;
-        start.start = pos;
-        start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
-        add_nfa_thread(p, text, o, sep, pos, std::move(start), cur, seen);
+        if (pos < c.candidate_end) {
+            NfaThread start;
+            start.pc = p.nfa_start;
+            start.start = pos;
+            start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
+            add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen);
+        }
         for (std::size_t k = 0; k < cur.size(); ++k) {
             if (p.nfa[cur[k].pc].op == NfaInst::Op::Match) {
                 best = cur[k];
@@ -580,17 +609,17 @@ bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&
             }
         }
         if (best && cur.empty()) break;
-        if (pos >= text.size()) break;
-        auto r = rune_at(text, pos);
+        if (pos >= c.record_end) break;
+        auto r = context_rune_at(c, pos);
         if (!r.ok) break;
         next.clear();
         std::fill(seen_next.begin(), seen_next.end(), 0);
         for (auto& t : cur) {
             const auto& i = p.nfa[t.pc];
-            if (nfa_consume(i, r.cp, sep, o)) {
+            if (nfa_consume(i, r.cp, c.separator, o)) {
                 auto z = t;
                 z.pc = i.x;
-                add_nfa_thread(p, text, o, sep, r.next, std::move(z), next, seen_next);
+                add_nfa_thread(p, c, o, c.separator, r.next, std::move(z), next, seen_next);
             }
         }
         cur.swap(next);
@@ -606,100 +635,41 @@ bool nfa_search(const RegexProgram&p,std::string_view text,const PatternOptions&
 struct Caps { std::vector<std::pair<std::size_t,std::size_t>> g; };
 struct State { std::size_t pos=0; Caps caps; };
 
-bool literal_at(std::string_view text,std::size_t pos,std::string_view lit,bool icase,std::size_t* end) {
-    std::size_t tp=pos,lp=0;while(lp<lit.size()){auto a=rune_at(text,tp),b=rune_at(lit,lp);if(!a.ok||!b.ok||!cp_eq(a.cp,b.cp,icase))return false;tp=a.next;lp=b.next;}if(end)*end=tp;return true;
-}
 // Extended VM (eval) resource bounds — enforced explicitly with clean throws:
 // - lookbehind window: 8192 bytes/code-units before s.pos (both positive and negative branches: lo = s.pos>8192 ? s.pos-8192 : 0)
 // - Repeat hard limit: capped to 10000 iterations (finite max -> min(max,10000); unbounded -> min(hard,10000))
 // - recursion depth: throws if depth>10000
 // - VM state limit: any Concat/Alt/Repeat intermediate expansion exceeding 50000 states throws
 //   "pergrep regex: VM state limit exceeded" instead of silent truncation
-std::vector<State> eval(const std::shared_ptr<RegexNode>&n,std::string_view t,const PatternOptions&o,unsigned char sep,const State&s,int depth=0) {
+bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end) {
+    std::size_t tp=pos,lp=0;
+    while(lp<lit.size()){auto a=context_rune_at(c,tp),b=rune_at(lit,lp);if(!a.ok||!b.ok||!cp_eq(a.cp,b.cp,icase))return false;tp=a.next;lp=b.next;}
+    if(end)*end=tp;return true;
+}
+
+std::vector<State> eval(const std::shared_ptr<RegexNode>&n,const VerifierContext& c,const PatternOptions&o,int depth,const State&s) {
     if(depth>10000) throw std::runtime_error("pergrep regex: recursion depth exceeded");
     using K=RegexNode::Kind;std::vector<State>out;bool icase=n->icase;
     switch(n->kind){
         case K::Empty:out.push_back(s);break;
-        case K::Literal:{std::size_t e;if(literal_at(t,s.pos,n->literal,icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
-        case K::Dot:{auto r=rune_at(t,s.pos);if(r.ok&&(n->dotall||r.cp!=sep)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
-        case K::Class:{auto r=rune_at(t,s.pos);if(r.ok&&class_match(n->char_class,r.cp,icase)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
-        case K::Begin:{bool ok=s.pos==0||(n->multiline&&s.pos>0&&static_cast<unsigned char>(t[s.pos-1])==sep);if(ok)out.push_back(s);break;}
-        case K::End:{
-            bool ok=false;
-            if(n->multiline){
-                ok=s.pos==t.size()||(s.pos<t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
-                if(!ok&&n->crlf&&sep=='\n'&&s.pos+1<t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
-            } else {
-                ok=s.pos==t.size()||(s.pos+1==t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
-                if(!ok&&n->crlf&&sep=='\n'&&s.pos+2==t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
-            }
-            if(ok)out.push_back(s);
-            break;
-        }
-        case K::AbsBegin:{if(s.pos==0)out.push_back(s);break;}
-        case K::AbsEnd:{if(s.pos==t.size())out.push_back(s);break;}
-        case K::EndNewline:{
-            bool ok=s.pos==t.size()||(s.pos+1==t.size()&&static_cast<unsigned char>(t[s.pos])==sep);
-            if(!ok&&n->crlf&&sep=='\n'&&s.pos+2==t.size()&&t[s.pos]=='\r'&&s.pos+1<t.size()&&t[s.pos+1]=='\n')ok=true;
-            if(ok)out.push_back(s);
-            break;
-        }
-        case K::WordBoundary:{auto l=rune_before(t,s.pos),r=rune_at(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));bool ok=lw!=rw;if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
-        case K::WordStartHalf:{auto l=rune_before(t,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
-        case K::WordEndHalf:{auto r=rune_at(t,s.pos);bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
-        case K::Concat:{std::vector<State>cur{s};for(auto&c:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(c,t,o,sep,st,depth+1);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(next.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
-        case K::Alt:{for(auto&c:n->children){auto v=eval(c,t,o,sep,s,depth+1);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(out.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}break;}
-        case K::Group:{auto base=s;auto v=eval(n->children[0],t,o,sep,s,depth+1);for(auto&z:v){if(static_cast<int>(z.caps.g.size())<=n->group)z.caps.g.resize(n->group+1,{SIZE_MAX,SIZE_MAX});z.caps.g[n->group]={base.pos,z.pos};}out=std::move(v);break;}
-        case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a||b>t.size())break;std::size_t e;if(literal_at(t,s.pos,t.substr(a,b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
-        case K::LookAhead:{
-            auto v=eval(n->children[0],t,o,sep,s,depth+1);
-            if(n->negative){if(v.empty())out.push_back(s);}
-            else{for(auto&z:v){State r=z;r.pos=s.pos;out.push_back(std::move(r));}}
-            break;
-        }
-        case K::LookBehind:{
-            std::size_t lo = s.pos > 8192 ? s.pos - 8192 : 0;
-            if(n->negative){
-                bool ok=false;
-                for(std::size_t p=lo;p<=s.pos;){
-                    State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
-                    for(auto&z:v)if(z.pos==s.pos){ok=true;break;}
-                    if(ok||p==s.pos) break;
-                    auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
-                }
-                if(!ok)out.push_back(s);
-            } else {
-                for(std::size_t p=lo;p<=s.pos;){
-                    State q=s;q.pos=p;auto v=eval(n->children[0],t,o,sep,q,depth+1);
-                    for(auto&z:v)if(z.pos==s.pos){State r=z;r.pos=s.pos;out.push_back(std::move(r));}
-                    if(p==s.pos) break;
-                    auto rr=rune_at(t,p);p=rr.ok?rr.next:p+1;
-                }
-            }
-            break;
-        }
-        case K::Repeat:{
-            std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};
-            std::size_t total = levels.size();
-            std::size_t hard = t.size() - s.pos + 1;
-            std::size_t limit = n->max == SIZE_MAX ? std::min<std::size_t>(hard, 10000) : std::min<std::size_t>(n->max, 10000);
-            for(std::size_t k=1;k<=limit;++k){
-                std::vector<State>next;
-                for(auto&st:levels){
-                    auto v=eval(n->children[0],t,o,sep,st,depth+1);
-                    for(auto&z:v)if(z.pos!=st.pos)next.push_back(std::move(z));
-                }
-                if(next.empty())break;
-                if(next.size()>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
-                total += next.size();
-                if(total>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
-                all.push_back(next);levels=std::move(next);
-            }
-            if(n->greedy){for(std::size_t k=all.size();k-->n->min;)out.insert(out.end(),all[k].begin(),all[k].end());}
-            else{for(std::size_t k=n->min;k<all.size();++k)out.insert(out.end(),all[k].begin(),all[k].end());}
-            if(out.size()>50000) throw std::runtime_error("pergrep regex: VM state limit exceeded");
-            break;
-        }
+        case K::Literal:{std::size_t e;if(context_literal_at(c,s.pos,n->literal,icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
+        case K::Dot:{auto r=context_rune_at(c,s.pos);if(r.ok&&(n->dotall||r.cp!=c.separator)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
+        case K::Class:{auto r=context_rune_at(c,s.pos);if(r.ok&&class_match(n->char_class,r.cp,icase)){auto z=s;z.pos=r.next;out.push_back(std::move(z));}break;}
+        case K::Begin:{bool ok=s.pos==c.record_begin||(n->multiline&&s.pos>c.source_begin&&context_byte(c,s.pos-1)==c.separator);if(ok)out.push_back(s);break;}
+        case K::End:{bool ok=false;if(n->multiline){ok=s.pos==c.record_end||(s.pos<c.record_end&&context_byte(c,s.pos)==c.separator);if(!ok&&n->crlf&&c.separator=='\n'&&s.pos+1<c.record_end&&context_byte(c,s.pos)=='\r'&&context_byte(c,s.pos+1)=='\n')ok=true;}else{ok=s.pos==c.record_end||(s.pos+1==c.record_end&&context_byte(c,s.pos)==c.separator);if(!ok&&n->crlf&&c.separator=='\n'&&s.pos+2==c.record_end&&context_byte(c,s.pos)=='\r'&&context_byte(c,s.pos+1)=='\n')ok=true;}if(ok)out.push_back(s);break;}
+        case K::AbsBegin:{if(s.pos==c.record_begin)out.push_back(s);break;}
+        case K::AbsEnd:{if(s.pos==c.record_end)out.push_back(s);break;}
+        case K::EndNewline:{bool ok=s.pos==c.record_end||(s.pos+1==c.record_end&&context_byte(c,s.pos)==c.separator);if(!ok&&n->crlf&&c.separator=='\n'&&s.pos+2==c.record_end&&context_byte(c,s.pos)=='\r'&&context_byte(c,s.pos+1)=='\n')ok=true;if(ok)out.push_back(s);break;}
+        case K::WordBoundary:{auto l=context_rune_before(c,s.pos),r=context_rune_right(c,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));bool ok=lw!=rw;if(n->negative)ok=!ok;if(ok)out.push_back(s);break;}
+        case K::WordStartHalf:{auto l=context_rune_before(c,s.pos);bool lw=l.ok&&(n->unicode?unicode_word(l.cp):(l.cp<128&&ascii_word(static_cast<unsigned char>(l.cp))));if(!lw)out.push_back(s);break;}
+        case K::WordEndHalf:{auto r=context_rune_right(c,s.pos);bool rw=r.ok&&(n->unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));if(!rw)out.push_back(s);break;}
+        case K::Concat:{std::vector<State>cur{s};for(auto&ch:n->children){std::vector<State>next;for(auto&st:cur){auto v=eval(ch,c,o,depth+1,st);next.insert(next.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(next.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}cur.swap(next);if(cur.empty())break;}out=std::move(cur);break;}
+        case K::Alt:{for(auto&ch:n->children){auto v=eval(ch,c,o,depth+1,s);out.insert(out.end(),std::make_move_iterator(v.begin()),std::make_move_iterator(v.end()));if(out.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");}break;}
+        case K::Group:{auto base=s;auto v=eval(n->children[0],c,o,depth+1,s);for(auto&z:v){if(static_cast<int>(z.caps.g.size())<=n->group)z.caps.g.resize(n->group+1,{SIZE_MAX,SIZE_MAX});z.caps.g[n->group]={base.pos,z.pos};}out=std::move(v);break;}
+        case K::BackRef:{if(n->group>=static_cast<int>(s.caps.g.size()))break;auto[a,b]=s.caps.g[n->group];if(a==SIZE_MAX||b<a||b>c.record_end)break;std::size_t e;if(context_literal_at(c,s.pos,c.source.substr(a-static_cast<std::size_t>(c.source_begin),b-a),icase,&e)){auto z=s;z.pos=e;out.push_back(std::move(z));}break;}
+        case K::LookAhead:{auto v=eval(n->children[0],c,o,depth+1,s);if(n->negative){if(v.empty())out.push_back(s);}else{for(auto&z:v){State r=z;r.pos=s.pos;out.push_back(std::move(r));}}break;}
+        case K::LookBehind:{VerifierContext look=c;if(c.left_context_available)look.record_begin=c.source_begin;if(c.right_context_available)look.record_end=c.source_end;std::size_t floor=n->negative||!c.left_context_available?c.record_begin:c.source_begin;std::size_t lo=s.pos>8192?std::max(floor,s.pos-8192):floor;if(n->negative){bool ok=false;for(std::size_t p=lo;p<=s.pos;){State q=s;q.pos=p;auto v=eval(n->children[0],look,o,depth+1,q);for(auto&z:v)if(z.pos==s.pos){ok=true;break;}if(ok||p==s.pos)break;auto rr=context_rune_at(c,p);p=rr.ok?rr.next:p+1;}if(!ok)out.push_back(s);}else{for(std::size_t p=lo;p<=s.pos;){State q=s;q.pos=p;auto v=eval(n->children[0],look,o,depth+1,q);for(auto&z:v)if(z.pos==s.pos){State r=z;r.pos=s.pos;out.push_back(std::move(r));}if(p==s.pos)break;auto rr=context_rune_at(c,p);p=rr.ok?rr.next:p+1;}}break;}
+        case K::Repeat:{std::vector<State>levels{s};std::vector<std::vector<State>>all{levels};std::size_t total=levels.size();std::size_t hard=c.record_end>=s.pos?c.record_end-s.pos+1:0;std::size_t limit=n->max==SIZE_MAX?std::min<std::size_t>(hard,10000):std::min<std::size_t>(n->max,10000);for(std::size_t k=1;k<=limit;++k){std::vector<State>next;for(auto&st:levels){auto v=eval(n->children[0],c,o,depth+1,st);for(auto&z:v)if(z.pos!=st.pos)next.push_back(std::move(z));}if(next.empty())break;if(next.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");total+=next.size();if(total>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");all.push_back(next);levels=std::move(next);}if(n->greedy){for(std::size_t k=all.size();k-->n->min;)out.insert(out.end(),all[k].begin(),all[k].end());}else{for(std::size_t k=n->min;k<all.size();++k)out.insert(out.end(),all[k].begin(),all[k].end());}if(out.size()>50000)throw std::runtime_error("pergrep regex: VM state limit exceeded");break;}
     }
     return out;
 }
@@ -1018,22 +988,40 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     return p;
 }
 
-bool regex_search(const RegexProgram&p,std::string_view text,const PatternOptions&o,std::size_t from,Match*out,std::uint32_t file_id,unsigned char sep){
-    if(!p.extended)return nfa_search(p,text,o,from,out,file_id,sep);
-    std::size_t st=from;while(st<=text.size()){State s;s.pos=st;s.caps.g.resize(p.groups+1,{SIZE_MAX,SIZE_MAX});auto v=eval(p.ast,text,o,sep,s);if(!v.empty()){auto z=v.front();if(out){out->file_id=file_id;out->start=st;out->end=z.pos;out->captures.assign(p.groups+1,{});out->captures[0]={st,z.pos,true,""};for(int g=1;g<=p.groups;++g){if(g<static_cast<int>(z.caps.g.size())){auto[a,b]=z.caps.g[g];if(a!=SIZE_MAX)out->captures[g]={a,b,true,g<static_cast<int>(p.group_names.size())?p.group_names[g]:std::string{}};}}}return true;}if(st==text.size())break;auto r=rune_at(text,st);st=r.ok?r.next:st+1;}return false;
+bool regex_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
+    if(!c.validate()) return false;
+    if(!p.extended)return nfa_search(p,c,o,out,file_id);
+    std::size_t st=c.candidate_begin;
+    while(st<c.candidate_end){
+        State s;s.pos=st;s.caps.g.resize(p.groups+1,{SIZE_MAX,SIZE_MAX});auto v=eval(p.ast,c,o,0,s);
+        if(!v.empty()){auto z=v.front();if(out){out->file_id=file_id;out->start=st;out->end=z.pos;out->captures.assign(p.groups+1,{});out->captures[0]={st,z.pos,true,""};for(int g=1;g<=p.groups;++g){if(g<static_cast<int>(z.caps.g.size())){auto[a,b]=z.caps.g[g];if(a!=SIZE_MAX)out->captures[g]={a,b,true,g<static_cast<int>(p.group_names.size())?p.group_names[g]:std::string{}};}}}return true;}
+        if(st>=c.record_end)break;auto r=context_rune_at(c,st);st=r.ok?r.next:st+1;
+    }
+    return false;
 }
 void test_eval_depth_guard(int depth){
-    // Build a minimal AST (literal) and call eval with the given depth to verify the guard.
     auto n = std::make_shared<RegexNode>(); n->kind = RegexNode::Kind::Literal; n->literal = "a";
     State s; s.pos = 0;
-    // Create a dummy text view; eval will immediately check depth before doing work.
-    std::string_view t = "a";
+    VerifierContext c; c.source="a"; c.source_end=1; c.record_end=1; c.candidate_end=2;
     PatternOptions o;
-    unsigned char sep = '\n';
-    (void)eval(n, t, o, sep, s, depth);
+    (void)eval(n, c, o, depth, s);
+}
+std::vector<Match> regex_find_all(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,bool overlapping,std::uint32_t file_id,std::uint64_t max_matches){
+    std::vector<Match>out;std::size_t pos=c.candidate_begin;
+    while(pos<c.candidate_end){Match m;auto attempt=c;attempt.candidate_begin=pos;if(!regex_search(p,attempt,o,&m,file_id))break;const auto start=m.start,end=m.end;out.push_back(std::move(m));if(max_matches&&out.size()>=max_matches)break;
+        if(overlapping){auto r=context_rune_at(c,start);pos=r.ok?r.next:start+1;}else if(end>start)pos=end;else{auto r=context_rune_at(c,start);pos=r.ok?r.next:start+1;}
+    }
+    return out;
+}
+
+bool regex_search(const RegexProgram&p,std::string_view text,const PatternOptions&o,std::size_t from,Match*out,std::uint32_t file_id,unsigned char sep){
+    VerifierContext c{text,0,static_cast<std::uint64_t>(text.size()),0,static_cast<std::uint64_t>(text.size()),static_cast<std::uint64_t>(from),static_cast<std::uint64_t>(text.size())+1,false,false,sep,o.crlf};
+    return regex_search(p,c,o,out,file_id);
 }
 std::vector<Match> regex_find_all(const RegexProgram&p,std::string_view text,const PatternOptions&o,bool overlapping,std::uint32_t file_id,std::uint64_t base,std::uint64_t max_matches,unsigned char sep){
-    std::vector<Match>out;std::size_t pos=0;while(pos<=text.size()){Match m;if(!regex_search(p,text,o,pos,&m,file_id,sep))break;std::size_t ls=m.start,le=m.end;m.start+=base;m.end+=base;for(auto&c:m.captures)if(c.matched){c.start+=base;c.end+=base;}out.push_back(std::move(m));if(max_matches&&out.size()>=max_matches)break;if(overlapping){auto r=rune_at(text,ls);pos=r.ok?r.next:ls+1;}else if(le>ls)pos=le;else{auto r=rune_at(text,ls);pos=r.ok?r.next:ls+1;}}return out;
+    const auto n=static_cast<std::uint64_t>(text.size());
+    VerifierContext c{text,base,base+n,base,base+n,base,base+n+1,false,false,sep,o.crlf};
+    return regex_find_all(p,c,o,overlapping,file_id,max_matches);
 }
 
 } // namespace pergrep::detail

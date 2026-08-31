@@ -1630,7 +1630,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     matched = fixed_match_in_record(rec, q, icase, p.impl_->opt.word, p.impl_->opt.line, p.impl_->opt.unicode, I);
                 } else {
                     Match m;
-                    if (detail::regex_search(p.impl_->re, rec, p.impl_->opt, 0, &m, fid, opt.record_separator)) {
+                    detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
+                        static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
+                        static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
+                        false, false, opt.record_separator, p.impl_->opt.crlf};
+                    if (detail::regex_search(p.impl_->re, context, p.impl_->opt, &m, fid)) {
                         matched = true;
                     }
                 }
@@ -1953,7 +1957,10 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             accounting.touch(fid, 0, data.size());
             const auto remain = [&]() { return first_hit_objective ? std::size_t{1} : (opt.max_matches ? opt.max_matches - out.size() : 0); };
             if (p.impl_->opt.multiline) {
-                auto ms = detail::regex_find_all(p.impl_->re, data, p.impl_->opt, opt.overlapping, fid, 0, remain(), opt.record_separator);
+                detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
+                    0, static_cast<std::uint64_t>(data.size()), 0, static_cast<std::uint64_t>(data.size() + 1),
+                    false, false, opt.record_separator, p.impl_->opt.crlf};
+                auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                 out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
                 if (result_bound_reached()) {
@@ -1973,8 +1980,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     std::size_t logical_e = e;
                     if (p.impl_->opt.crlf && opt.record_separator == '\n' && logical_e > b && data[logical_e - 1] == '\r')
                         --logical_e;
-                    auto rec = std::string_view(data).substr(b, logical_e - b);
-                    auto ms = detail::regex_find_all(p.impl_->re, rec, p.impl_->opt, opt.overlapping, fid, b, remain(), opt.record_separator);
+                    detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
+                        static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
+                        static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
+                        false, false, opt.record_separator, p.impl_->opt.crlf};
+                    auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                     out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
                 if (result_bound_reached()) {

@@ -175,6 +175,47 @@ struct QueryIR {
     std::string exact_literal;
 };
 
+// Internal contract for one exact verifier invocation. All coordinates are
+// source bytes (not Unicode code points) and all intervals are half-open.
+// `source` is a non-owning view whose byte zero is `source_begin`; callers
+// own/keep the backing storage alive for the duration of verification.
+// `record_begin/end` delimit the logical record (the separator and a CRLF
+// terminator are outside it). `candidate_begin/end` is the planned, half-open
+// range of start offsets to attempt; its end may be record_end + 1 so the
+// empty match at the record end remains a valid candidate. It narrows starts
+// only (M2.3 owns bounded-region execution), never the bytes visible to an
+// attempted match. Source/record bounds, context-availability flags, separator
+// and CRLF policy are authoritative; derived views are convenience helpers.
+struct VerifierContext {
+    std::string_view source;
+    std::uint64_t source_begin = 0;
+    std::uint64_t source_end = 0;
+    std::uint64_t record_begin = 0;
+    std::uint64_t record_end = 0;
+    std::uint64_t candidate_begin = 0;
+    std::uint64_t candidate_end = 0;
+    bool left_context_available = false;
+    bool right_context_available = false;
+    unsigned char separator = '\n';
+    bool crlf = false;
+
+    bool validate() const noexcept {
+        if (source_end < source_begin || source_end - source_begin != source.size()) return false;
+        if (record_begin < source_begin || record_end < record_begin || record_end > source_end) return false;
+        if (candidate_begin < record_begin || candidate_end < candidate_begin) return false;
+        if (record_end == std::numeric_limits<std::uint64_t>::max()) return false;
+        return candidate_end <= record_end + 1;
+    }
+    std::string_view record_view() const noexcept {
+        if (!validate()) return {};
+        return source.substr(static_cast<std::size_t>(record_begin - source_begin),
+                             static_cast<std::size_t>(record_end - record_begin));
+    }
+    bool contains(std::uint64_t absolute) const noexcept {
+        return absolute >= source_begin && absolute < source_end;
+    }
+};
+
 // Pure extraction helpers (conservative, no false negatives). Exposed for
 // testing and for analyze_query(). Each operates on the AST subtree only.
 std::vector<std::string> query_mandatory(const std::shared_ptr<RegexNode>& n);
@@ -215,6 +256,10 @@ struct RegexProgram {
     std::int32_t nfa_start = -1;
 };
 RegexProgram parse_regex(std::string_view pattern, const PatternOptions& opt);
+bool regex_search(const RegexProgram&, const VerifierContext&, const PatternOptions&, Match*, std::uint32_t);
+std::vector<Match> regex_find_all(const RegexProgram&, const VerifierContext&, const PatternOptions&, bool, std::uint32_t, std::uint64_t);
+// Compatibility adapters for existing internal tests/callers. New verifier
+// code should pass VerifierContext directly.
 bool regex_search(const RegexProgram&, std::string_view, const PatternOptions&, std::size_t, Match*, std::uint32_t, unsigned char);
 std::vector<Match> regex_find_all(const RegexProgram&, std::string_view, const PatternOptions&, bool, std::uint32_t, std::uint64_t, std::uint64_t, unsigned char);
 // Test hook: directly exercises the eval recursion-depth guard without deep C++ recursion.
