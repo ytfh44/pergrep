@@ -490,27 +490,27 @@ struct NfaThread { int pc=-1; std::size_t start=0; std::vector<std::pair<std::si
 Rune context_rune_at(const VerifierContext& c, std::size_t pos) {
     if (!c.validate() || pos < c.record_begin || pos >= c.record_end || !c.region_contains(pos)) return {};
     auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
-    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    if (!r.ok || (c.bounded_region && c.source_begin + r.next > c.region_end)) return {};
+    r.next += static_cast<std::size_t>(c.source_begin);
     return r;
 }
 Rune context_rune_before(const VerifierContext& c, std::size_t pos) {
     if (!c.validate() || pos <= c.source_begin || (pos <= c.record_begin && !c.left_context_available) || pos > c.record_end) return {};
-    auto p = pos - 1;
-    if (p < c.source_begin || !c.region_contains(p)) return {};
     auto r = rune_before(c.source, pos - static_cast<std::size_t>(c.source_begin));
-    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    if (!r.ok) return {};
+    r.next += static_cast<std::size_t>(c.source_begin);
     return r;
 }
 Rune context_rune_right(const VerifierContext& c, std::size_t pos) {
-    if (!c.validate()) return {};
-    if (pos < c.record_end) return context_rune_at(c, pos);
-    if (pos != c.record_end || !c.right_context_available || pos >= c.source_end || !c.region_contains(pos)) return {};
+    if (!c.validate() || pos < c.record_begin || pos > c.record_end) return {};
+    if (pos == c.record_end && (!c.right_context_available || pos >= c.source_end)) return {};
     auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
-    if (r.ok) r.next += static_cast<std::size_t>(c.source_begin);
+    if (!r.ok) return {};
+    r.next += static_cast<std::size_t>(c.source_begin);
     return r;
 }
 unsigned char context_byte(const VerifierContext& c, std::size_t pos) {
-    if (!c.region_contains(pos)) return 0;
+    if (!c.validate() || pos < c.source_begin || pos >= c.source_end) return 0;
     return static_cast<unsigned char>(c.source[pos - static_cast<std::size_t>(c.source_begin)]);
 }
 bool assert_begin(const NfaInst&i,const VerifierContext& c,std::size_t pos,unsigned char sep){return pos==c.record_begin||(i.multiline&&pos>c.source_begin&&context_byte(c,pos-1)==sep);}
@@ -534,7 +534,7 @@ bool assert_end_newline(const NfaInst&i,const VerifierContext& c,std::size_t pos
 bool is_word_at(const NfaInst&i,const Rune&r){return r.ok&&(i.unicode?unicode_word(r.cp):(r.cp<128&&ascii_word(static_cast<unsigned char>(r.cp))));}
 bool assert_word(const NfaInst&i,const VerifierContext& c,std::size_t pos){auto l=context_rune_before(c,pos),r=context_rune_right(c,pos);bool ok=is_word_at(i,l)!=is_word_at(i,r);return i.negative?!ok:ok;}
 bool assert_word_start_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_before(c,pos));}
-bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_at(c,pos));}
+bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_right(c,pos));}
 
 void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint8_t>&seen){
     std::vector<NfaThread> stack;stack.push_back(std::move(seed));
@@ -685,16 +685,16 @@ RB min_bound(RB a, RB b) noexcept { if (a.is_unbounded() || b.is_unbounded() || 
 void merge_analysis(RA& d, const RA& s) {
     d.forward_lookahead_bytes=max_bound(d.forward_lookahead_bytes,s.forward_lookahead_bytes); d.forward_lookahead_runes=max_bound(d.forward_lookahead_runes,s.forward_lookahead_runes); d.backward_lookbehind_bytes=max_bound(d.backward_lookbehind_bytes,s.backward_lookbehind_bytes); d.backward_lookbehind_runes=max_bound(d.backward_lookbehind_runes,s.backward_lookbehind_runes);
     d.requires_record_boundary|=s.requires_record_boundary; d.requires_absolute_begin|=s.requires_absolute_begin; d.requires_absolute_end|=s.requires_absolute_end; d.requires_line_begin|=s.requires_line_begin; d.requires_line_end|=s.requires_line_end; d.requires_word_boundary|=s.requires_word_boundary; d.requires_word_start|=s.requires_word_start; d.requires_word_end|=s.requires_word_end;
-    d.icase|=s.icase; d.unicode|=s.unicode; d.dotall|=s.dotall; d.multiline|=s.multiline; d.crlf|=s.crlf; d.contains_nul|=s.contains_nul; d.has_backreference|=s.has_backreference; d.has_lookahead|=s.has_lookahead; d.has_lookbehind|=s.has_lookbehind; d.has_unbounded_repeat|=s.has_unbounded_repeat; d.repeat_limit_applied|=s.repeat_limit_applied; d.lookbehind_limit_applied|=s.lookbehind_limit_applied; d.vm_state_limit_relevant|=s.vm_state_limit_relevant; for(const auto& note:s.notes)if(std::find(d.notes.begin(),d.notes.end(),note)==d.notes.end())d.notes.push_back(note);
+    d.icase|=s.icase; d.unicode|=s.unicode; d.dotall|=s.dotall; d.multiline|=s.multiline; d.crlf|=s.crlf; d.contains_nul|=s.contains_nul; d.pattern_contains_nul|=s.pattern_contains_nul; d.has_backreference|=s.has_backreference; d.has_lookahead|=s.has_lookahead; d.has_lookbehind|=s.has_lookbehind; d.has_unbounded_repeat|=s.has_unbounded_repeat; d.repeat_limit_applied|=s.repeat_limit_applied; d.lookbehind_limit_applied|=s.lookbehind_limit_applied; d.vm_state_limit_relevant|=s.vm_state_limit_relevant; for(const auto& note:s.notes)if(std::find(d.notes.begin(),d.notes.end(),note)==d.notes.end())d.notes.push_back(note);
 }
 RA analyze_regex_node(const std::shared_ptr<RegexNode>& n, unsigned char sep) {
-    RA o; o.record_separator=sep; o.custom_separator=sep!='\n'; o.separator_is_nul=sep=='\0'; o.contains_nul=sep=='\0'; if(!n){o.nullable=true;o.notes.emplace_back("null AST node treated as empty metadata");return o;}
+    RA o; o.record_separator=sep; o.custom_separator=sep!='\n'; o.separator_is_nul=sep=='\0'; o.contains_nul=sep=='\0'; o.pattern_contains_nul=false; if(!n){o.nullable=true;o.notes.emplace_back("null AST node treated as empty metadata");return o;}
     o.icase=n->icase; o.unicode=n->unicode; o.dotall=n->dotall; o.multiline=n->multiline; o.crlf=n->crlf; using K=RegexNode::Kind;
     auto child=[&](std::size_t i){return i<n->children.size()&&n->children[i]?analyze_regex_node(n->children[i],sep):RA{};};
     auto one=[&](){o.byte_lower=RB::finite(1);o.byte_upper=RB::finite(4);o.rune_lower=o.rune_upper=RB::finite(1);};
     switch(n->kind){
     case K::Empty:o.nullable=true;break;
-    case K::Literal:{std::size_t p=0,rn=0;while(p<n->literal.size()){auto r=rune_at(n->literal,p);p=(!r.ok||r.next<=p)?p+1:r.next;++rn;}o.rune_lower=o.rune_upper=RB::finite(rn);o.contains_nul|=n->literal.find('\0')!=std::string::npos;if(n->icase){o.byte_lower=RB::unknown();o.byte_upper=RB::unknown();o.notes.emplace_back("case-folded literal has unknown UTF-8 byte width");}else{o.byte_lower=o.byte_upper=RB::finite(n->literal.size());}o.nullable=n->literal.empty();break;}
+    case K::Literal:{std::size_t p=0,rn=0;while(p<n->literal.size()){auto r=rune_at(n->literal,p);p=(!r.ok||r.next<=p)?p+1:r.next;++rn;}o.rune_lower=o.rune_upper=RB::finite(rn);const bool has_nul=n->literal.find('\0')!=std::string::npos;o.pattern_contains_nul|=has_nul;o.contains_nul|=has_nul;if(n->icase){o.byte_lower=RB::unknown();o.byte_upper=RB::unknown();o.notes.emplace_back("case-folded literal has unknown UTF-8 byte width");}else{o.byte_lower=o.byte_upper=RB::finite(n->literal.size());}o.nullable=n->literal.empty();break;}
     case K::Dot:case K::Class:one();break;
     case K::Begin:o.nullable=true;o.requires_record_boundary=true;o.requires_line_begin=n->multiline;o.backward_lookbehind_bytes=RB::finite(n->crlf?2:1);o.backward_lookbehind_runes=RB::finite(1);break;
     case K::End:case K::EndNewline:o.nullable=true;o.requires_record_boundary=true;o.requires_line_end=n->multiline;o.forward_lookahead_bytes=RB::finite(n->crlf?2:1);o.forward_lookahead_runes=RB::finite(1);break;

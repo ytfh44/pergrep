@@ -55,7 +55,9 @@ int main(){
     assert(word_meta.requires_word_start && word_meta.requires_word_end);
     PatternOptions nul; nul.multiline = true;
     auto nul_meta = detail::parse_regex("^\\x00$", nul).context_analysis('\0');
-    assert(nul_meta.record_separator == '\0' && nul_meta.custom_separator && nul_meta.contains_nul);
+    assert(nul_meta.record_separator == '\0' && nul_meta.custom_separator && nul_meta.contains_nul && nul_meta.pattern_contains_nul);
+    const auto payload_nul = detail::parse_regex(R"(foo\x00bar)", {}).context_analysis();
+    assert(payload_nul.pattern_contains_nul && payload_nul.contains_nul && !payload_nul.separator_is_nul);
     PatternOptions extended; extended.engine = Engine::Pcre2Compat;
     auto look = detail::parse_regex("a(?=b)", extended).context_analysis();
     assert(look.has_lookahead && look.forward_lookahead_bytes.value == 1 && look.byte_upper.value == 1);
@@ -165,6 +167,70 @@ int main(){
     auto fallback_matches = indexed.find(unbounded, {}, &fallback_stats);
     assert(fallback_stats.physical_operator != "RegexBoundedRegion");
     assert(fallback_matches.size() == matches.size());
+  }
+  // M2.4 boundary oracle: bounded regular verification must agree with the
+  // complete-record/file reference for every boundary policy. Region ends are
+  // optimization limits, never implicit record or file endpoints.
+  {
+    IndexOptions small;
+    small.chunk_bytes = 64;
+    small.chunk_overlap = 32;
+    const auto run_oracle = [&](std::string data, std::string expression,
+                                PatternOptions popt, SearchOptions sopt) {
+      auto indexed_idx = Index::from_documents({{"a.txt", data}}, small);
+      auto reference_idx = Index::from_documents({{"a.txt", data}},
+                                                   {.chunk_bytes = 1024 * 1024,
+                                                    .chunk_overlap = 512 * 1024});
+      Searcher indexed(indexed_idx);
+      Searcher reference(reference_idx);
+      auto pattern = Pattern::compile(std::move(expression), popt);
+      SearchStats indexed_stats{};
+      SearchStats reference_stats{};
+      const auto actual = indexed.find(pattern, sopt, &indexed_stats);
+      const auto expected = reference.find(pattern, sopt, &reference_stats);
+      assert(indexed_stats.physical_operator == "RegexBoundedRegion");
+      assert(actual.size() == expected.size());
+      for (std::size_t i = 0; i < actual.size(); ++i) {
+        assert(actual[i].file_id == expected[i].file_id);
+        assert(actual[i].start == expected[i].start);
+        assert(actual[i].end == expected[i].end);
+        assert(actual[i].captures.size() == expected[i].captures.size());
+      }
+    };
+
+    // Non-multiline records and explicit anchors remain record-local.
+    run_oracle("prefix\nfoo12bar\nfoo7bar\nsuffix",
+                R"(^foo[0-9]{1,3}bar$)", {}, {});
+    run_oracle("foo1bar\nfoo2bar", R"(\Afoo[0-9]bar)", {}, {});
+    run_oracle("foo1bar\nfoo2bar", R"(foo[0-9]bar\z)", {}, {});
+    // Multiline mode searches one file while ^/$ still use real separators.
+    PatternOptions multiline; multiline.multiline = true;
+    run_oracle("prefix\nfoo12bar\nfoo7bar\nsuffix",
+                R"(^foo[0-9]{1,3}bar$)", multiline, {});
+    PatternOptions line; line.line = true;
+    run_oracle("prefix foo1bar suffix\nfoo2bar\n",
+                R"(foo[0-9]bar)", line, {});
+    // A trailing separator does not manufacture an extra empty record.
+    run_oracle("foo1bar\n", R"(^foo[0-9]bar$)", {}, {});
+    // CRLF strips the terminator from the logical record, but remains visible
+    // to line/anchor policy.
+    PatternOptions crlf; crlf.crlf = true;
+    run_oracle("foo1bar\r\nfoo2bar\r\n",
+                R"(^foo[0-9]bar$)", crlf, {});
+    // Custom separators and NUL payload bytes are independent concerns.
+    SearchOptions custom_separator; custom_separator.record_separator = '|';
+    run_oracle("foo1bar|foo2bar|tail",
+                R"(^foo[0-9]bar$)", {}, custom_separator);
+    run_oracle(std::string("foo1\0bar\nfoo2\0bar\n", 18),
+                R"(^foo[0-9]\x00bar$)", {}, {});
+    // Word mode reads the adjacent Unicode runes from source, not from the
+    // bounded region; both sides of the first candidate are word characters.
+    PatternOptions word; word.word = true;
+    run_oracle(std::string("\xC3\xA9") + "foo1bar" + std::string("\xE7\x95\x8C") + " foo2bar",
+                R"(foo[0-9]{1,3}bar)", word, {});
+    PatternOptions ascii_word = word; ascii_word.unicode = false;
+    run_oracle(std::string("\xC3\xA9") + "foo1bar" + std::string("\xE7\x95\x8C"),
+                R"(foo[0-9]bar)", ascii_word, {});
   }
   // Multiline and zero-width matches make progress.
   {

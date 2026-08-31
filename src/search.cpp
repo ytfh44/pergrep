@@ -132,14 +132,16 @@ struct BoundedRegexRegion {
 
 bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
                              unsigned char separator, detail::RegexAnalysis* analysis) {
-    if (re.extended || re.groups > 1 || re.query_ir.mandatory.size() < 2 || opt.case_mode != CaseMode::Sensitive || opt.multiline || opt.word || opt.line) return false;
+    // Region execution is safe for all regular boundary modes: boundary
+    // assertions consult source/record metadata, while only rune consumption
+    // is clipped to the execution region. Extended constructs stay on the
+    // established full verifier because their context can be data-dependent.
+    if (re.extended || re.groups > 1 || re.query_ir.mandatory.size() < 2 ||
+        opt.case_mode != CaseMode::Sensitive) return false;
     auto a = re.context_analysis(separator);
     if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
     if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
-    if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat ||
-        a.nullable || a.requires_record_boundary || a.requires_absolute_begin || a.requires_absolute_end ||
-        a.requires_line_begin || a.requires_line_end || a.requires_word_boundary || a.requires_word_start ||
-        a.requires_word_end || a.contains_nul) return false;
+    if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat) return false;
     if (re.query_ir.mandatory.empty()) return false;
     for (const auto& literal : re.query_ir.mandatory)
         if (literal.empty() || literal.size() > a.byte_upper.value) return false;
@@ -2018,28 +2020,23 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     return first_hit_objective ? std::size_t{1} :
                         (opt.max_matches ? opt.max_matches - out.size() : 0);
                 };
-                std::size_t b = 0;
-                while (b < data.size() || (b == 0 && data.empty())) {
-                    if (stop_requested()) goto done;
-                    auto e = data.find(static_cast<char>(opt.record_separator), b);
-                    bool term = (e != std::string::npos);
-                    if (!term) e = data.size();
-                    std::size_t logical_e = e;
-                    if (p.impl_->opt.crlf && opt.record_separator == '\n' && logical_e > b && data[logical_e - 1] == '\r')
-                        --logical_e;
-                    const auto record = std::string_view(data).substr(b, logical_e - b);
-                    const auto regions = bounded_regex_regions(record, b, logical_e, bounded_literal, bounded_analysis);
+                const auto verify_bounded_record = [&](std::uint64_t record_begin, std::uint64_t record_end) {
+                    const auto record = std::string_view(data).substr(
+                        static_cast<std::size_t>(record_begin),
+                        static_cast<std::size_t>(record_end - record_begin));
+                    const auto regions = bounded_regex_regions(record, record_begin, record_end,
+                                                               bounded_literal, bounded_analysis);
                     for (const auto& bounded : regions) {
-                        if (stop_requested()) goto done;
+                        if (stop_requested()) return false;
                         detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
-                            static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
-                            bounded.candidate_begin, bounded.candidate_end, false, false,
-                            opt.record_separator, p.impl_->opt.crlf};
+                            record_begin, record_end, bounded.candidate_begin, bounded.candidate_end,
+                            false, false, opt.record_separator, p.impl_->opt.crlf};
                         context.region_begin = bounded.region_begin;
                         context.region_end = bounded.region_end;
                         context.bounded_region = true;
                         accounting.touch(fid, bounded.region_begin, bounded.region_end);
-                        auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
+                        auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt,
+                                                          opt.overlapping, fid, remain());
                         out.insert(out.end(), ms.begin(), ms.end());
                         record_first_hit();
                         if (result_bound_reached()) {
@@ -2047,11 +2044,28 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                                 stats->early_stopped = true;
                                 stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
                             }
-                            goto done;
+                            return false;
                         }
                     }
-                    if (!term) break;
-                    b = e + 1;
+                    return true;
+                };
+                if (p.impl_->opt.multiline) {
+                    if (!verify_bounded_record(0, static_cast<std::uint64_t>(data.size()))) goto done;
+                } else {
+                    std::size_t b = 0;
+                    while (b < data.size() || (b == 0 && data.empty())) {
+                        if (stop_requested()) goto done;
+                        auto e = data.find(static_cast<char>(opt.record_separator), b);
+                        bool term = (e != std::string::npos);
+                        if (!term) e = data.size();
+                        std::size_t logical_e = e;
+                        if (p.impl_->opt.crlf && opt.record_separator == '\n' && logical_e > b && data[logical_e - 1] == '\r')
+                            logical_e -= 1;
+                        if (!verify_bounded_record(static_cast<std::uint64_t>(b),
+                                                   static_cast<std::uint64_t>(logical_e))) goto done;
+                        if (!term) break;
+                        b = e + 1;
+                    }
                 }
             }
             goto done;
