@@ -1390,6 +1390,19 @@ int main(){
     (void)ref_searcher.find(pattern, inverted, &inverted_stats);
     assert(inverted_stats.effective_k == 0 && inverted_stats.selected_qgram_count == 0 && inverted_stats.selected_qgram_rows == 0);
     assert(inverted_stats.qgram_fallback_reason == "invert-match-record-scan");
+    const std::string long_query(40, 'L');
+    IndexOptions long_options;
+    long_options.chunk_bytes = 128;
+    long_options.chunk_overlap = 32;
+    long_options.planned_qgrams = 64;
+    auto long_index = Index::from_documents({{"long.txt", std::string(256, 'x') + long_query}}, long_options);
+    Searcher long_searcher(long_index);
+    auto long_pattern = Pattern::compile(long_query, {.kind = PatternKind::Fixed});
+    SearchStats long_stats{};
+    const auto long_matches = long_searcher.find(long_pattern, {}, &long_stats);
+    assert(long_matches.size() == 1);
+    assert(long_stats.effective_k == 0 && long_stats.selected_qgram_count == 0 && long_stats.selected_qgram_rows == 0);
+    assert(long_stats.qgram_fallback_reason == "literal-exceeds-chunk-overlap");
     // A query with fewer available q-grams clamps deterministically.
     IndexOptions options; options.planned_qgrams = 64;
     auto short_index = Index::from_documents(docs, options);

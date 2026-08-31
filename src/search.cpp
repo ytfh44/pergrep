@@ -1663,6 +1663,11 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             (guarded_fixed_dispatch && qc.fixed_operator == detail::FixedPhysicalOperator::WholeFile)) {
             if (stats) stats->qgram_fallback_reason =
                 q.size() > I.opt.chunk_overlap ? "literal-exceeds-chunk-overlap" : "planner-selected-whole-file";
+            if (stats && q.size() > I.opt.chunk_overlap) {
+                stats->effective_k = 0;
+                stats->selected_qgram_count = 0;
+                stats->selected_qgram_rows = 0;
+            }
             auto cv = chunk_candidates(I, q, &accounting);
             accounting.note_candidates(cv);
             std::vector<uint32_t> files;
