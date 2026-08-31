@@ -1025,7 +1025,6 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     else if(opt.word){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::WordStartHalf),p.ast,mk(RegexNode::Kind::WordEndHalf)};p.ast=std::move(c);}
     if(!p.extended){NfaCompiler c(p);c.compile(p.ast);}
     // M2.2 observes the final AST, including line/word wrappers.
-    p.analysis = analyze_regex(p.ast, '\n');
     return p;
 }
 

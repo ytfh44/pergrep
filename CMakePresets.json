@@ -10,7 +10,7 @@
         "CMAKE_C_COMPILER": "cl",
         "CMAKE_CXX_COMPILER": "cl",
         "CMAKE_C_FLAGS": "/utf-8",
-        "CMAKE_CXX_FLAGS": "/utf-8",
+        "CMAKE_CXX_FLAGS": "/utf-8 /EHsc",
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "PERGREP_BUILD_TESTS": "ON"
