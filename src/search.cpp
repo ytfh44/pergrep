@@ -165,12 +165,6 @@ bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions
         !a.backward_lookbehind_bytes.is_finite() || a.repeat_limit_applied ||
         a.lookbehind_limit_applied) return false;
     if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat) return false;
-    // Boundary assertions require context outside the clipped region. The
-    // normal Searcher has that context, but a bounded plan must not assume it
-    // when a caller supplies a sliced/missing-context verifier input.
-    if (a.requires_record_boundary || a.requires_absolute_begin || a.requires_absolute_end ||
-        a.requires_line_begin || a.requires_line_end || a.requires_word_boundary ||
-        a.requires_word_start || a.requires_word_end) return false;
     if (re.query_ir.mandatory.empty() && !branch_multi_mandatory) return false;
     for (const auto& literal : re.query_ir.mandatory)
         if (literal.empty() || literal.size() > a.byte_upper.value) return false;
