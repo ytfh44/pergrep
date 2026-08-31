@@ -136,6 +136,36 @@ int main(){
     auto p=Pattern::compile(R"(foo([0-9]+)bar)"); auto m=s.find(p); assert(m.size()==1); assert(m[0].captures.size()>=2); assert(m[0].captures[1].matched); assert(m[0].captures[1].end-m[0].captures[1].start==3);
     auto np=Pattern::compile(R"(foo(?<digits>[0-9]+)bar)"); auto nm=s.find(np); assert(nm.size()==1); assert(nm[0].captures[1].name=="digits");
   }
+  // M2.3 bounded-region verification keeps regular finite-width matches exact while
+  // restricting verifier visibility to regions around proven mandatory literals.
+  {
+    std::string first(18000, 'x');
+    first += " pre foo12bar post foo7bar"; first.push_back(10);
+    std::string second = "foo123bar and foo9bar\n";
+    const std::vector<Document> docs = {{"a.txt", first}, {"b.txt", second}};
+    IndexOptions small;
+    small.chunk_bytes = 256;
+    small.chunk_overlap = 64;
+    auto indexed_idx = Index::from_documents(docs, small);
+    Searcher indexed(indexed_idx);
+    auto p = Pattern::compile(R"(foo([0-9]{1,3})bar)");
+    SearchStats stats{};
+    auto matches = indexed.find(p, {}, &stats);
+    assert(stats.physical_operator == "RegexBoundedRegion");
+    assert(stats.verified_bytes < first.size() + second.size());
+    assert(matches.size() == 4);
+    assert(matches[0].file_id == 0 && matches[0].start == 18005 && matches[0].end == 18013);
+    assert(matches[0].captures.size() >= 2 && matches[0].captures[1].start == 18008 && matches[0].captures[1].end == 18010);
+    assert(matches[1].file_id == 0 && matches[1].start == 18019 && matches[1].end == 18026);
+    assert(matches[2].file_id == 1 && matches[2].start == 0 && matches[2].end == 9);
+    assert(matches[2].captures[1].start == 3 && matches[2].captures[1].end == 6);
+    assert(matches[3].start == 14 && matches[3].end == 21);
+    SearchStats fallback_stats{};
+    auto unbounded = Pattern::compile(R"(foo([0-9]+)bar)");
+    auto fallback_matches = indexed.find(unbounded, {}, &fallback_stats);
+    assert(fallback_stats.physical_operator != "RegexBoundedRegion");
+    assert(fallback_matches.size() == matches.size());
+  }
   // Multiline and zero-width matches make progress.
   {
     auto idx=corpus("a\nb\n"); Searcher s(idx); PatternOptions o; o.multiline=true;

@@ -123,6 +123,60 @@ struct StatsRecorder {
         stats->candidate_files = candidate_file_ids.size();
     }
 };
+struct BoundedRegexRegion {
+    std::uint64_t candidate_begin = 0;
+    std::uint64_t candidate_end = 0;
+    std::uint64_t region_begin = 0;
+    std::uint64_t region_end = 0;
+};
+
+bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
+                             unsigned char separator, detail::RegexAnalysis* analysis) {
+    if (re.extended || opt.case_mode != CaseMode::Sensitive || opt.multiline || opt.word || opt.line) return false;
+    auto a = re.context_analysis(separator);
+    if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
+    if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
+    if (a.has_backreference || a.has_lookahead || a.has_lookbehind || a.has_unbounded_repeat ||
+        a.nullable || a.requires_record_boundary || a.requires_absolute_begin || a.requires_absolute_end ||
+        a.requires_line_begin || a.requires_line_end || a.requires_word_boundary || a.requires_word_start ||
+        a.requires_word_end || a.contains_nul) return false;
+    if (re.query_ir.mandatory.empty()) return false;
+    for (const auto& literal : re.query_ir.mandatory)
+        if (literal.empty() || literal.size() > a.byte_upper.value) return false;
+    if (analysis) *analysis = std::move(a);
+    return true;
+}
+
+std::vector<BoundedRegexRegion> bounded_regex_regions(std::string_view record, std::uint64_t record_begin,
+                                                       std::uint64_t record_end, std::string_view literal,
+                                                       const detail::RegexAnalysis& analysis) {
+    std::vector<BoundedRegexRegion> regions;
+    if (literal.empty() || record.empty()) return regions;
+    const auto width = analysis.byte_upper.value;
+    const auto literal_width = static_cast<std::uint64_t>(literal.size());
+    if (literal_width > width) return regions;
+    const auto start_slack = width - literal_width;
+    for (std::size_t at = record.find(literal); at != std::string_view::npos;) {
+        const auto absolute = record_begin + static_cast<std::uint64_t>(at);
+        const auto begin = absolute > start_slack ? std::max(record_begin, absolute - start_slack) : record_begin;
+        const auto end = std::min(record_end + 1, absolute + 1);
+        const auto region_end = std::min(record_end, end + width + analysis.forward_lookahead_bytes.value);
+        if (begin < end && begin < region_end) {
+            BoundedRegexRegion next{begin, end, begin, region_end};
+            if (!regions.empty() && next.candidate_begin <= regions.back().candidate_end) {
+                auto& current = regions.back();
+                current.candidate_end = std::max(current.candidate_end, next.candidate_end);
+                current.region_begin = std::min(current.region_begin, next.region_begin);
+                current.region_end = std::max(current.region_end, next.region_end);
+            } else {
+                regions.push_back(next);
+            }
+        }
+        if (at > record.size() - literal.size()) break;
+        at = record.find(literal, at + 1);
+    }
+    return regions;
+}
 
 
 struct DecodedRune { UChar32 cp = U_SENTINEL; std::size_t next = 0; bool ok = false; };
@@ -1940,6 +1994,67 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 }
             }
             cv = chunk_candidates(I, lit, &accounting);
+        }
+        detail::RegexAnalysis bounded_analysis;
+        std::string bounded_literal;
+        for (const auto& candidate : p.impl_->re.query_ir.mandatory) {
+            if (candidate.size() > bounded_literal.size()) bounded_literal = candidate;
+        }
+        if (bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis) &&
+            !bounded_literal.empty()) {
+            if (stats) stats->physical_operator = "RegexBoundedRegion";
+            auto bounded_cv = chunk_candidates(I, bounded_literal, &accounting);
+            accounting.note_candidates(bounded_cv);
+            std::vector<uint32_t> bounded_files;
+            for (auto ci : bounded_cv) {
+                if (bounded_files.empty() || bounded_files.back() != I.chunks[ci].file_id)
+                    bounded_files.push_back(I.chunks[ci].file_id);
+            }
+            for (auto fid : bounded_files) {
+                if (stop_requested()) goto done;
+                if (!opt.include_binary && I.infos[fid].binary) continue;
+                const auto& data = I.loaded[fid].data;
+                const auto remain = [&]() {
+                    return first_hit_objective ? std::size_t{1} :
+                        (opt.max_matches ? opt.max_matches - out.size() : 0);
+                };
+                std::size_t b = 0;
+                while (b < data.size() || (b == 0 && data.empty())) {
+                    if (stop_requested()) goto done;
+                    auto e = data.find(static_cast<char>(opt.record_separator), b);
+                    bool term = (e != std::string::npos);
+                    if (!term) e = data.size();
+                    std::size_t logical_e = e;
+                    if (p.impl_->opt.crlf && opt.record_separator == '\n' && logical_e > b && data[logical_e - 1] == '\r')
+                        --logical_e;
+                    const auto record = std::string_view(data).substr(b, logical_e - b);
+                    const auto regions = bounded_regex_regions(record, b, logical_e, bounded_literal, bounded_analysis);
+                    for (const auto& bounded : regions) {
+                        if (stop_requested()) goto done;
+                        detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
+                            static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
+                            bounded.candidate_begin, bounded.candidate_end, false, false,
+                            opt.record_separator, p.impl_->opt.crlf};
+                        context.region_begin = bounded.region_begin;
+                        context.region_end = bounded.region_end;
+                        context.bounded_region = true;
+                        accounting.touch(fid, bounded.region_begin, bounded.region_end);
+                        auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
+                        out.insert(out.end(), ms.begin(), ms.end());
+                        record_first_hit();
+                        if (result_bound_reached()) {
+                            if (stats) {
+                                stats->early_stopped = true;
+                                stats->early_stop_reason = first_hit_objective ? "first-hit" : "max-matches";
+                            }
+                            goto done;
+                        }
+                    }
+                    if (!term) break;
+                    b = e + 1;
+                }
+            }
+            goto done;
         }
         accounting.note_candidates(cv);
         std::vector<uint32_t> files;
