@@ -296,11 +296,12 @@ std::vector<BoundedRegexRegion> bounded_regex_regions_joined(
         for (std::size_t at = record.find(constraint.literal);
              at != std::string_view::npos;) {
             const auto absolute = record_begin + static_cast<std::uint64_t>(at);
-            if (absolute >= record_begin + constraint.min_start) {
+            if (absolute >= record_begin && absolute - record_begin >= constraint.min_start) {
                 const auto low = absolute > constraint.max_start
                     ? std::max(record_begin, absolute - constraint.max_start) : record_begin;
                 const auto start = absolute - constraint.min_start;
-                const auto high = std::min(record_end + 1, sat_add(start, 1));
+                const auto record_limit = record_end == std::numeric_limits<std::uint64_t>::max() ? record_end : record_end + 1;
+                const auto high = std::min(record_limit, sat_add(start, 1));
                 if (low < high) current.push_back({low, high});
             }
             if (at > record.size() - constraint.literal.size()) break;
