@@ -271,7 +271,7 @@ struct RegexProgram {
 
     // M2.2 canonical context/width metadata, computed after parse wrappers are attached.
     // This is advisory only: exact matching remains owned by the AST/NFA/VM.
-    RegexAnalysis context_analysis() const { return analyze_regex(ast, '\n'); }
+    RegexAnalysis context_analysis(unsigned char record_separator = '\n') const { return analyze_regex(ast, record_separator); }
     // Canonical optimizer representation. Parsing is the only construction
     // path that installs this value; planners and verifiers must read it.
     QueryIR query_ir;
