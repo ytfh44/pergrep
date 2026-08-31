@@ -295,7 +295,9 @@ std::vector<BoundedRegexRegion> bounded_regex_regions_joined(
         std::vector<Interval> current;
         for (std::size_t at = record.find(constraint.literal);
              at != std::string_view::npos;) {
-            const auto absolute = record_begin + static_cast<std::uint64_t>(at);
+            const auto offset = static_cast<std::uint64_t>(at);
+            if (record_begin > std::numeric_limits<std::uint64_t>::max() - offset) break;
+            const auto absolute = record_begin + offset;
             if (absolute >= record_begin && absolute - record_begin >= constraint.min_start) {
                 const auto low = absolute > constraint.max_start
                     ? std::max(record_begin, absolute - constraint.max_start) : record_begin;
