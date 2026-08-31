@@ -232,6 +232,114 @@ int main(){
     run_oracle(std::string("\xC3\xA9") + "foo1bar" + std::string("\xE7\x95\x8C"),
                 R"(foo[0-9]bar)", ascii_word, {});
   }
+  // M2.5: bounded verification changes only the search range. Match spans,
+  // capture spans, order, and bounded prefixes must equal full verification.
+  {
+    const auto same_matches = [](const std::vector<Match>& actual,
+                                 const std::vector<Match>& expected) {
+      assert(actual.size() == expected.size());
+      for (std::size_t i = 0; i < actual.size(); ++i) {
+        assert(actual[i].file_id == expected[i].file_id);
+        assert(actual[i].start == expected[i].start);
+        assert(actual[i].end == expected[i].end);
+        assert(actual[i].captures.size() == expected[i].captures.size());
+        for (std::size_t g = 0; g < actual[i].captures.size(); ++g) {
+          const auto& a = actual[i].captures[g];
+          const auto& e = expected[i].captures[g];
+          assert(a.start == e.start && a.end == e.end && a.matched == e.matched);
+          assert(a.name == e.name);
+        }
+      }
+    };
+    IndexOptions tiny; tiny.chunk_bytes = 64; tiny.chunk_overlap = 32;
+    IndexOptions whole; whole.chunk_bytes = 1 << 20; whole.chunk_overlap = 1 << 19;
+    const auto compare = [&](std::vector<Document> docs, std::string expression,
+                             PatternOptions popt = {}, SearchOptions sopt = {},
+                             bool bounded = true) {
+      auto indexed = Index::from_documents(docs, tiny);
+      auto reference = Index::from_documents(docs, whole);
+      auto pattern = Pattern::compile(std::move(expression), popt);
+      SearchStats bounded_stats{};
+      const auto actual = Searcher(indexed).find(pattern, sopt, &bounded_stats);
+      const auto expected = Searcher(reference).find(pattern, sopt);
+      if (bounded) assert(bounded_stats.physical_operator == "RegexBoundedRegion");
+      same_matches(actual, expected);
+      if (sopt.max_matches) {
+        assert(actual.size() <= sopt.max_matches);
+        assert(std::equal(actual.begin(), actual.end(), expected.begin(),
+                          [](const Match& a, const Match& e) {
+                            return a.file_id == e.file_id && a.start == e.start && a.end == e.end;
+                          }));
+      }
+    };
+
+    // Leftmost-first alternation (a|ab) remains ordered inside a bounded,
+    // pattern, while finite greedy/lazy repeats retain their original end.
+    compare({{"a.txt", "preabfoo preaafoo preabfoo"}}, R"(pre(a|ab)foo)");
+    compare({{"a.txt", "preaafoo preaaafoo preaaaafoo"}}, R"(prea{1,3}foo)");
+    compare({{"a.txt", "preaafoo preaaafoo"}}, R"(prea{1,3}?foo)");
+
+    // Captures retain absolute byte spans even when the capture crosses the
+    // mandatory-literal-centered region used by the verifier.
+    compare({{"a.txt", "xx preABCfoo yy preDEfoo"}}, R"(pre([A-Z]{1,3})foo)");
+
+    // Region boundaries do not alter overlapping progress, and a max_matches
+    // prefix is exactly the full verifier's prefix.
+    SearchOptions overlapping; overlapping.overlapping = true;
+    compare({{"a.txt", "preaafoo preaafoo"}}, R"(prea{1,2}foo)", {}, overlapping);
+    SearchOptions limited; limited.max_matches = 2;
+    compare({{"a.txt", "preafoo preafoo preafoo"}}, R"(prea{1,2}foo)", {}, limited);
+
+    PatternOptions multiline; multiline.multiline = true;
+    compare({{"z.txt", "preafoo\npreaafoo"}, {"a.txt", "preaaafoo\npreafoo"}},
+            R"(prea{1,3}foo)", multiline);
+
+    // Candidate chunks may arrive from different chunks and files, but the
+    // merged stream remains source/file ordered rather than candidate order.
+    std::string zchunk(80, 'x'); zchunk += "preABCfoo";
+    zchunk += std::string(80, 'y'); zchunk += "preDEfoo";
+    std::string achunk(90, 'z'); achunk += "preFGfoo";
+    auto chunked = Index::from_documents({{"z.txt", zchunk}, {"a.txt", achunk}}, tiny);
+    auto chunk_pattern = Pattern::compile(R"(pre([A-Z]{1,3})foo)");
+    auto chunk_matches = Searcher(chunked).find(chunk_pattern);
+    assert(chunk_matches.size() == 3);
+    assert(chunk_matches[0].file_id == 0 && chunk_matches[0].start == 90);
+    assert(chunk_matches[1].file_id == 1 && chunk_matches[1].start == 80);
+    assert(chunk_matches[2].file_id == 1 && chunk_matches[2].start == 169);
+
+    // Lookaround capture semantics intentionally stay on the established
+    // extended verifier, but preserve captures inside the assertion.
+    PatternOptions extended; extended.engine = Engine::Pcre2Compat;
+    compare({{"a.txt", "xxfoo foo"}}, R"((?=(?<look>foo))foo)", extended, {}, false);
+
+    // Direct bounded contexts cover progress behavior independently of the
+    // planner: overlaps advance by one rune and zero-width matches advance
+    // without repeating the same candidate forever.
+    const auto direct_context = [&](std::string expression, std::string text,
+                                    bool is_overlapping, std::uint64_t region_end,
+                                    std::uint64_t candidate_end) {
+      PatternOptions options; options.multiline = expression == "^";
+      auto pattern = detail::parse_regex(expression, options);
+      detail::VerifierContext full;
+      full.source = text; full.source_begin = 0; full.source_end = text.size();
+      full.record_begin = 0; full.record_end = text.size();
+      full.candidate_begin = 0; full.candidate_end = candidate_end;
+      full.separator = '\n';
+      auto bounded = full; bounded.region_begin = 0; bounded.region_end = region_end;
+      bounded.bounded_region = true;
+      const auto expected = detail::regex_find_all(pattern, full, options,
+                                                   is_overlapping, 0, 0);
+      const auto actual = detail::regex_find_all(pattern, bounded, options,
+                                                 is_overlapping, 0, 0);
+      same_matches(actual, expected);
+      return actual;
+    };
+    const auto overlaps = direct_context("aa", "xxaaaaYY", true, 6, 6);
+    assert(overlaps.size() == 3 && overlaps[0].start == 2 && overlaps[1].start == 3 &&
+           overlaps[2].start == 4);
+    const auto zero_width = direct_context("^", "a\nb\n", false, 4, 4);
+    assert(zero_width.size() == 2 && zero_width[0].start == 0 && zero_width[1].start == 2);
+  }
   // Multiline and zero-width matches make progress.
   {
     auto idx=corpus("a\nb\n"); Searcher s(idx); PatternOptions o; o.multiline=true;
