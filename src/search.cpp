@@ -132,7 +132,7 @@ struct BoundedRegexRegion {
 
 bool bounded_regex_eligible(const detail::RegexProgram& re, const PatternOptions& opt,
                              unsigned char separator, detail::RegexAnalysis* analysis) {
-    if (re.extended || opt.case_mode != CaseMode::Sensitive || opt.multiline || opt.word || opt.line) return false;
+    if (re.extended || re.groups > 1 || re.query_ir.mandatory.size() < 2 || opt.case_mode != CaseMode::Sensitive || opt.multiline || opt.word || opt.line) return false;
     auto a = re.context_analysis(separator);
     if (!a.byte_upper.is_finite() || a.byte_upper.value == 0 || a.byte_upper.value > (1u << 20)) return false;
     if (!a.forward_lookahead_bytes.is_finite() || !a.backward_lookbehind_bytes.is_finite()) return false;
@@ -2003,7 +2003,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         if (bounded_regex_eligible(p.impl_->re, p.impl_->opt, opt.record_separator, &bounded_analysis) &&
             !bounded_literal.empty()) {
             if (stats) stats->physical_operator = "RegexBoundedRegion";
-            auto bounded_cv = chunk_candidates(I, bounded_literal, &accounting);
+            const auto& bounded_cv = cv;
             accounting.note_candidates(bounded_cv);
             std::vector<uint32_t> bounded_files;
             for (auto ci : bounded_cv) {
