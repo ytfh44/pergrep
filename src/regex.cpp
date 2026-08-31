@@ -688,7 +688,7 @@ void merge_analysis(RA& d, const RA& s) {
     d.icase|=s.icase; d.unicode|=s.unicode; d.dotall|=s.dotall; d.multiline|=s.multiline; d.crlf|=s.crlf; d.contains_nul|=s.contains_nul; d.has_backreference|=s.has_backreference; d.has_lookahead|=s.has_lookahead; d.has_lookbehind|=s.has_lookbehind; d.has_unbounded_repeat|=s.has_unbounded_repeat; d.repeat_limit_applied|=s.repeat_limit_applied; d.lookbehind_limit_applied|=s.lookbehind_limit_applied; d.vm_state_limit_relevant|=s.vm_state_limit_relevant; for(const auto& note:s.notes)if(std::find(d.notes.begin(),d.notes.end(),note)==d.notes.end())d.notes.push_back(note);
 }
 RA analyze_regex_node(const std::shared_ptr<RegexNode>& n, unsigned char sep) {
-    RA o; o.record_separator=sep; o.custom_separator=sep!='\n'; o.separator_is_nul=sep=='\0'; o.contains_nul=sep=='\0'; if(!n){o.notes.emplace_back("null AST node treated as empty metadata");return o;}
+    RA o; o.record_separator=sep; o.custom_separator=sep!='\n'; o.separator_is_nul=sep=='\0'; o.contains_nul=sep=='\0'; if(!n){o.nullable=true;o.notes.emplace_back("null AST node treated as empty metadata");return o;}
     o.icase=n->icase; o.unicode=n->unicode; o.dotall=n->dotall; o.multiline=n->multiline; o.crlf=n->crlf; using K=RegexNode::Kind;
     auto child=[&](std::size_t i){return i<n->children.size()&&n->children[i]?analyze_regex_node(n->children[i],sep):RA{};};
     auto one=[&](){o.byte_lower=RB::finite(1);o.byte_upper=RB::finite(4);o.rune_lower=o.rune_upper=RB::finite(1);};

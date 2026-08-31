@@ -54,7 +54,7 @@ int main(){
     auto word_meta = detail::parse_regex("foo", word).context_analysis();
     assert(word_meta.requires_word_start && word_meta.requires_word_end);
     PatternOptions nul; nul.multiline = true;
-    auto nul_meta = detail::analyze_regex(detail::parse_regex("^\\x00$", nul).ast, '\0');
+    auto nul_meta = detail::parse_regex("^\\x00$", nul).context_analysis('\0');
     assert(nul_meta.record_separator == '\0' && nul_meta.custom_separator && nul_meta.contains_nul);
     PatternOptions extended; extended.engine = Engine::Pcre2Compat;
     auto look = detail::parse_regex("a(?=b)", extended).context_analysis();
