@@ -29,7 +29,7 @@ int main(){
     assert(literal.byte_lower.is_finite() && literal.byte_lower.value == 3);
     assert(literal.byte_upper.is_finite() && literal.byte_upper.value == 3);
     assert(literal.rune_lower.value == 3 && literal.rune_upper.value == 3);
-    auto unicode = detail::parse_regex("世界", {}).analysis;
+    auto unicode = detail::parse_regex("\xE4\xB8\x96\xE7\x95\x8C", {}).analysis;
     assert(unicode.byte_lower.value == 6 && unicode.rune_lower.value == 2);
     auto dot = detail::parse_regex(".", {}).analysis;
     assert(dot.byte_lower.value == 1 && dot.byte_upper.value == 4 && dot.rune_upper.value == 1);
