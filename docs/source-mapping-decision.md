@@ -1,6 +1,6 @@
 # ADR-0040: Source-backed corpus residency by default
 
-**Status:** Accepted
+**Status:** Accepted (lifecycle policy; performance gate remains conditional)
 **Date:** 2026-09-01
 **Scope:** M3.4 / GitHub issue #40
 **Decision owner:** M3; M4 implementations must conform to this snapshot model
@@ -21,7 +21,7 @@ The decision must cover the closed workload classes in [the workload matrix](wor
 - **interactive-large-repository:** repeated filtered searches over a large repository;
 - **batch-multi-pattern:** several heterogeneous patterns over one index.
 
-The matrix also includes `filesystem.cold.roundtrip` and `filesystem.warm-repeated.medium`, and requires lifecycle, RSS, page-fault, logical/physical bytes, and correctness measurements. No benchmark result is checked into this worktree, so this record does not invent a universal mmap speedup or a numeric crossover. It makes the residency choice from the observed API/lifecycle contracts and leaves performance gates to the matrix measurements.
+The matrix also includes `filesystem.cold.roundtrip` and `filesystem.warm-repeated.medium`, and requires lifecycle, RSS, page-fault, logical/physical bytes, and correctness measurements. No benchmark result is checked into this worktree. This ADR therefore does not claim a universal mmap speedup or numeric crossover: the accepted decision is a lifecycle and invalidation policy based on the current API contracts, with the matrix measurements below as a mandatory performance gate before changing the default.
 
 ## Decision
 
@@ -29,7 +29,7 @@ The matrix also includes `filesystem.cold.roundtrip` and `filesystem.warm-repeat
 
 **Keep the packed immutable corpus as an explicit opt-in, not the default.** Set `IndexOptions::persist_corpus = true` when the caller needs an autonomous point-in-time artifact: offline or reproducible batch work, artifact auditing, a source tree that may be moved or disappear, high-latency network/removable media, or a deliberate cross-process/machine hand-off. Such an index is a snapshot; consumers use `is_snapshot()` and do not require `fresh()` before searching it.
 
-**Treat transformed input as a separate snapshot domain.** Stdin, encoding conversion, `--pre`, archive decompression, and BOM-triggered decoding are represented through `Index::from_documents` after transformation. They remain ephemeral and must not be written into the ordinary source-backed cache key. A caller may deliberately persist a transformed corpus only as an explicit immutable artifact with a non-default transform identity and an equivalent cache policy; otherwise it must be rebuilt from the transformation pipeline.
+**Treat transformed input as a separate snapshot domain.** Stdin, encoding conversion, `--pre`, archive decompression, and BOM-triggered decoding are represented through `Index::from_documents` after transformation. They remain ephemeral and must not be written into the ordinary source-backed cache key. The current public API rejects persistence for transformed `from_documents` indexes; transformed input therefore remains ephemeral. Supporting explicit transformed snapshots requires a separate API and cache-identity decision, not an assumption in this ADR.
 
 This gives local, mutable workspaces the smaller cache and natural freshness behavior they need, while retaining the packed form where source independence and deterministic bytes are more important than avoiding duplication.
 
@@ -48,7 +48,7 @@ This gives local, mutable workspaces the smaller cache and natural freshness beh
 | Changed/deleted/renamed files | Detectable through the source fingerprint and `fresh()` when size or nanosecond mtime changes, or when the regular-file set/path set changes. |
 | Network/removable media | Requires the source root on every load/revalidation and is exposed to availability and metadata latency. |
 | Windows sharing | A mapping implementation must request read/write/delete sharing explicitly; this ADR does not rely on unspecified CRT `ifstream` sharing behavior. |
-| Transformed input | Not valid for transformed bytes; use the ephemeral path or an explicit transformed snapshot. |
+| Transformed input | Not valid for transformed bytes; use the ephemeral path. Explicit transformed snapshots are not currently supported by the public API. |
 
 **Pros:** compact cache, no raw-source duplication, natural live-workspace invalidation, and a good fit for the interactive classes.
 **Cons:** source availability is required; load/revalidation can touch many files; a freshness check cannot close every TOCTOU window; same-size edits that preserve mtime are not detected.
@@ -66,7 +66,7 @@ This gives local, mutable workspaces the smaller cache and natural freshness beh
 | Changed/deleted/renamed files | The packed bytes and paths remain unchanged by source mutations. That is the snapshot guarantee, not freshness. A policy that needs the newest source must compare an external generation/source identity and repack. |
 | Network/removable media | Source-independent after creation; only the packed index must remain accessible. This is the preferred mode when the source cannot be reliably re-read. |
 | Windows sharing | Search/load need not retain source handles. The index file still needs normal read sharing and should be created/replaced with the repository's crash-safe same-volume rename rules. |
-| Transformed input | Can represent transformed bytes safely only when the transformation identity is part of the artifact/cache identity. |
+| Transformed input | Not available through the current public API; a future transformed-snapshot design must bind transformation identity into the artifact/cache identity. |
 
 **Pros:** deterministic coordinates, no source dependency after creation, one sequential payload, and a portable hand-off artifact.
 **Cons:** raw corpus duplication, larger cache and transfer size, stale-by-design paths/content, and cleartext corpus exposure requiring the access controls in [the freshness and cache-security contract](freshness-and-cache-security.md).
@@ -77,16 +77,16 @@ This gives local, mutable workspaces the smaller cache and natural freshness beh
 |---|---|---|
 | `one-shot` on a local, ordinary repository | Source-backed default | The cold path should not create a second raw corpus copy. |
 | `warm-repeated` on a stable local repository | Source-backed default | Repeated queries reuse one resident index; source freshness is checked at reuse boundaries. |
-| `interactive-large-repository` | Source-backed default | File additions, deletions, renames, and edits must cause cache rejection/rebuild rather than silently changing the meaning of coordinates. |
+| `interactive-large-repository` | Source-backed default | Metadata-detectable additions, deletions, renames, size changes, or mtime changes must cause cache rejection/rebuild rather than silently changing the meaning of coordinates. |
 | `batch-multi-pattern` with an available stable tree | Source-backed is sufficient | One loaded index serves all patterns; pack only when source independence or reproducibility is required. |
 | Offline/reproducible batch, audit artifact, or source unavailable | Packed opt-in | The artifact must own its bytes and remain searchable after source movement or mutation. |
-| `oneshot.transformed.*`, stdin, `--pre`, `--search-zip`, or encoding conversion | Ephemeral `from_documents` by default | The searched bytes are not the source bytes and must not collide with a source-backed cache. Explicit transformed snapshots are allowed only with transform identity. |
+| `oneshot.transformed.*`, stdin, `--pre`, `--search-zip`, or encoding conversion | Ephemeral `from_documents` | The searched bytes are not the source bytes and must not enter the ordinary source-backed cache. The current public API does not persist this path. |
 
 ## Invalidation and correctness rules
 
 ### Source-backed indexes
 
-1. Reuse requires the stored v7 manifest/source identity to match the requested root, selector, index options, transform identity, and corpus counts when those fields are supplied. The unqualified CLI path additionally calls `fresh()` before searching.
+1. Manifest-aware reuse requires the caller to supply and match the requested root, selector, index options, transform identity, and corpus counts. The current CLI uses unqualified `Index::load()` and then `fresh()`, so it relies on the embedded source identity and does not provide selector/transform expectations.
 2. `fresh()` re-traverses with the same hidden-file and symlink policy, compares the sorted regular-file path set, then compares each file's size and nanosecond mtime. Any added, deleted, renamed, resized, or mtime-changed file is stale and must trigger cache invalidation and rebuild.
 3. A same-size edit that preserves the recorded mtime is outside the metadata fingerprint. Callers requiring adversarial or byte-for-byte freshness must use a content hash policy or a packed snapshot; they must not treat `fresh() == true` as a cryptographic proof.
 4. A file can change after `fresh()` and before verification (TOCTOU). A live search that requires stable coordinates must use a packed snapshot or an equivalent external stability protocol; source-backed mode is not silently upgraded to snapshot semantics.
@@ -98,11 +98,12 @@ This gives local, mutable workspaces the smaller cache and natural freshness beh
 2. Source changes, deletion, or rename do not invalidate the bytes in a packed snapshot. They make the snapshot older than the source. A “latest source” cache policy must track a separate source generation and explicitly repack.
 3. Schema/version, checksum, index options, selector identity, source-root policy, corpus counts, or transform identity mismatches invalidate the artifact. A transformed artifact must never be reused for a different transformation pipeline.
 4. Paths are frozen at snapshot creation. Results intentionally refer to the stored path names even if the original tree later renames or deletes those files.
-5. Because the packed payload contains cleartext corpus bytes, cache permissions/ACLs must follow [the existing cache-security rules](freshness-and-cache-security.md).
+5. Because the packed payload contains cleartext corpus bytes, cache permissions/ACLs must follow [the cache-security rules](freshness-and-cache-security.md). The current save path still requires platform-specific permission hardening; this ADR does not treat that requirement as already enforced.
 
 ## Trade-off analysis and measurement gate
 
 The selected default is a lifecycle decision, not a claim that source mapping is always faster. The matrix's filesystem scenarios must compare both modes using the same corpus, patterns, and correctness reference, recording at least:
+The current benchmark matrix does not yet run both residency modes or provide mutation/network/removable-media arms; these are future release-gate scenarios, not completed measurements.
 
 - cold build/search and warm/repeated search latency;
 - save and load time, including packed serialization/checksum cost;
