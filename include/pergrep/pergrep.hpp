@@ -130,6 +130,7 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
     explicit Index(std::shared_ptr<Impl> impl);
+    static Index load_impl(const std::filesystem::path& file, const CacheManifest& expected, bool manifest_aware);
     friend class Searcher;
 };
 
