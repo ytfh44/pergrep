@@ -4001,6 +4001,7 @@ int main(){
     manifest.transform_identity = 5678;
     manifest.generation = 42;
     const auto manifest_cache = base / "zero-manifest.pgi";
+    std::cerr << "DIAG-PATH-DONE\n" << std::flush;
     manifest_index.save(manifest_cache, manifest);
     for (int field = 0; field != 7; ++field) {
       CacheManifest expected = manifest;
@@ -4023,6 +4024,7 @@ int main(){
 
     // A pre-manifest v5 snapshot remains loadable through the legacy API only.
     const auto qualified = base / "qualified-v5.pgi";
+    std::cerr << "DIAG-ZERO-DONE\n" << std::flush;
     manifest_index.save(qualified);
     std::ifstream in(qualified, std::ios::binary);
     std::string bytes((std::istreambuf_iterator<char>(in)), {});
@@ -4053,6 +4055,7 @@ int main(){
     catch (const std::runtime_error& e) {
       explicit_legacy_rejected = std::string(e.what()).find("cache manifest missing") != std::string::npos;
     }
+    std::cerr << "DIAG-LEGACY-DONE\n" << std::flush;
     assert(explicit_legacy_rejected);
 
     // Persisted snapshots reject oversized payloads before writing or allocating.
@@ -4121,6 +4124,7 @@ int main(){
     }
 
     fs::remove_all(base);
+    std::cerr << "DIAG-OVER-DONE\n" << std::flush;
   }
   std::cerr << "DIAG-POST-DONE\n" << std::flush;
   return 0;
