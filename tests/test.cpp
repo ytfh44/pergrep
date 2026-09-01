@@ -2235,28 +2235,48 @@ int main(){
       auto idx = Index::build(base / "corpus");
       auto* raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data()));
       assert(raw != nullptr);
-      // Inject large offsets >4 GiB
+      // Malformed serialized chunk geometry is rejected before any search dereferences it.
       const uint64_t GB = 1024ULL * 1024 * 1024;
       raw->chunks.clear();
       raw->chunks.push_back({0, 5*GB, 10*GB, 10*GB + 128});
       raw->chunks.push_back({0, 0x1'0000'0000ULL, 0x2'0000'0000ULL, 0x2'0000'0010ULL});
-      // Keep pos_desc consistent with new chunks (minimal)
       raw->pos_desc.clear();
       raw->pos_desc.push_back({0, 64, 1, 1});
       raw->pos_desc.push_back({64, 64, 1, 1});
       raw->pos.assign(128, 0);
       auto p = base / "chunk_idx.bin";
       idx.save(p);
-      auto loaded = Index::load(p);
-      auto* raw2 = static_cast<const pergrep::detail::IndexData*>(loaded.debug_index_data());
-      assert(raw2 != nullptr);
-      assert(raw2->chunks.size() == 2);
-      assert(raw2->chunks[0].core_begin == 5*GB);
-      assert(raw2->chunks[0].core_end == 10*GB);
-      assert(raw2->chunks[0].ext_end == 10*GB + 128);
-      assert(raw2->chunks[1].core_begin == 0x1'0000'0000ULL);
-      assert(raw2->chunks[1].core_end == 0x2'0000'0000ULL);
-      assert(raw2->chunks[1].ext_end == 0x2'0000'0010ULL);
+      bool rejected = false;
+      try { (void)Index::load(p); }
+      catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("invalid chunk geometry") != std::string::npos;
+      }
+      assert(rejected);
+      auto bad_group = Index::build(base / "corpus");
+      auto* group_raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad_group.debug_index_data()));
+      assert(group_raw != nullptr);
+      group_raw->groups[0].lg = 8;
+      const auto group_cache = base / "bad-group.bin";
+      bad_group.save(group_cache);
+      bool group_rejected = false;
+      try { (void)Index::load(group_cache); }
+      catch (const std::runtime_error& e) {
+        group_rejected = std::string(e.what()).find("invalid qgram group") != std::string::npos;
+      }
+      assert(group_rejected);
+
+      auto bad_pos = Index::build(base / "corpus");
+      auto* pos_raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad_pos.debug_index_data()));
+      assert(pos_raw != nullptr && !pos_raw->pos_desc.empty());
+      pos_raw->pos_desc[0].m = 0;
+      const auto pos_cache = base / "bad-pos.bin";
+      bad_pos.save(pos_cache);
+      bool pos_rejected = false;
+      try { (void)Index::load(pos_cache); }
+      catch (const std::runtime_error& e) {
+        pos_rejected = std::string(e.what()).find("invalid positional descriptors") != std::string::npos;
+      }
+      assert(pos_rejected);
       fs::remove_all(base);
 #else
       // Fallback: verify Chunk fields are 64-bit and put/get preserves high bits
@@ -3854,5 +3874,80 @@ int main(){
     // Unbounded repeats remain explicit conservative fallbacks.
     assert_regex_fallback("foo.*bar", {.case_mode = CaseMode::Insensitive}, "unbounded-repeat");
   }
+  // M3.1 manifest-first cache validation.
+  {
+    const auto base = std::filesystem::temp_directory_path() / "pergrep_m31_manifest";
+    const auto root = base / "corpus";
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(root);
+    { std::ofstream f(root / "a.txt", std::ios::binary); f << "manifest payload\n"; }
+    auto idx = Index::build(root);
+    const auto cache = base / "index.pgi";
+    CacheManifest manifest;
+    manifest.selector_identity = 0x1234;
+    manifest.index_options = idx.options();
+    manifest.transform_identity = 0x5678;
+    manifest.generation = 42;
+    idx.save(cache, manifest);
+
+    // All manifest request fields round-trip without loading the filter/payload twice.
+    auto loaded = Index::load(cache, manifest);
+    assert(loaded.files().size() == 1);
+    assert(loaded.content(0) == "manifest payload\n");
+
+    // A mismatch is rejected by the preamble, before any filter or corpus read.
+    for (auto bad : {1ULL, 2ULL, 3ULL, 4ULL, 5ULL}) {
+      CacheManifest expected = manifest;
+      if (bad == 1) expected.selector_identity = 0x9999;
+      else if (bad == 2) expected.generation = 43;
+      else if (bad == 3) expected.transform_identity = 0x9999;
+      else if (bad == 4) { expected.index_options->chunk_bytes += 64; }
+      else { expected.schema_version = 2; }
+      bool threw = false;
+      try { (void)Index::load(cache, expected); }
+      catch (const std::runtime_error& e) { threw = true; assert(std::string(e.what()).find("stale cache manifest") != std::string::npos); }
+      assert(threw);
+    }
+
+    // The same preamble gate protects v6: a generation mismatch rejects before
+    // attempting to materialize the persisted corpus bytes.
+    {
+      IndexOptions snapshot_options = idx.options();
+      snapshot_options.persist_corpus = true;
+      auto snapshot = Index::build(root, snapshot_options);
+      const auto snapshot_cache = base / "snapshot.pgi";
+      CacheManifest snapshot_manifest;
+      snapshot_manifest.generation = 7;
+      snapshot.save(snapshot_cache, snapshot_manifest);
+      CacheManifest stale_snapshot = snapshot_manifest;
+      stale_snapshot.generation = 8;
+      bool threw = false;
+      try { (void)Index::load(snapshot_cache, stale_snapshot); }
+      catch (const std::runtime_error& e) { threw = std::string(e.what()).find("stale cache manifest") != std::string::npos; }
+      assert(threw);
+      // A v6 payload length must match FileInfo and corpus totals.
+      auto* snapshot_raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(snapshot.debug_index_data()));
+      assert(snapshot_raw != nullptr && !snapshot_raw->loaded.empty());
+      snapshot_raw->loaded[0].data.push_back('x');
+      const auto corrupt_cache = base / "snapshot-corrupt-payload.pgi";
+      snapshot.save(corrupt_cache, snapshot_manifest);
+      bool payload_rejected = false;
+      try { (void)Index::load(corrupt_cache); }
+      catch (const std::runtime_error& e) {
+        payload_rejected = std::string(e.what()).find("invalid corpus payload") != std::string::npos;
+      }
+      assert(payload_rejected);
+    }
+
+    // v5 source drift is detected from metadata before the legacy filter sections
+    // and before the source file is re-read as resident corpus.
+    { std::ofstream f(root / "a.txt", std::ios::binary | std::ios::app); f << "changed"; }
+    bool stale = false;
+    try { (void)Index::load(cache); }
+    catch (const std::runtime_error& e) { stale = std::string(e.what()).find("source changed") != std::string::npos; }
+    assert(stale);
+    std::filesystem::remove_all(base);
+  }
+
   return 0;
 }

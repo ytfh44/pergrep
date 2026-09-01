@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <iostream>
 #include <system_error>
+#include <limits>
+#include <tuple>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -487,6 +489,77 @@ bool Index::fresh() const {
 }
 
 namespace {
+constexpr std::uint64_t kManifestMagic = 0x4d414e4946455354ULL; // MANIFEST
+constexpr std::uint32_t kManifestSchema = 1;
+
+static std::uint64_t fnv_mix(std::uint64_t h, std::string_view s) noexcept {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+static std::uint64_t fnv_mix(std::uint64_t h, std::uint64_t v) noexcept {
+    for (unsigned i = 0; i < 8; ++i) { h ^= static_cast<unsigned char>(v); h *= 1099511628211ULL; v >>= 8; }
+    return h;
+}
+
+// Compute a source fingerprint from metadata only. This is intentionally free
+// of file-content reads so stale v5 entries can be rejected before filters or
+// resident corpus bytes are materialized.
+static std::uint64_t source_identity(const fs::path& root, const IndexOptions& opt) {
+    std::vector<std::tuple<std::string, std::uint64_t, std::int64_t>> files;
+    std::error_code ec;
+    if (!fs::is_directory(root, ec) || ec) return 0;
+    std::unordered_set<std::string> visited_dirs;
+    if (opt.follow_symlinks) {
+        auto rc = fs::canonical(root, ec);
+        if (!ec) visited_dirs.insert(rc.generic_string());
+    }
+    auto dop = fs::directory_options::skip_permission_denied |
+        (opt.follow_symlinks ? fs::directory_options::follow_directory_symlink : fs::directory_options::none);
+    for (auto it = fs::recursive_directory_iterator(root, dop, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        const auto& e = *it;
+        if (!opt.include_hidden) {
+            auto name = e.path().filename().string();
+            if (!name.empty() && name[0] == '.' && name != "." && name != "..") {
+                if (e.is_directory(ec)) it.disable_recursion_pending();
+                continue;
+            }
+        }
+        if (!opt.follow_symlinks && pergrep_cli::platform::is_reparse_point(e.path())) {
+            if (e.is_directory(ec)) it.disable_recursion_pending();
+            continue;
+        }
+        if (opt.follow_symlinks && e.is_directory(ec)) {
+            auto canon = fs::canonical(e.path(), ec);
+            if (!ec && !visited_dirs.insert(canon.generic_string()).second) {
+                it.disable_recursion_pending();
+                continue;
+            }
+        }
+        if (e.is_regular_file(ec)) {
+            auto rel = pergrep_cli::platform::path_to_utf8(e.path().lexically_relative(root));
+            std::error_code x;
+            auto size = fs::file_size(e.path(), x);
+            if (x) return 0;
+            files.emplace_back(std::move(rel), size, mtime_ns(e.path()));
+        }
+    }
+    std::sort(files.begin(), files.end());
+    auto h = fnv_mix(1469598103934665603ULL, pergrep_cli::platform::path_to_utf8(root));
+    for (const auto& [path, size, mtime] : files) {
+        h = fnv_mix(h, path); h = fnv_mix(h, size); h = fnv_mix(h, static_cast<std::uint64_t>(mtime));
+    }
+    return h;
+}
+
+static bool same_options(const IndexOptions& a, const IndexOptions& b) noexcept {
+    return a.chunk_bytes == b.chunk_bytes && a.chunk_overlap == b.chunk_overlap &&
+        a.positional_block_bytes == b.positional_block_bytes &&
+        a.positional_budget_ratio == b.positional_budget_ratio &&
+        a.planned_qgrams == b.planned_qgrams && a.include_hidden == b.include_hidden &&
+        a.follow_symlinks == b.follow_symlinks && a.persist_corpus == b.persist_corpus;
+}
+
 // Serialization is host-endian (little-endian on x86_64) and not portable across
 // architectures. All scalar fields are written as raw host bytes via put<T> and
 // read via get<T>. This is intentional for speed; an index built on one
@@ -558,8 +631,28 @@ inline std::string pid_suffix() {
 }
 }
 void Index::save(const fs::path& file) const {
+    save(file, CacheManifest{});
+}
+
+void Index::save(const fs::path& file, const CacheManifest& requested) const {
     if (!impl_) throw std::runtime_error("cannot persist an uninitialized pergrep index");
     if (impl_->ephemeral) throw std::runtime_error("cannot persist an in-memory pergrep index");
+    CacheManifest manifest = requested;
+    if (manifest.schema_version && *manifest.schema_version != kManifestSchema)
+        throw std::runtime_error("unsupported cache manifest schema");
+    manifest.schema_version = manifest.schema_version.value_or(kManifestSchema);
+    if (manifest.index_options && !same_options(*manifest.index_options, impl_->opt))
+        throw std::runtime_error("cache manifest index options do not match index");
+    if (manifest.selector_identity && *manifest.selector_identity == 0)
+        manifest.selector_identity = 0;
+    manifest.source_root = manifest.source_root.value_or(pergrep_cli::platform::path_to_utf8(impl_->root));
+    manifest.source_identity = manifest.source_identity.value_or(source_identity(impl_->root, impl_->opt));
+    manifest.selector_identity = manifest.selector_identity.value_or(0);
+    manifest.index_options = manifest.index_options.value_or(impl_->opt);
+    manifest.transform_identity = manifest.transform_identity.value_or(0);
+    manifest.corpus_files = manifest.corpus_files.value_or(impl_->infos.size());
+    manifest.corpus_bytes = manifest.corpus_bytes.value_or(impl_->corp_bytes);
+    manifest.generation = manifest.generation.value_or(static_cast<std::uint64_t>(impl_->root_mtime_ns));
     if (!file.parent_path().empty()) fs::create_directories(file.parent_path());
     // Crash-safe: write to temp file then atomic rename. fs::rename is atomic on
     // POSIX and uses MoveFileExW on Windows (atomic when on same volume).
@@ -580,6 +673,26 @@ void Index::save(const fs::path& file) const {
             // persist_corpus=true emits v6 and appends raw corpus after pos vector.
             uint32_t ver = impl_->opt.persist_corpus ? 6 : 5;
             put(o, ver);
+            // Manifest is a fixed, bounded preamble. It is validated before the
+            // legacy filter sections or v6 corpus payload are read.
+            put(o, kManifestMagic);
+            put(o, *manifest.schema_version);
+            put(o, *manifest.source_identity);
+            puts(o, *manifest.source_root);
+            put(o, *manifest.selector_identity);
+            const auto& mo = *manifest.index_options;
+            put(o, uint64_t(mo.chunk_bytes));
+            put(o, uint64_t(mo.chunk_overlap));
+            put(o, uint64_t(mo.positional_block_bytes));
+            put(o, mo.positional_budget_ratio);
+            put(o, uint64_t(mo.planned_qgrams));
+            put(o, uint8_t(mo.include_hidden ? 1 : 0));
+            put(o, uint8_t(mo.follow_symlinks ? 1 : 0));
+            put(o, uint8_t(mo.persist_corpus ? 1 : 0));
+            put(o, *manifest.transform_identity);
+            put(o, *manifest.corpus_files);
+            put(o, *manifest.corpus_bytes);
+            put(o, *manifest.generation);
             puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
             put(o, uint64_t(impl_->opt.chunk_bytes));
             put(o, uint64_t(impl_->opt.chunk_overlap));
@@ -665,6 +778,10 @@ void Index::save(const fs::path& file) const {
     }
 }
 Index Index::load(const fs::path& file) {
+    return load(file, CacheManifest{});
+}
+
+Index Index::load(const fs::path& file, const CacheManifest& expected) {
     // Truncation guard: check file size is at least header before reading.
     {
         std::error_code ec;
@@ -681,6 +798,69 @@ Index Index::load(const fs::path& file) {
     if (!i || std::memcmp(magic, "PERGREP\0", 8) != 0) throw std::runtime_error("pergrep index: truncated");
     auto ver = get<uint32_t>(i);
     if (ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
+
+    CacheManifest stored;
+    bool has_manifest = false;
+    std::uint64_t marker = 0;
+    i.read(reinterpret_cast<char*>(&marker), sizeof marker);
+    if (!i) throw std::runtime_error("pergrep index: truncated");
+    if (marker == kManifestMagic) {
+        has_manifest = true;
+        stored.schema_version = get<std::uint32_t>(i);
+        if (stored.schema_version != kManifestSchema)
+            throw std::runtime_error("unsupported cache manifest schema");
+        stored.source_identity = get<std::uint64_t>(i);
+        stored.source_root = gets(i);
+        stored.selector_identity = get<std::uint64_t>(i);
+        IndexOptions mo;
+        mo.chunk_bytes = get<std::uint64_t>(i);
+        mo.chunk_overlap = get<std::uint64_t>(i);
+        mo.positional_block_bytes = get<std::uint64_t>(i);
+        mo.positional_budget_ratio = get<double>(i);
+        mo.planned_qgrams = get<std::uint64_t>(i);
+        mo.include_hidden = get<std::uint8_t>(i) != 0;
+        mo.follow_symlinks = get<std::uint8_t>(i) != 0;
+        mo.persist_corpus = get<std::uint8_t>(i) != 0;
+        stored.index_options = mo;
+        stored.transform_identity = get<std::uint64_t>(i);
+        stored.corpus_files = get<std::uint64_t>(i);
+        stored.corpus_bytes = get<std::uint64_t>(i);
+        stored.generation = get<std::uint64_t>(i);
+
+        auto mismatch = [&](bool bad, const char* what) {
+            if (bad) throw std::runtime_error(std::string("stale cache manifest: ") + what);
+        };
+        mismatch(expected.schema_version && *expected.schema_version != *stored.schema_version, "schema");
+        if (expected.source_identity) mismatch(*expected.source_identity != *stored.source_identity, "source identity");
+        if (expected.source_root) mismatch(*expected.source_root != *stored.source_root, "source root");
+        if (expected.selector_identity) mismatch(*expected.selector_identity != *stored.selector_identity, "selector");
+        if (expected.index_options) mismatch(!same_options(*expected.index_options, *stored.index_options), "index options");
+        if (expected.transform_identity) mismatch(*expected.transform_identity != *stored.transform_identity, "transform");
+        if (expected.corpus_files) mismatch(*expected.corpus_files != *stored.corpus_files, "corpus files");
+        if (expected.corpus_bytes) mismatch(*expected.corpus_bytes != *stored.corpus_bytes, "corpus bytes");
+        if (expected.generation) mismatch(*expected.generation != *stored.generation, "generation");
+
+#ifdef _WIN32
+        auto root_path = fs::path(std::u8string(stored.source_root->begin(), stored.source_root->end()));
+#else
+        auto root_path = fs::path(*stored.source_root);
+#endif
+        // v5 is source-backed, so metadata validation happens while only the
+        // manifest is resident. v6 remains loadable after its source disappears.
+        if (ver == 5 && source_identity(root_path, *stored.index_options) != *stored.source_identity)
+            throw std::runtime_error("stale cache manifest: source changed or disappeared");
+    } else {
+        // Existing v5/v6 files predate the manifest. Keep their documented
+        // compatibility for the unqualified API, but never use one to satisfy
+        // an explicit manifest-aware request.
+        i.seekg(-static_cast<std::streamoff>(sizeof marker), std::ios::cur);
+        if (!i) throw std::runtime_error("pergrep index: truncated");
+        if (expected.schema_version || expected.source_identity || expected.source_root || expected.selector_identity ||
+            expected.index_options || expected.transform_identity || expected.corpus_files ||
+            expected.corpus_bytes || expected.generation)
+            throw std::runtime_error("cache manifest missing");
+    }
+
     auto I = std::make_shared<Impl>();
     I->opt.persist_corpus = (ver == 6);
 #ifdef _WIN32
@@ -698,6 +878,14 @@ Index Index::load(const fs::path& file) {
     I->opt.follow_symlinks = get<uint8_t>(i) != 0;
     I->corp_bytes = get<uint64_t>(i);
     I->root_mtime_ns = get<int64_t>(i);
+    if (has_manifest) {
+        if (!same_options(I->opt, *stored.index_options) || I->opt.persist_corpus != (ver == 6))
+            throw std::runtime_error("stale cache manifest: index options");
+        if (pergrep_cli::platform::path_to_utf8(I->root) != *stored.source_root)
+            throw std::runtime_error("stale cache manifest: source root");
+        if (I->corp_bytes != *stored.corpus_bytes)
+            throw std::runtime_error("stale cache manifest: corpus bytes");
+    }
     i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
     // qgram_freq is legacy hash-bucket occurrence data; exact planner stats
     // are rebuilt below after v5/v6 corpus restoration.
@@ -706,6 +894,8 @@ Index Index::load(const fs::path& file) {
     I->pos_block = get<uint32_t>(i);
     auto nf = get<uint64_t>(i);
     if (nf > kMaxFiles) throw std::runtime_error("pergrep index: truncated");
+    if (has_manifest && nf != *stored.corpus_files)
+        throw std::runtime_error("stale cache manifest: corpus files");
     I->infos.reserve(static_cast<size_t>(nf));
     I->loaded.reserve(static_cast<size_t>(nf));
     for (uint64_t k = 0; k < nf; ++k) {
@@ -716,6 +906,16 @@ Index Index::load(const fs::path& file) {
         f.binary = get<uint8_t>(i) != 0;
         I->infos.push_back(std::move(f));
     }
+    std::uint64_t info_total = 0;
+    for (const auto& f : I->infos) {
+        if (f.size > UINT64_MAX - info_total)
+            throw std::runtime_error("pergrep index: invalid corpus totals");
+        info_total += f.size;
+    }
+    if (info_total != I->corp_bytes)
+        throw std::runtime_error("pergrep index: invalid corpus totals");
+    if (has_manifest && info_total != *stored.corpus_bytes)
+        throw std::runtime_error("stale cache manifest: corpus bytes");
     auto nc = get<uint64_t>(i);
     if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
     I->chunks.reserve(static_cast<size_t>(nc));
@@ -725,6 +925,9 @@ Index Index::load(const fs::path& file) {
         c.core_begin = get<uint64_t>(i);
         c.core_end = get<uint64_t>(i);
         c.ext_end = get<uint64_t>(i);
+        if (c.file_id >= nf || c.core_begin > c.core_end || c.core_end > c.ext_end ||
+            c.ext_end > I->infos[c.file_id].size)
+            throw std::runtime_error("pergrep index: invalid chunk geometry");
         I->chunks.push_back(c);
     }
     for (auto& g : I->groups) {
@@ -733,9 +936,16 @@ Index Index::load(const fs::path& file) {
         g.words = get<uint32_t>(i);
         g.gids = getv<uint32_t>(i);
         g.bits = getv<uint64_t>(i);
+        if (g.lg < 9 || g.lg > 16 || g.m != (1u << g.lg) ||
+            g.words != (g.gids.size() + 63) / 64 ||
+            static_cast<std::uint64_t>(g.words) > UINT64_MAX / (1u << g.lg) ||
+            g.bits.size() != static_cast<std::uint64_t>(1u << g.lg) * g.words)
+            throw std::runtime_error("pergrep index: invalid qgram group");
+        for (auto gid : g.gids)
+            if (gid >= nc) throw std::runtime_error("pergrep index: invalid qgram group reference");
     }
     auto npd = get<uint64_t>(i);
-    if (npd > kMaxPosDesc) throw std::runtime_error("pergrep index: truncated");
+    if (npd != nc || npd > kMaxPosDesc) throw std::runtime_error("pergrep index: invalid positional descriptors");
     I->pos_desc.reserve(static_cast<size_t>(npd));
     for (uint64_t k = 0; k < npd; ++k) {
         detail::PosDesc d;
@@ -746,6 +956,16 @@ Index Index::load(const fs::path& file) {
         I->pos_desc.push_back(d);
     }
     I->pos = getv<uint8_t>(i);
+    std::uint64_t pos_end = 0;
+    for (const auto& d : I->pos_desc) {
+        if (d.m < 64 || d.m > 1024 || (d.m & (d.m - 1)) != 0 || d.blocks == 0 ||
+            d.mask_bytes != (static_cast<std::uint64_t>(d.blocks) + 7) / 8 ||
+            d.off != pos_end || static_cast<std::uint64_t>(d.mask_bytes) >
+                (I->pos.size() - std::min<std::uint64_t>(pos_end, I->pos.size())) / d.m)
+            throw std::runtime_error("pergrep index: invalid positional descriptors");
+        pos_end += static_cast<std::uint64_t>(d.m) * d.mask_bytes;
+    }
+    if (pos_end != I->pos.size()) throw std::runtime_error("pergrep index: invalid positional data");
     // QO-5: decouple filter persistence from corpus re-read.
     // v5 (persist_corpus==false): legacy path re-reads every source file via
     // std::ifstream (O(corpus) I/O) to repopulate I->loaded. Documented as
@@ -753,10 +973,13 @@ Index Index::load(const fs::path& file) {
     // v6 (persist_corpus==true): persisted corpus bytes follow the filter;
     // restore I->loaded directly from the index without touching the filesystem.
     if (ver == 6) {
-        constexpr uint64_t kMaxCorpusPerFile = 512ULL * 1024 * 1024; // 512 MiB per file guard against OOM
+        std::uint64_t payload_total = 0;
         for (size_t k = 0; k < I->infos.size(); ++k) {
             auto n = get<uint64_t>(i);
-            if (n > kMaxCorpusPerFile) throw std::runtime_error("pergrep index: truncated");
+            if (n != I->infos[k].size || n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+                n > UINT64_MAX - payload_total)
+                throw std::runtime_error("pergrep index: invalid corpus payload");
+            payload_total += n;
             std::string data;
             data.resize(static_cast<size_t>(n));
             if (n) {
@@ -765,8 +988,9 @@ Index Index::load(const fs::path& file) {
             }
             I->loaded.push_back({I->infos[k], std::move(data)});
         }
+        if (payload_total != I->corp_bytes || (has_manifest && payload_total != *stored.corpus_bytes))
+            throw std::runtime_error("pergrep index: invalid corpus payload totals");
     } else {
-        // v5: re-read from filesystem (O(corpus) I/O per load)
         for (auto& f : I->infos) {
 #ifdef _WIN32
             std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
@@ -775,6 +999,8 @@ Index Index::load(const fs::path& file) {
 #endif
             if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
             std::string data((std::istreambuf_iterator<char>(src)), {});
+            if (data.size() != f.size)
+                throw std::runtime_error("indexed source changed or disappeared: " + f.path);
             I->loaded.push_back({f, std::move(data)});
         }
     }
