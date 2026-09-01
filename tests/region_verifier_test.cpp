@@ -306,7 +306,7 @@ Case make_case(std::uint32_t seed) {
     case 8: c.expr = R"((é|世界)[A-Z]{1,2})"; body += "éAB éaB 世界CD 世界cD"; break;
     case 9: c.expr = R"(\bfoo[0-9]{1,3}bar\b)"; c.po.word = true; body += " foo12bar xfoo12bar foo1234bar "; c.bounded = true; break;
     case 10: c.expr = R"(aba)"; c.so.overlapping = true; body += "ababa xabx"; break;
-    case 11: c.expr = R"(^needle$)"; c.po.multiline = true; c.so.record_separator = 0; c.so.include_binary = true; body = noise(r, at); body += "\0needle\0tail\0badneedle\0"; break;
+    case 11: c.expr = R"(^needle$)"; c.po.multiline = true; c.so.record_separator = 0; c.so.include_binary = true; body = noise(r, at); body += std::string("\0needle\0tail\0badneedle\0", 23); break;
     case 12: c.expr = R"(foo\x00bar)"; c.so.include_binary = true; body += std::string("foo\0bar\n", 8) + "fooXbar"; break;
     default: c.expr = R"(^foo[0-9]{1,3}bar$)"; c.so.record_separator = '|'; body += "|foo12bar|foo1234bar|"; c.bounded = true; break;
     }
