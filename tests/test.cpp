@@ -3087,8 +3087,8 @@ int main(){
         assert(threw);
       }
 
-      // (c) Unsupported / invalid version numbers (e.g. 0, 4, 7, 9999, 0xFFFFFFFF)
-      for (uint32_t bad_ver : {0u, 1u, 4u, 7u, 100u, 0xFFFFFFFFu}) {
+      // (c) Unsupported / invalid version numbers (e.g. 0, 1, 4, 100, 0xFFFFFFFF)
+      for (uint32_t bad_ver : {0u, 1u, 4u, 100u, 0xFFFFFFFFu}) {
         auto bad_ver_path = base / ("bad_ver_" + std::to_string(bad_ver) + ".bin");
         std::string bad_ver_bytes = valid_bytes;
         std::memcpy(&bad_ver_bytes[8], &bad_ver, sizeof(bad_ver));
@@ -3107,6 +3107,15 @@ int main(){
         assert(threw);
       }
 
+      // A big-endian version encoding is not a valid v7 header.
+      std::string non_le_bytes = valid_bytes;
+      non_le_bytes[8] = 0; non_le_bytes[9] = 0; non_le_bytes[10] = 0; non_le_bytes[11] = 7;
+      const auto non_le_path = base / "bad_ver_big_endian.bin";
+      { std::ofstream out(non_le_path, std::ios::binary | std::ios::trunc); out.write(non_le_bytes.data(), static_cast<std::streamsize>(non_le_bytes.size())); }
+      bool non_le_threw = false;
+      try { (void)Index::load(non_le_path); }
+      catch (const std::runtime_error& e) { non_le_threw = std::string(e.what()).find("unsupported pergrep index version") != std::string::npos; }
+      assert(non_le_threw);
       fs::remove_all(base);
     }
 
@@ -3889,6 +3898,12 @@ int main(){
     manifest.transform_identity = 0x5678;
     manifest.generation = 42;
     idx.save(cache, manifest);
+    std::ifstream format_in(cache, std::ios::binary);
+    std::array<unsigned char, 12> format_header{};
+    format_in.read(reinterpret_cast<char*>(format_header.data()), static_cast<std::streamsize>(format_header.size()));
+    assert(format_in && std::memcmp(format_header.data(), "PERGREP\0", 8) == 0);
+    assert(format_header[8] == 7 && format_header[9] == 0 && format_header[10] == 0 && format_header[11] == 0);
+    format_in.close();
 
     // All manifest request fields round-trip without loading the filter/payload twice.
     auto loaded = Index::load(cache, manifest);
@@ -3902,7 +3917,7 @@ int main(){
       else if (bad == 2) expected.generation = 43;
       else if (bad == 3) expected.transform_identity = 0x9999;
       else if (bad == 4) { expected.index_options->chunk_bytes += 64; }
-      else { expected.schema_version = 2; }
+      else { expected.schema_version = 1; }
       bool threw = false;
       try { (void)Index::load(cache, expected); }
       catch (const std::runtime_error& e) { threw = true; assert(std::string(e.what()).find("stale cache manifest") != std::string::npos); }
@@ -4016,6 +4031,7 @@ int main(){
     assert(read_u64(manifest_end) == 0x4d414e4946455354ULL);
     manifest_end += 8; // manifest marker
     manifest_end += 4; // schema
+    manifest_end += 4; // feature flags
     manifest_end += 8; // source identity
     const auto root_len = read_u64(manifest_end);
     manifest_end += 8 + static_cast<std::size_t>(root_len);
@@ -4024,6 +4040,8 @@ int main(){
     assert(manifest_end < bytes.size());
     std::string legacy_bytes = bytes;
     legacy_bytes.erase(12, manifest_end - 12);
+    const std::uint32_t legacy_version = 5;
+    std::memcpy(legacy_bytes.data() + 8, &legacy_version, sizeof(legacy_version));
     const auto legacy_cache = base / "legacy-v5.pgi";
     { std::ofstream out(legacy_cache, std::ios::binary); out.write(legacy_bytes.data(), static_cast<std::streamsize>(legacy_bytes.size())); }
     auto legacy_loaded = Index::load(legacy_cache);
@@ -4049,6 +4067,56 @@ int main(){
       oversized_rejected = std::string(e.what()).find("v6 corpus payload exceeds 1 GiB limit") != std::string::npos;
     }
     assert(oversized_rejected);
+
+    // v7 corruption is rejected deterministically before any oversized allocation.
+    {
+      std::ifstream in(manifest_cache, std::ios::binary);
+      std::string original_v7((std::istreambuf_iterator<char>(in)), {});
+      in.close();
+      std::string v7 = original_v7;
+      auto u64le = [&](std::size_t at) { std::uint64_t x = 0;
+        for (unsigned k = 0; k != 8; ++k) x |= std::uint64_t(static_cast<unsigned char>(v7[at + k])) << (8 * k);
+        return x;
+      };
+      auto put64le = [&](std::size_t at, std::uint64_t x) {
+        for (unsigned k = 0; k != 8; ++k) v7[at + k] = static_cast<char>(x >> (8 * k));
+      };
+      std::size_t at = 12;
+      at += 8 + 4 + 4 + 8; // marker, schema, feature flags, source identity
+      const auto source_root_len = u64le(at); at += 8 + static_cast<std::size_t>(source_root_len);
+      at += 8 * 5 + sizeof(double) + 3 + 8 * 4; // selector, options, transform/totals/generation
+      const auto serialized_root_len = u64le(at); at += 8 + static_cast<std::size_t>(serialized_root_len);
+      at += 8 * 5 + 2 + 8 + 8; // index options, corpus bytes, root mtime
+      at += 256 * 8 + 65536 * 4; // planner arrays
+      const auto pos_block_at = at; at += 4;
+      const auto nf_at = at;
+      put64le(nf_at, std::uint64_t{10'000'000});
+      const auto count_cache = base / "corrupt-count.pgi";
+      { std::ofstream out(count_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
+      bool count_rejected = false;
+      try { (void)Index::load(count_cache); }
+      catch (const std::runtime_error& e) { count_rejected = std::string(e.what()).find("truncated") != std::string::npos; }
+      assert(count_rejected);
+
+      v7 = original_v7;
+      v7[pos_block_at] = 0; v7[pos_block_at + 1] = 0; v7[pos_block_at + 2] = 0; v7[pos_block_at + 3] = 0;
+      const auto pos_cache = base / "corrupt-pos-block.pgi";
+      { std::ofstream out(pos_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
+      bool pos_rejected = false;
+      try { (void)Index::load(pos_cache); }
+      catch (const std::runtime_error& e) { pos_rejected = std::string(e.what()).find("positional block mismatch") != std::string::npos; }
+      assert(pos_rejected);
+
+      v7 = original_v7;
+      assert(v7.size() > 20);
+      v7[v7.size() - 9] ^= 1; // final positional-filter byte, before checksum trailer
+      const auto filter_cache = base / "corrupt-filter.pgi";
+      { std::ofstream out(filter_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
+      bool filter_rejected = false;
+      try { (void)Index::load(filter_cache); }
+      catch (const std::runtime_error& e) { filter_rejected = std::string(e.what()).find("checksum mismatch") != std::string::npos; }
+      assert(filter_rejected);
+    }
 
     fs::remove_all(base);
   }

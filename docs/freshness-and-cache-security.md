@@ -239,10 +239,10 @@ Binary Layout:
   ```
 
 #### 3. Manifest-First Cache Validation
-New v5/v6 files contain a bounded MANIFEST preamble after the magic and format version. It records schema version, source identity/root, selector and transform identities, index options, corpus totals, and generation. Index::load(file, expected_manifest) validates these fields and v5 source metadata before reading filter vectors or source-backed corpus bytes; the unqualified overload keeps legacy unmanifested v5/v6 compatibility.
+New v7 files contain a bounded MANIFEST preamble after the magic and little-endian format version. It records schema 2, source identity/root, selector and transform identities, index options, corpus totals, generation, feature flags, and an integrity checksum. `Index::load(file, expected_manifest)` validates these fields and source metadata before reading filter vectors or source-backed corpus bytes; the unqualified overload keeps legacy unmanifested v5/v6 compatibility, which remains host-representation-only.
 
 #### 4. Vector Length Bounding & OOM Prevention
-pergrep enforces hard upper bounds before allocating vectors and validates serialized references and geometry: nf <= kMaxFiles, nc <= kMaxChunks, npd == nc, q-gram group dimensions and IDs, chunk file IDs/ranges, positional descriptor dimensions/offsets, and v6 payload lengths against FileInfo and corpus totals. Invalid data terminates with std::runtime_error rather than reaching search-time pointer arithmetic.
+pergrep bounds v7 string, vector, file, chunk, and positional-descriptor counts against remaining bytes before allocation; it validates serialized references, options, geometry, positional-block consistency, and the checksum before exposing the index. Persisted corpus lengths are capped and checked against FileInfo and corpus totals. Invalid data terminates with `std::runtime_error` rather than reaching search-time pointer arithmetic.
 - **Max File Count**: `nf <= 1,000,000` (`kMaxFiles`).
 - **Max Chunk Count**: `nc <= 10,000,000` (`kMaxChunks`).
 - **Max Positional Descriptors**: `npd <= 10,000,000` (`kMaxPosDesc`).

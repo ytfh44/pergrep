@@ -12,6 +12,13 @@
 #include <vector>
 
 namespace pergrep {
+// Current on-disk snapshot identity. Index::save always emits v7, the portable
+// little-endian format. Index::load retains read compatibility with legacy v5/v6
+// host-representation snapshots; those legacy formats are not portable across
+// differing host byte order or data representation.
+inline constexpr std::uint32_t kIndexFormatVersion = 7;
+inline constexpr std::uint32_t kIndexFormatSchema = 2;
+inline constexpr std::string_view kIndexFormatIdentity = "pergrep-index-format-v7-schema2";
 struct PlanKey;
 class Pattern;
 struct PlanCandidateMetrics;
@@ -66,15 +73,12 @@ struct IndexOptions {
     std::size_t planned_qgrams = 4;
     bool include_hidden = true; // filtering is normally done by the CLI layer.
     bool follow_symlinks = false;
-    // QO-5: on-disk corpus prototype. When false (default), Index::save persists
-    // only filter structures and file metadata; Index::load re-reads each source
-    // file via std::ifstream (O(corpus) I/O) to repopulate I->loaded. This keeps
-    // index files small and backward-compatible (v5). When true, save also
-    // persists the raw corpus bytes after the positional filter (v6) so load
-    // restores content without touching the filesystem — prototype for a true
-    // on-disk index that decouples filter persistence from corpus re-read.
-    // Default false preserves backward compatibility; true trades larger index
-    // for O(1) load without corpus re-read.
+    // On-disk snapshots are always emitted as v7 by Index::save. This option
+    // selects whether v7 includes its optional persisted-corpus section. When
+    // false (default), save persists filter structures and file metadata; load
+    // re-reads each source file. When true, save also persists raw corpus bytes
+    // and load restores content without touching the filesystem. Legacy v5/v6
+    // files remain readable as host-representation compatibility formats only.
     bool persist_corpus = false;
 };
 
