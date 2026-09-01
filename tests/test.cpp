@@ -3884,6 +3884,7 @@ int main(){
     assert_regex_fallback("foo.*bar", {.case_mode = CaseMode::Insensitive}, "unbounded-repeat");
   }
   // M3.1 manifest-first cache validation.
+  std::cerr << "DIAG-M31-START\n" << std::flush;
   {
     const auto base = std::filesystem::temp_directory_path() / "pergrep_m31_manifest";
     const auto root = base / "corpus";
@@ -3965,6 +3966,7 @@ int main(){
   }
 
   // Post-M3.1 cache hardening regressions.
+  std::cerr << "DIAG-M31-DONE\n" << std::flush;
   {
     namespace fs = std::filesystem;
     const auto base = fs::temp_directory_path() / "pergrep_m31_hardening";
@@ -4120,5 +4122,6 @@ int main(){
 
     fs::remove_all(base);
   }
+  std::cerr << "DIAG-POST-DONE\n" << std::flush;
   return 0;
 }
