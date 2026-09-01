@@ -305,7 +305,11 @@ std::string cache_path(const fs::path&root){const char*base=getenv("PERGREP_CACH
     if(!base)dir=(getenv("XDG_CACHE_HOME")?to_path(getenv("XDG_CACHE_HOME"))/"pergrep":to_path(getenv("HOME")?getenv("HOME"):".")/".cache/pergrep");
 #endif
     if(base)dir=to_path(base);
-    auto s=pergrep_cli::platform::path_to_utf8(fs::weakly_canonical(root));uint64_t h=1469598103934665603ull;for(unsigned char c:s){h^=c;h*=1099511628211ull;}std::ostringstream o;o<<std::hex<<h;return(dir/o.str()/"index.pgi").string();}
+    auto s=pergrep_cli::platform::path_to_utf8(fs::weakly_canonical(root));uint64_t h=1469598103934665603ull;for(unsigned char c:s){h^=c;h*=1099511628211ull;}
+    // Cache identity includes the current on-disk format, so a legacy v5/v6
+    // cache can never collide with a portable v7 snapshot.
+    for(unsigned char c : pergrep::kIndexFormatIdentity){h^=c;h*=1099511628211ull;}
+    std::ostringstream o;o<<std::hex<<h;return(dir/o.str()/"index.pgi").string();}
 
 struct IgnoreRule { fs::path base; std::string pat; bool neg=false, ci=false, dir_only=false; };
 struct PathSelector { std::string rel; bool directory=false; };

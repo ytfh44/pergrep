@@ -1,11 +1,13 @@
 #include "internal.hpp"
 #include "platform.hpp"
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <system_error>
 #include <limits>
 #include <tuple>
+#include <type_traits>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -508,7 +510,10 @@ bool Index::fresh() const {
 
 namespace {
 constexpr std::uint64_t kManifestMagic = 0x4d414e4946455354ULL; // MANIFEST
-constexpr std::uint32_t kManifestSchema = 1;
+constexpr std::uint32_t kManifestSchema = kIndexFormatSchema;
+constexpr std::uint32_t kPortableIndexVersion = kIndexFormatVersion;
+constexpr std::uint32_t kFeaturePersistedCorpus = 1u;
+constexpr std::uint32_t kFeatureIntegrityChecksum = 2u;
 
 static std::uint64_t fnv_mix(std::uint64_t h, std::string_view s) noexcept {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
@@ -523,7 +528,10 @@ static std::uint64_t fnv_mix(std::uint64_t h, std::uint64_t v) noexcept {
 // of file-content reads so stale v5 entries can be rejected before filters or
 // resident corpus bytes are materialized.
 static std::uint64_t source_identity(const fs::path& root, const IndexOptions& opt) {
+    constexpr std::size_t kMaxManifestFiles = 1'000'000;
+    constexpr std::uint64_t kMaxManifestMetadataBytes = 256ULL * 1024 * 1024;
     std::vector<std::tuple<std::string, std::uint64_t, std::int64_t>> files;
+    std::uint64_t metadata_bytes = 0;
     std::error_code ec;
     if (!fs::is_directory(root, ec) || ec) return 0;
     std::unordered_set<std::string> visited_dirs;
@@ -559,6 +567,14 @@ static std::uint64_t source_identity(const fs::path& root, const IndexOptions& o
             std::error_code x;
             auto size = fs::file_size(e.path(), x);
             if (x) return 0;
+            // A manifest may contain an untrusted source_root. Bound metadata
+            // collection so validation cannot traverse an oversized tree or
+            // accumulate an attacker-controlled vector before payload checks.
+            if (files.size() >= kMaxManifestFiles ||
+                metadata_bytes > kMaxManifestMetadataBytes ||
+                rel.size() > kMaxManifestMetadataBytes - metadata_bytes)
+                return 0;
+            metadata_bytes += rel.size();
             files.emplace_back(std::move(rel), size, mtime_ns(e.path()));
         }
     }
@@ -577,68 +593,117 @@ static bool same_options(const IndexOptions& a, const IndexOptions& b) noexcept 
         a.planned_qgrams == b.planned_qgrams && a.include_hidden == b.include_hidden &&
         a.follow_symlinks == b.follow_symlinks && a.persist_corpus == b.persist_corpus;
 }
+static bool valid_index_options(const IndexOptions& o) noexcept {
+    return o.chunk_bytes >= 64 && o.chunk_bytes <= (1ULL << 30) &&
+        o.positional_block_bytes >= 16 && o.positional_block_bytes <= (1ULL << 20) &&
+        o.chunk_overlap <= o.chunk_bytes / 2 && o.planned_qgrams <= 64 &&
+        std::isfinite(o.positional_budget_ratio) &&
+        o.positional_budget_ratio >= 0.0 && o.positional_budget_ratio <= 10.0;
+}
 
-// Serialization is host-endian (little-endian on x86_64) and not portable across
-// architectures. All scalar fields are written as raw host bytes via put<T> and
-// read via get<T>. This is intentional for speed; an index built on one
-// endianness cannot be loaded on another without conversion. Field-by-field
-// encoding is used for Chunk and PosDesc (no putv<Chunk>/putv<PosDesc>) to
-// avoid padding divergence across compilers/platforms.
-template<class T> void put(std::ostream& o, const T& x) {
+// v5/v6 were intentionally emitted as raw host-byte fields. Keep this codec
+// solely for reading those historical files; never use it for new snapshots.
+template<class T> void put_raw(std::ostream& o, const T& x) {
     o.write(reinterpret_cast<const char*>(&x), sizeof x);
     if (!o) throw std::runtime_error("index write failed");
 }
-template<class T> T get(std::istream& i) {
+template<class T> T get_raw(std::istream& i) {
     T x{};
     i.read(reinterpret_cast<char*>(&x), sizeof x);
     if (!i) throw std::runtime_error("pergrep index: truncated");
     return x;
 }
-void puts(std::ostream& o, std::string_view s) {
-    uint64_t n = s.size();
-    put(o, n);
-    if (n) {
-        o.write(s.data(), static_cast<std::streamsize>(n));
-        if (!o) throw std::runtime_error("index write failed");
-    }
-}
+void put_u8(std::ostream& o, std::uint8_t x) { put_raw(o, x); }
+std::uint8_t get_u8(std::istream& i) { return get_raw<std::uint8_t>(i); }
+void put_le16(std::ostream& o, std::uint16_t x) { char b[2] = {char(x), char(x >> 8)}; o.write(b, 2); if (!o) throw std::runtime_error("index write failed"); }
+void put_le32(std::ostream& o, std::uint32_t x) { char b[4] = {char(x), char(x >> 8), char(x >> 16), char(x >> 24)}; o.write(b, 4); if (!o) throw std::runtime_error("index write failed"); }
+void put_le64(std::ostream& o, std::uint64_t x) { char b[8]; for (unsigned k=0;k<8;++k) b[k]=char(x>>(8*k)); o.write(b, 8); if (!o) throw std::runtime_error("index write failed"); }
+std::uint16_t get_le16(std::istream& i) { unsigned char b[2]; i.read(reinterpret_cast<char*>(b),2); if (!i) throw std::runtime_error("pergrep index: truncated"); return std::uint16_t(b[0]) | (std::uint16_t(b[1])<<8); }
+std::uint32_t get_le32(std::istream& i) { unsigned char b[4]; i.read(reinterpret_cast<char*>(b),4); if (!i) throw std::runtime_error("pergrep index: truncated"); return std::uint32_t(b[0]) | (std::uint32_t(b[1])<<8) | (std::uint32_t(b[2])<<16) | (std::uint32_t(b[3])<<24); }
+std::uint64_t get_le64(std::istream& i) { unsigned char b[8]; i.read(reinterpret_cast<char*>(b),8); if (!i) throw std::runtime_error("pergrep index: truncated"); std::uint64_t x=0; for(unsigned k=0;k<8;++k) x |= std::uint64_t(b[k]) << (8*k); return x; }
+void put_le_i64(std::ostream& o, std::int64_t x) { put_le64(o, static_cast<std::uint64_t>(x)); }
+std::int64_t get_le_i64(std::istream& i) { return static_cast<std::int64_t>(get_le64(i)); }
+void put_le_double(std::ostream& o, double x) { put_le64(o, std::bit_cast<std::uint64_t>(x)); }
+double get_le_double(std::istream& i) { return std::bit_cast<double>(get_le64(i)); }
 // Max sizes to avoid OOM / "string too long" on corrupted input.
-constexpr uint64_t kMaxString = 16 * 1024 * 1024; // 16 MiB per string (path/root)
+constexpr uint64_t kMaxString = 16 * 1024 * 1024;
 constexpr uint64_t kMaxFiles = 10'000'000;
 constexpr uint64_t kMaxChunks = 100'000'000;
 constexpr uint64_t kMaxPosDesc = 100'000'000;
-constexpr uint64_t kMaxVectorElems = 200'000'000; // for gids/bits/pos
-std::string gets(std::istream& i) {
-    auto n = get<uint64_t>(i);
-    if (n > kMaxString) throw std::runtime_error("pergrep index: truncated");
-    std::string s;
-    s.resize(static_cast<size_t>(n));
-    if (n) {
-        i.read(s.data(), static_cast<std::streamsize>(n));
+constexpr uint64_t kMaxVectorElems = 200'000'000;
+// Reader/Writer make the v7 snapshot contract explicit: every scalar has a
+// fixed width and is encoded little-endian. Legacy mode is used only for v5/v6.
+struct Writer {
+    std::ostream& o; bool portable;
+    template<class T> void scalar(T x) {
+        if (!portable) { put_raw(o, x); return; }
+        if constexpr (std::is_same_v<T, std::uint8_t>) put_u8(o, x);
+        else if constexpr (std::is_same_v<T, std::uint16_t>) put_le16(o, x);
+        else if constexpr (std::is_same_v<T, std::uint32_t>) put_le32(o, x);
+        else if constexpr (std::is_same_v<T, std::uint64_t>) put_le64(o, x);
+        else if constexpr (std::is_same_v<T, std::int64_t>) put_le_i64(o, x);
+        else if constexpr (std::is_same_v<T, double>) put_le_double(o, x);
+        else static_assert(std::is_same_v<T, void>, "unsupported index scalar");
+    }
+    void string(std::string_view s) { scalar<std::uint64_t>(s.size()); if (!s.empty()) { o.write(s.data(), static_cast<std::streamsize>(s.size())); if (!o) throw std::runtime_error("index write failed"); } }
+    template<class T> void vector(const std::vector<T>& v) { scalar<std::uint64_t>(v.size()); if (!portable && !v.empty()) { o.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(sizeof(T)*v.size())); if (!o) throw std::runtime_error("index write failed"); } else for (const auto x : v) scalar<T>(x); }
+};
+struct Reader {
+    std::istream& i; bool portable; std::uint64_t stream_size;
+    std::uint64_t remaining() {
+        const auto p = i.tellg();
+        if (p < 0 || static_cast<std::uint64_t>(p) > stream_size)
+            throw std::runtime_error("pergrep index: truncated");
+        return stream_size - static_cast<std::uint64_t>(p);
+    }
+    template<class T> T scalar() {
+        if (!portable) return get_raw<T>(i);
+        if constexpr (std::is_same_v<T, std::uint8_t>) return get_u8(i);
+        else if constexpr (std::is_same_v<T, std::uint16_t>) return get_le16(i);
+        else if constexpr (std::is_same_v<T, std::uint32_t>) return get_le32(i);
+        else if constexpr (std::is_same_v<T, std::uint64_t>) return get_le64(i);
+        else if constexpr (std::is_same_v<T, std::int64_t>) return get_le_i64(i);
+        else if constexpr (std::is_same_v<T, double>) return get_le_double(i);
+        else static_assert(std::is_same_v<T, void>, "unsupported index scalar");
+    }
+    std::string string() {
+        const auto n = scalar<std::uint64_t>();
+        if (n > kMaxString || n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) || n > remaining())
+            throw std::runtime_error("pergrep index: truncated");
+        std::string s(static_cast<size_t>(n), '\0');
+        if (n) { i.read(s.data(), static_cast<std::streamsize>(n)); if (!i) throw std::runtime_error("pergrep index: truncated"); }
+        return s;
+    }
+    template<class T> std::vector<T> vector() {
+        const auto n = scalar<std::uint64_t>();
+        if (n > kMaxVectorElems || n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) throw std::runtime_error("pergrep index: truncated");
+        if (n > 0 && n > UINT64_MAX / sizeof(T)) throw std::runtime_error("pergrep index: truncated");
+        if (n > remaining() / sizeof(T)) throw std::runtime_error("pergrep index: truncated");
+        std::vector<T> v(static_cast<size_t>(n));
+        if (!portable && n) i.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(sizeof(T)*n));
+        else for (auto& x : v) x = scalar<T>();
         if (!i) throw std::runtime_error("pergrep index: truncated");
+        return v;
     }
-    return s;
-}
-template<class T> void putv(std::ostream& o, const std::vector<T>& v) {
-    uint64_t n = v.size();
-    put(o, n);
-    if (n) {
-        o.write(reinterpret_cast<const char*>(v.data()), sizeof(T) * n);
-        if (!o) throw std::runtime_error("index write failed");
+};
+static std::uint64_t hash_file_range(const fs::path& file, std::uint64_t offset, std::uint64_t bytes) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open index for integrity check: " + file.string());
+    in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!in) throw std::runtime_error("pergrep index: truncated");
+    std::uint64_t h = 1469598103934665603ULL;
+    char buf[64 * 1024];
+    while (bytes) {
+        const auto want = static_cast<std::streamsize>(std::min<std::uint64_t>(bytes, sizeof(buf)));
+        in.read(buf, want);
+        if (in.gcount() != want) throw std::runtime_error("pergrep index: truncated");
+        for (std::streamsize k = 0; k < want; ++k) {
+            h ^= static_cast<unsigned char>(buf[k]);
+            h *= 1099511628211ULL;
+        }
+        bytes -= static_cast<std::uint64_t>(want);
     }
-}
-template<class T> std::vector<T> getv(std::istream& i) {
-    auto n = get<uint64_t>(i);
-    if (n > kMaxVectorElems) throw std::runtime_error("pergrep index: truncated");
-    // Guard against overflow in sizeof(T)*n allocation check
-    if (n > 0 && n > (UINT64_MAX / sizeof(T))) throw std::runtime_error("pergrep index: truncated");
-    std::vector<T> v;
-    v.resize(static_cast<size_t>(n));
-    if (n) {
-        i.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(sizeof(T) * n));
-        if (!i) throw std::runtime_error("pergrep index: truncated");
-    }
-    return v;
+    return h;
 }
 inline std::string pid_suffix() {
 #ifdef _WIN32
@@ -697,91 +762,72 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
             std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
             if (!o) throw std::runtime_error("cannot create index: " + tmp.string());
             o.write("PERGREP\0", 8);
-            // QO-5: v5 = filter-only (legacy, re-read corpus on load, O(corpus) I/O).
-            // v6 = filter + persisted corpus bytes (prototype on-disk corpus) so
-            // load can restore I->loaded without touching the filesystem.
-            // Default persist_corpus=false keeps v5 for backward compat and small files;
-            // persist_corpus=true emits v6 and appends raw corpus after pos vector.
-            uint32_t ver = impl_->opt.persist_corpus ? 6 : 5;
-            put(o, ver);
-            // Manifest is a fixed, bounded preamble. It is validated before the
-            // legacy filter sections or v6 corpus payload are read.
-            put(o, kManifestMagic);
-            put(o, *manifest.schema_version);
-            put(o, *manifest.source_identity);
-            puts(o, *manifest.source_root);
-            put(o, *manifest.selector_identity);
+            // v7 is the current portable snapshot format. Every scalar below is
+            // fixed-width little-endian; optional sections are advertised by flags.
+            Writer w{o, true};
+            w.scalar<std::uint32_t>(kPortableIndexVersion);
+            w.scalar<std::uint64_t>(kManifestMagic);
+            w.scalar<std::uint32_t>(*manifest.schema_version);
+            w.scalar<std::uint32_t>((impl_->opt.persist_corpus ? kFeaturePersistedCorpus : 0u) | kFeatureIntegrityChecksum);
+            w.scalar<std::uint64_t>(*manifest.source_identity);
+            w.string(*manifest.source_root);
+            w.scalar<std::uint64_t>(*manifest.selector_identity);
             const auto& mo = *manifest.index_options;
-            put(o, uint64_t(mo.chunk_bytes));
-            put(o, uint64_t(mo.chunk_overlap));
-            put(o, uint64_t(mo.positional_block_bytes));
-            put(o, mo.positional_budget_ratio);
-            put(o, uint64_t(mo.planned_qgrams));
-            put(o, uint8_t(mo.include_hidden ? 1 : 0));
-            put(o, uint8_t(mo.follow_symlinks ? 1 : 0));
-            put(o, uint8_t(mo.persist_corpus ? 1 : 0));
-            put(o, *manifest.transform_identity);
-            put(o, *manifest.corpus_files);
-            put(o, *manifest.corpus_bytes);
-            put(o, *manifest.generation);
-            puts(o, pergrep_cli::platform::path_to_utf8(impl_->root));
-            put(o, uint64_t(impl_->opt.chunk_bytes));
-            put(o, uint64_t(impl_->opt.chunk_overlap));
-            put(o, uint64_t(impl_->opt.positional_block_bytes));
-            put(o, impl_->opt.positional_budget_ratio);
-            put(o, uint64_t(impl_->opt.planned_qgrams));
-            put(o, uint8_t(impl_->opt.include_hidden ? 1 : 0));
-            put(o, uint8_t(impl_->opt.follow_symlinks ? 1 : 0));
-            put(o, uint64_t(impl_->corp_bytes));
-            put(o, int64_t(impl_->root_mtime_ns));
-            o.write(reinterpret_cast<const char*>(impl_->byte_freq.data()), sizeof(impl_->byte_freq));
-            // v5/v6 retain qgram_freq as the legacy hash-bucket occurrence
-            // array. M1.5 planner tables are recomputed on load from corpus
-            // bytes, so these formats remain byte-for-byte compatible.
-            o.write(reinterpret_cast<const char*>(impl_->qgram_freq.data()), sizeof(impl_->qgram_freq));
-            if (!o) throw std::runtime_error("index write failed");
-            put(o, uint32_t(impl_->pos_block));
-            uint64_t nf = impl_->infos.size();
-            put(o, nf);
-            for (auto& f : impl_->infos) {
-                puts(o, f.path);
-                put(o, uint64_t(f.size));
-                put(o, int64_t(f.mtime_ns));
-                put(o, uint8_t(f.binary ? 1 : 0));
+            w.scalar<std::uint64_t>(mo.chunk_bytes);
+            w.scalar<std::uint64_t>(mo.chunk_overlap);
+            w.scalar<std::uint64_t>(mo.positional_block_bytes);
+            w.scalar<double>(mo.positional_budget_ratio);
+            w.scalar<std::uint64_t>(mo.planned_qgrams);
+            w.scalar<std::uint8_t>(mo.include_hidden ? 1 : 0);
+            w.scalar<std::uint8_t>(mo.follow_symlinks ? 1 : 0);
+            w.scalar<std::uint8_t>(mo.persist_corpus ? 1 : 0);
+            w.scalar<std::uint64_t>(*manifest.transform_identity);
+            w.scalar<std::uint64_t>(*manifest.corpus_files);
+            w.scalar<std::uint64_t>(*manifest.corpus_bytes);
+            w.scalar<std::uint64_t>(*manifest.generation);
+            w.string(pergrep_cli::platform::path_to_utf8(impl_->root));
+            w.scalar<std::uint64_t>(impl_->opt.chunk_bytes);
+            w.scalar<std::uint64_t>(impl_->opt.chunk_overlap);
+            w.scalar<std::uint64_t>(impl_->opt.positional_block_bytes);
+            w.scalar<double>(impl_->opt.positional_budget_ratio);
+            w.scalar<std::uint64_t>(impl_->opt.planned_qgrams);
+            w.scalar<std::uint8_t>(impl_->opt.include_hidden ? 1 : 0);
+            w.scalar<std::uint8_t>(impl_->opt.follow_symlinks ? 1 : 0);
+            w.scalar<std::uint64_t>(impl_->corp_bytes);
+            w.scalar<std::int64_t>(impl_->root_mtime_ns);
+            for (const auto x : impl_->byte_freq) w.scalar<std::uint64_t>(x);
+            for (const auto x : impl_->qgram_freq) w.scalar<std::uint32_t>(x);
+            w.scalar<std::uint32_t>(impl_->pos_block);
+            w.scalar<std::uint64_t>(impl_->infos.size());
+            for (const auto& f : impl_->infos) {
+                w.string(f.path);
+                w.scalar<std::uint64_t>(f.size);
+                w.scalar<std::int64_t>(f.mtime_ns);
+                w.scalar<std::uint8_t>(f.binary ? 1 : 0);
             }
-            put(o, uint64_t(impl_->chunks.size()));
-            // Field-by-field, not putv<Chunk>, to avoid padding.
-            for (auto const& c : impl_->chunks) {
-                put(o, uint32_t(c.file_id));
-                put(o, uint64_t(c.core_begin));
-                put(o, uint64_t(c.core_end));
-                put(o, uint64_t(c.ext_end));
+            w.scalar<std::uint64_t>(impl_->chunks.size());
+            for (const auto& c : impl_->chunks) {
+                w.scalar<std::uint32_t>(c.file_id);
+                w.scalar<std::uint64_t>(c.core_begin);
+                w.scalar<std::uint64_t>(c.core_end);
+                w.scalar<std::uint64_t>(c.ext_end);
             }
-            for (auto& g : impl_->groups) {
-                put(o, uint8_t(g.lg));
-                put(o, uint32_t(g.m));
-                put(o, uint32_t(g.words));
-                putv(o, g.gids);
-                putv(o, g.bits);
+            for (const auto& g : impl_->groups) {
+                w.scalar<std::uint8_t>(g.lg);
+                w.scalar<std::uint32_t>(g.m);
+                w.scalar<std::uint32_t>(g.words);
+                w.vector(g.gids);
+                w.vector(g.bits);
             }
-            put(o, uint64_t(impl_->pos_desc.size()));
-            // Field-by-field for PosDesc as well.
-            for (auto const& d : impl_->pos_desc) {
-                put(o, uint64_t(d.off));
-                put(o, uint16_t(d.m));
-                put(o, uint32_t(d.mask_bytes));
-                put(o, uint32_t(d.blocks));
+            w.scalar<std::uint64_t>(impl_->pos_desc.size());
+            for (const auto& d : impl_->pos_desc) {
+                w.scalar<std::uint64_t>(d.off);
+                w.scalar<std::uint16_t>(d.m);
+                w.scalar<std::uint32_t>(d.mask_bytes);
+                w.scalar<std::uint32_t>(d.blocks);
             }
-            putv(o, impl_->pos);
-            // QO-5 prototype on-disk corpus: when persist_corpus is true, also
-            // persist the raw file contents after the filter. This decouples filter
-            // persistence from corpus re-read: load no longer needs O(corpus) I/O.
-            // Documented as prototype — index files become larger by corpus_bytes.
-            if (impl_->opt.persist_corpus) {
-                for (auto& lf : impl_->loaded) {
-                    puts(o, lf.data);
-                }
-            }
+            w.vector(impl_->pos);
+            if (impl_->opt.persist_corpus) for (const auto& lf : impl_->loaded) w.string(lf.data);
             o.flush();
             if (!o) {
                 o.close();
@@ -794,6 +840,16 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
                 throw std::runtime_error("index write failed");
             }
         }
+        std::error_code size_ec;
+        const auto body_end = fs::file_size(tmp, size_ec);
+        if (size_ec || body_end < 12) throw std::runtime_error("index write failed");
+        const auto checksum = hash_file_range(tmp, 12, body_end - 12);
+        std::ofstream tail(tmp, std::ios::binary | std::ios::app);
+        if (!tail) throw std::runtime_error("index write failed");
+        put_le64(tail, checksum);
+        tail.flush();
+        tail.close();
+        if (!tail) throw std::runtime_error("index write failed");
         std::error_code ec;
         fs::rename(tmp, file, ec);
         if (ec) {
@@ -818,49 +874,71 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
 
 Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool manifest_aware) {
     // Truncation guard: check file size is at least header before reading.
+    std::uint64_t snapshot_size = 0;
     {
         std::error_code ec;
         auto sz = fs::file_size(file, ec);
-        if (!ec) {
-            constexpr uint64_t kMinHeader = 8 + 4; // magic + version
-            if (sz < kMinHeader) throw std::runtime_error("pergrep index: truncated");
-        }
+        if (ec) throw std::runtime_error("cannot stat index: " + file.string());
+        snapshot_size = sz;
+        constexpr uint64_t kMinHeader = 8 + 4; // magic + version
+        if (sz < kMinHeader) throw std::runtime_error("pergrep index: truncated");
     }
     std::ifstream i(file, std::ios::binary);
     if (!i) throw std::runtime_error("cannot open index: " + file.string());
     char magic[8];
     i.read(magic, 8);
     if (!i || std::memcmp(magic, "PERGREP\0", 8) != 0) throw std::runtime_error("pergrep index: truncated");
-    auto ver = get<uint32_t>(i);
-    if (ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
+    unsigned char version_bytes[4];
+    i.read(reinterpret_cast<char*>(version_bytes), sizeof(version_bytes));
+    if (!i) throw std::runtime_error("pergrep index: truncated");
+    std::uint32_t raw_ver = 0;
+    std::memcpy(&raw_ver, version_bytes, sizeof(raw_ver));
+    const auto le_ver = static_cast<std::uint32_t>(version_bytes[0]) |
+                        (static_cast<std::uint32_t>(version_bytes[1]) << 8) |
+                        (static_cast<std::uint32_t>(version_bytes[2]) << 16) |
+                        (static_cast<std::uint32_t>(version_bytes[3]) << 24);
+    const bool portable = le_ver == kPortableIndexVersion;
+    const auto ver = portable ? kPortableIndexVersion : raw_ver;
+    if (!portable && ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
+    if (portable && snapshot_size < 12 + 8) throw std::runtime_error("pergrep index: truncated");
+    Reader r{i, portable, snapshot_size};
+    std::uint32_t feature_flags = 0;
+    bool persisted_corpus = ver == 6;
 
     CacheManifest stored;
     bool has_manifest = false;
-    std::uint64_t marker = 0;
-    i.read(reinterpret_cast<char*>(&marker), sizeof marker);
-    if (!i) throw std::runtime_error("pergrep index: truncated");
+    std::uint64_t marker = r.scalar<std::uint64_t>();
+    if (portable && marker != kManifestMagic) throw std::runtime_error("incompatible pergrep index schema: missing manifest");
     if (marker == kManifestMagic) {
         has_manifest = true;
-        stored.schema_version = get<std::uint32_t>(i);
-        if (stored.schema_version != kManifestSchema)
-            throw std::runtime_error("unsupported cache manifest schema");
-        stored.source_identity = get<std::uint64_t>(i);
-        stored.source_root = gets(i);
-        stored.selector_identity = get<std::uint64_t>(i);
+        stored.schema_version = r.scalar<std::uint32_t>();
+        if ((portable && stored.schema_version != kManifestSchema) || (!portable && stored.schema_version != 1))
+            throw std::runtime_error("incompatible pergrep index schema: unsupported manifest schema");
+        if (portable) {
+            feature_flags = r.scalar<std::uint32_t>();
+            if (feature_flags & ~(kFeaturePersistedCorpus | kFeatureIntegrityChecksum)) throw std::runtime_error("incompatible pergrep index schema: unknown feature section");
+            if ((feature_flags & kFeatureIntegrityChecksum) == 0) throw std::runtime_error("incompatible pergrep index schema: missing integrity checksum");
+            persisted_corpus = (feature_flags & kFeaturePersistedCorpus) != 0;
+        }
+        stored.source_identity = r.scalar<std::uint64_t>();
+        stored.source_root = r.string();
+        stored.selector_identity = r.scalar<std::uint64_t>();
         IndexOptions mo;
-        mo.chunk_bytes = get<std::uint64_t>(i);
-        mo.chunk_overlap = get<std::uint64_t>(i);
-        mo.positional_block_bytes = get<std::uint64_t>(i);
-        mo.positional_budget_ratio = get<double>(i);
-        mo.planned_qgrams = get<std::uint64_t>(i);
-        mo.include_hidden = get<std::uint8_t>(i) != 0;
-        mo.follow_symlinks = get<std::uint8_t>(i) != 0;
-        mo.persist_corpus = get<std::uint8_t>(i) != 0;
+        mo.chunk_bytes = r.scalar<std::uint64_t>();
+        mo.chunk_overlap = r.scalar<std::uint64_t>();
+        mo.positional_block_bytes = r.scalar<std::uint64_t>();
+        mo.positional_budget_ratio = r.scalar<double>();
+        mo.planned_qgrams = r.scalar<std::uint64_t>();
+        mo.include_hidden = r.scalar<std::uint8_t>() != 0;
+        mo.follow_symlinks = r.scalar<std::uint8_t>() != 0;
+        mo.persist_corpus = r.scalar<std::uint8_t>() != 0;
+        if (!valid_index_options(mo))
+            throw std::runtime_error("pergrep index: invalid index options");
         stored.index_options = mo;
-        stored.transform_identity = get<std::uint64_t>(i);
-        stored.corpus_files = get<std::uint64_t>(i);
-        stored.corpus_bytes = get<std::uint64_t>(i);
-        stored.generation = get<std::uint64_t>(i);
+        stored.transform_identity = r.scalar<std::uint64_t>();
+        stored.corpus_files = r.scalar<std::uint64_t>();
+        stored.corpus_bytes = r.scalar<std::uint64_t>();
+        stored.generation = r.scalar<std::uint64_t>();
 
         auto mismatch = [&](bool bad, const char* what) {
             if (bad) throw std::runtime_error(std::string("stale cache manifest: ") + what);
@@ -882,12 +960,16 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
 #endif
         // v5 is source-backed, so metadata validation happens while only the
         // manifest is resident. v6 remains loadable after its source disappears.
-        if (ver == 5 && source_identity(root_path, *stored.index_options) != *stored.source_identity)
-            throw std::runtime_error("stale cache manifest: source changed or disappeared");
+        if (!persisted_corpus) {
+            const auto actual_source_identity = source_identity(root_path, *stored.index_options);
+            if (actual_source_identity == 0 || actual_source_identity != *stored.source_identity)
+                throw std::runtime_error("stale cache manifest: source changed or disappeared");
+        }
     } else {
         // Existing v5/v6 files predate the manifest. Keep their documented
         // compatibility for the unqualified API, but never use one to satisfy
         // an explicit manifest-aware request.
+        if (portable) throw std::runtime_error("incompatible pergrep index schema: missing manifest");
         i.seekg(-static_cast<std::streamoff>(sizeof marker), std::ios::cur);
         if (!i) throw std::runtime_error("pergrep index: truncated");
         if (manifest_aware)
@@ -895,48 +977,58 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
     }
 
     auto I = std::make_shared<Impl>();
-    I->opt.persist_corpus = (ver == 6);
+    if (portable) persisted_corpus = (feature_flags & kFeaturePersistedCorpus) != 0;
+    I->opt.persist_corpus = persisted_corpus;
 #ifdef _WIN32
-    auto root_str = gets(i);
+    auto root_str = r.string();
     I->root = fs::path(std::u8string(root_str.begin(), root_str.end()));
 #else
-    I->root = gets(i);
+    I->root = r.string();
 #endif
-    I->opt.chunk_bytes = get<uint64_t>(i);
-    I->opt.chunk_overlap = get<uint64_t>(i);
-    I->opt.positional_block_bytes = get<uint64_t>(i);
-    I->opt.positional_budget_ratio = get<double>(i);
-    I->opt.planned_qgrams = get<uint64_t>(i);
-    I->opt.include_hidden = get<uint8_t>(i) != 0;
-    I->opt.follow_symlinks = get<uint8_t>(i) != 0;
-    I->corp_bytes = get<uint64_t>(i);
-    I->root_mtime_ns = get<int64_t>(i);
+    I->opt.chunk_bytes = r.scalar<std::uint64_t>();
+    I->opt.chunk_overlap = r.scalar<std::uint64_t>();
+    I->opt.positional_block_bytes = r.scalar<std::uint64_t>();
+    I->opt.positional_budget_ratio = r.scalar<double>();
+    I->opt.planned_qgrams = r.scalar<std::uint64_t>();
+    I->opt.include_hidden = r.scalar<std::uint8_t>() != 0;
+    I->opt.follow_symlinks = r.scalar<std::uint8_t>() != 0;
+    I->corp_bytes = r.scalar<std::uint64_t>();
+    I->root_mtime_ns = r.scalar<std::int64_t>();
+    if (!valid_index_options(I->opt))
+        throw std::runtime_error("pergrep index: invalid index options");
     if (has_manifest) {
-        if (!same_options(I->opt, *stored.index_options) || I->opt.persist_corpus != (ver == 6))
+        if (!same_options(I->opt, *stored.index_options) || I->opt.persist_corpus != persisted_corpus)
             throw std::runtime_error("stale cache manifest: index options");
         if (pergrep_cli::platform::path_to_utf8(I->root) != *stored.source_root)
             throw std::runtime_error("stale cache manifest: source root");
         if (I->corp_bytes != *stored.corpus_bytes)
             throw std::runtime_error("stale cache manifest: corpus bytes");
     }
-    i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
-    // qgram_freq is legacy hash-bucket occurrence data; exact planner stats
-    // are rebuilt below after v5/v6 corpus restoration.
-    i.read(reinterpret_cast<char*>(I->qgram_freq.data()), sizeof(I->qgram_freq));
-    if (!i) throw std::runtime_error("pergrep index: truncated");
-    I->pos_block = get<uint32_t>(i);
-    auto nf = get<uint64_t>(i);
+    if (portable) {
+        for (auto& x : I->byte_freq) x = r.scalar<std::uint64_t>();
+        for (auto& x : I->qgram_freq) x = r.scalar<std::uint32_t>();
+    } else {
+        i.read(reinterpret_cast<char*>(I->byte_freq.data()), sizeof(I->byte_freq));
+        i.read(reinterpret_cast<char*>(I->qgram_freq.data()), sizeof(I->qgram_freq));
+        if (!i) throw std::runtime_error("pergrep index: truncated");
+    }
+    I->pos_block = r.scalar<std::uint32_t>();
+    if (I->pos_block != I->opt.positional_block_bytes)
+        throw std::runtime_error("pergrep index: positional block mismatch");
+    auto nf = r.scalar<std::uint64_t>();
     if (nf > kMaxFiles) throw std::runtime_error("pergrep index: truncated");
+    // Each file record needs at least a uint64 length plus fixed metadata.
+    if (nf > r.remaining() / 25) throw std::runtime_error("pergrep index: truncated");
     if (has_manifest && nf != *stored.corpus_files)
         throw std::runtime_error("stale cache manifest: corpus files");
     I->infos.reserve(static_cast<size_t>(nf));
     I->loaded.reserve(static_cast<size_t>(nf));
     for (uint64_t k = 0; k < nf; ++k) {
         FileInfo f;
-        f.path = gets(i);
-        f.size = get<uint64_t>(i);
-        f.mtime_ns = get<int64_t>(i);
-        f.binary = get<uint8_t>(i) != 0;
+        f.path = r.string();
+        f.size = r.scalar<std::uint64_t>();
+        f.mtime_ns = r.scalar<std::int64_t>();
+        f.binary = r.scalar<std::uint8_t>() != 0;
         if (unsafe_file_info_path(f.path))
             throw std::runtime_error("pergrep index: invalid FileInfo path");
         I->infos.push_back(std::move(f));
@@ -951,28 +1043,30 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         throw std::runtime_error("pergrep index: invalid corpus totals");
     if (has_manifest && info_total != *stored.corpus_bytes)
         throw std::runtime_error("stale cache manifest: corpus bytes");
-    if (ver == 6 && I->corp_bytes > kMaxV6PayloadBytes)
+    if (persisted_corpus && I->corp_bytes > kMaxV6PayloadBytes)
         throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
-    auto nc = get<uint64_t>(i);
+    auto nc = r.scalar<std::uint64_t>();
     if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
+    // Each chunk record is four fixed-width fields. Check before reserve.
+    if (nc > r.remaining() / 28) throw std::runtime_error("pergrep index: truncated");
     I->chunks.reserve(static_cast<size_t>(nc));
     for (uint64_t k = 0; k < nc; ++k) {
         Chunk c;
-        c.file_id = get<uint32_t>(i);
-        c.core_begin = get<uint64_t>(i);
-        c.core_end = get<uint64_t>(i);
-        c.ext_end = get<uint64_t>(i);
+        c.file_id = r.scalar<std::uint32_t>();
+        c.core_begin = r.scalar<std::uint64_t>();
+        c.core_end = r.scalar<std::uint64_t>();
+        c.ext_end = r.scalar<std::uint64_t>();
         if (c.file_id >= nf || c.core_begin > c.core_end || c.core_end > c.ext_end ||
             c.ext_end > I->infos[c.file_id].size)
             throw std::runtime_error("pergrep index: invalid chunk geometry");
         I->chunks.push_back(c);
     }
     for (auto& g : I->groups) {
-        g.lg = get<uint8_t>(i);
-        g.m = get<uint32_t>(i);
-        g.words = get<uint32_t>(i);
-        g.gids = getv<uint32_t>(i);
-        g.bits = getv<uint64_t>(i);
+        g.lg = r.scalar<std::uint8_t>();
+        g.m = r.scalar<std::uint32_t>();
+        g.words = r.scalar<std::uint32_t>();
+        g.gids = r.vector<std::uint32_t>();
+        g.bits = r.vector<std::uint64_t>();
         if (g.lg < 9 || g.lg > 16 || g.m != (1u << g.lg) ||
             g.words != (g.gids.size() + 63) / 64 ||
             static_cast<std::uint64_t>(g.words) > UINT64_MAX / (1u << g.lg) ||
@@ -981,18 +1075,19 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         for (auto gid : g.gids)
             if (gid >= nc) throw std::runtime_error("pergrep index: invalid qgram group reference");
     }
-    auto npd = get<uint64_t>(i);
+    auto npd = r.scalar<std::uint64_t>();
     if (npd != nc || npd > kMaxPosDesc) throw std::runtime_error("pergrep index: invalid positional descriptors");
+    if (npd > r.remaining() / 18) throw std::runtime_error("pergrep index: invalid positional descriptors");
     I->pos_desc.reserve(static_cast<size_t>(npd));
     for (uint64_t k = 0; k < npd; ++k) {
         detail::PosDesc d;
-        d.off = get<uint64_t>(i);
-        d.m = get<uint16_t>(i);
-        d.mask_bytes = get<uint32_t>(i);
-        d.blocks = get<uint32_t>(i);
+        d.off = r.scalar<std::uint64_t>();
+        d.m = r.scalar<std::uint16_t>();
+        d.mask_bytes = r.scalar<std::uint32_t>();
+        d.blocks = r.scalar<std::uint32_t>();
         I->pos_desc.push_back(d);
     }
-    I->pos = getv<uint8_t>(i);
+    I->pos = r.vector<std::uint8_t>();
     std::uint64_t pos_end = 0;
     for (const auto& d : I->pos_desc) {
         if (d.m < 64 || d.m > 1024 || (d.m & (d.m - 1)) != 0 || d.blocks == 0 ||
@@ -1009,15 +1104,25 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
     // prototype cost — suitable for stable trees, large corpora pay re-read.
     // v6 (persist_corpus==true): persisted corpus bytes follow the filter;
     // restore I->loaded directly from the index without touching the filesystem.
-    if (ver == 6) {
+    auto verify_integrity = [&] {
+        if (!portable) return;
+        const auto checksum_pos = i.tellg();
+        if (checksum_pos < 0 || static_cast<std::uint64_t>(checksum_pos) != snapshot_size - 8)
+            throw std::runtime_error("pergrep index: invalid checksum trailer");
+        const auto expected_checksum = r.scalar<std::uint64_t>();
+        if (expected_checksum != hash_file_range(file, 12, snapshot_size - 20))
+            throw std::runtime_error("pergrep index: checksum mismatch");
+    };
+    if (persisted_corpus) {
         std::uint64_t payload_total = 0;
         for (size_t k = 0; k < I->infos.size(); ++k) {
-            auto n = get<uint64_t>(i);
+            auto n = r.scalar<std::uint64_t>();
             if (n > kMaxV6PayloadBytes - payload_total)
                 throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
             if (n != I->infos[k].size || n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
                 n > UINT64_MAX - payload_total)
                 throw std::runtime_error("pergrep index: invalid corpus payload");
+            if (n > r.remaining()) throw std::runtime_error("pergrep index: invalid corpus payload");
             payload_total += n;
             std::string data;
             data.resize(static_cast<size_t>(n));
@@ -1029,7 +1134,9 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         }
         if (payload_total != I->corp_bytes || (has_manifest && payload_total != *stored.corpus_bytes))
             throw std::runtime_error("pergrep index: invalid corpus payload totals");
+        verify_integrity();
     } else {
+        verify_integrity();
         for (auto& f : I->infos) {
 #ifdef _WIN32
             std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
@@ -1043,7 +1150,7 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
             I->loaded.push_back({f, std::move(data)});
         }
     }
-    // v5/v6 do not contain planner statistics. Recompute them from the loaded
+    // Legacy v5/v6 and portable v7 do not contain planner statistics. Recompute them from the loaded
     // corpus rather than interpreting legacy qgram_freq bytes as exact stats.
     rebuild_planner_stats(*I);
     return Index(I);

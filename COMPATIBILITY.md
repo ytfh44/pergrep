@@ -52,3 +52,10 @@ Runtime search code does not invoke or link:
 ## Compatibility provenance
 
 Flag names and precedence rules were checked against ripgrep 15.2.0's public flag definitions and public integration tests. The default file-type table is adapted from ripgrep and is covered by its MIT license; see `THIRD_PARTY_NOTICES.md`.
+## Persistent index format
+
+New snapshots use portable format v7 with the eight-byte `PERGREP\0` magic, fixed-width fields, and explicit little-endian encoding for every scalar and vector element. The v7 header stores manifest magic, schema 2, and a feature bitset; bit 0 advertises the optional persisted-corpus section. Unknown feature bits and unsupported schemas fail with an incompatible-schema error before payload loading.
+
+The v7 payload is field-by-field: UTF-8 byte strings carry a fixed-width uint64 length, booleans are uint8 values, signed timestamps are int64 values, floating-point fields use their IEEE-754 uint64 bit pattern, and arrays/vectors are length-prefixed and element-encoded. No compiler padding or host byte order is part of v7.
+
+`Index::load()` keeps read compatibility with pre-manifest v5 source-backed and v6 persisted-corpus snapshots. New writes use v7 only. Migration is read-old/write-new: load the legacy snapshot, then save it to produce v7; legacy files are never rewritten in place. The CLI cache key includes the v7/schema-2 format identity so legacy and portable snapshots cannot collide.
