@@ -238,14 +238,16 @@ Binary Layout:
   if (ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
   ```
 
-#### 3. Vector Length Bounding & OOM Prevention
-Corrupted index headers may report astronomical element counts (e.g. $2^{64}-1$). `pergrep` enforces hard upper bounds before allocating vectors:
+#### 3. Manifest-First Cache Validation
+New v5/v6 files contain a bounded MANIFEST preamble after the magic and format version. It records schema version, source identity/root, selector and transform identities, index options, corpus totals, and generation. Index::load(file, expected_manifest) validates these fields and v5 source metadata before reading filter vectors or source-backed corpus bytes; the unqualified overload keeps legacy unmanifested v5/v6 compatibility.
+
+#### 4. Vector Length Bounding & OOM Prevention
+pergrep enforces hard upper bounds before allocating vectors and validates serialized references and geometry: nf <= kMaxFiles, nc <= kMaxChunks, npd == nc, q-gram group dimensions and IDs, chunk file IDs/ranges, positional descriptor dimensions/offsets, and v6 payload lengths against FileInfo and corpus totals. Invalid data terminates with std::runtime_error rather than reaching search-time pointer arithmetic.
 - **Max File Count**: `nf <= 1,000,000` (`kMaxFiles`).
 - **Max Chunk Count**: `nc <= 10,000,000` (`kMaxChunks`).
 - **Max Positional Descriptors**: `npd <= 10,000,000` (`kMaxPosDesc`).
-- **Max Corpus Size per File (v6)**: `n <= 512 MiB` (`kMaxCorpusPerFile`). Prevents memory exhaustion attacks where a corrupted size field forces `std::string::resize` to allocate gigabytes of memory.
 
-#### 4. Stream State & Truncation Detection
+#### 5. Stream State & Truncation Detection
 - Prior to reading, the file size is verified against the minimum header size ($8 + 4 = 12$ bytes).
 - Every deserialization primitive (`get<T>`, `getv<T>`, `gets`, `i.read`) checks the `std::ifstream` state.
 - If EOF is reached unexpectedly or stream failbit/badbit is set during any field read, loading terminates with:

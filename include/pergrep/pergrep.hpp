@@ -85,6 +85,21 @@ struct FileInfo {
     bool binary = false;
 };
 
+// Cache metadata is deliberately kept separate from the index payload. A
+// caller may provide only the fields that define its cache request; unset
+// fields are populated on save and treated as wildcards on load.
+struct CacheManifest {
+    std::optional<std::uint32_t> schema_version;
+    std::optional<std::uint64_t> source_identity;
+    std::optional<std::string> source_root;
+    std::optional<std::uint64_t> selector_identity;
+    std::optional<IndexOptions> index_options;
+    std::optional<std::uint64_t> transform_identity;
+    std::optional<std::uint64_t> corpus_files;
+    std::optional<std::uint64_t> corpus_bytes;
+    std::optional<std::uint64_t> generation;
+};
+
 struct Document {
     std::string path;
     std::string content;
@@ -96,7 +111,9 @@ public:
     static Index build(const std::filesystem::path& root, IndexOptions options = {});
     static Index from_documents(std::vector<Document> documents, IndexOptions options = {});
     static Index load(const std::filesystem::path& file);
+    static Index load(const std::filesystem::path& file, const CacheManifest& expected);
     void save(const std::filesystem::path& file) const;
+    void save(const std::filesystem::path& file, const CacheManifest& manifest) const;
 
     const std::filesystem::path& root() const noexcept;
     const IndexOptions& options() const noexcept;
