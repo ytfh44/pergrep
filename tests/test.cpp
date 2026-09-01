@@ -3884,7 +3884,6 @@ int main(){
     assert_regex_fallback("foo.*bar", {.case_mode = CaseMode::Insensitive}, "unbounded-repeat");
   }
   // M3.1 manifest-first cache validation.
-  std::cerr << "DIAG-M31-START\n" << std::flush;
   {
     const auto base = std::filesystem::temp_directory_path() / "pergrep_m31_manifest";
     const auto root = base / "corpus";
@@ -3966,7 +3965,6 @@ int main(){
   }
 
   // Post-M3.1 cache hardening regressions.
-  std::cerr << "DIAG-M31-DONE\n" << std::flush;
   {
     namespace fs = std::filesystem;
     const auto base = fs::temp_directory_path() / "pergrep_m31_hardening";
@@ -4001,7 +3999,6 @@ int main(){
     manifest.transform_identity = 5678;
     manifest.generation = 42;
     const auto manifest_cache = base / "zero-manifest.pgi";
-    std::cerr << "DIAG-PATH-DONE\n" << std::flush;
     manifest_index.save(manifest_cache, manifest);
     for (int field = 0; field != 7; ++field) {
       CacheManifest expected = manifest;
@@ -4024,7 +4021,6 @@ int main(){
 
     // A pre-manifest v5 snapshot remains loadable through the legacy API only.
     const auto qualified = base / "qualified-v5.pgi";
-    std::cerr << "DIAG-ZERO-DONE\n" << std::flush;
     manifest_index.save(qualified);
     std::ifstream in(qualified, std::ios::binary);
     std::string bytes((std::istreambuf_iterator<char>(in)), {});
@@ -4055,15 +4051,12 @@ int main(){
     catch (const std::runtime_error& e) {
       explicit_legacy_rejected = std::string(e.what()).find("cache manifest missing") != std::string::npos;
     }
-    std::cerr << "DIAG-LEGACY-DONE\n" << std::flush;
     assert(explicit_legacy_rejected);
-    std::cerr << "DIAG-LEGACY-ASSERT-DONE\n" << std::flush;
 
     // Persisted snapshots reject oversized payloads before writing or allocating.
     IndexOptions snapshot_options;
     snapshot_options.persist_corpus = true;
     auto oversized = Index::build(root, snapshot_options);
-    std::cerr << "DIAG-OVER-BUILD-DONE\n" << std::flush;
     auto* oversized_raw = const_cast<pergrep::detail::IndexData*>(
         static_cast<const pergrep::detail::IndexData*>(oversized.debug_index_data()));
     assert(oversized_raw);
@@ -4074,12 +4067,13 @@ int main(){
       oversized_rejected = std::string(e.what()).find("v6 corpus payload exceeds 1 GiB limit") != std::string::npos;
     }
     assert(oversized_rejected);
-    std::cerr << "DIAG-OVER-ASSERT-DONE\n" << std::flush;
 
     // v7 corruption is rejected deterministically before any oversized allocation.
     {
       std::ifstream in(manifest_cache, std::ios::binary);
-      std::string v7((std::istreambuf_iterator<char>(in)), {});
+      std::string original_v7((std::istreambuf_iterator<char>(in)), {});
+      in.close();
+      std::string v7 = original_v7;
       auto u64le = [&](std::size_t at) { std::uint64_t x = 0;
         for (unsigned k = 0; k != 8; ++k) x |= std::uint64_t(static_cast<unsigned char>(v7[at + k])) << (8 * k);
         return x;
@@ -4090,7 +4084,7 @@ int main(){
       std::size_t at = 12;
       at += 8 + 4 + 4 + 8; // marker, schema, feature flags, source identity
       const auto source_root_len = u64le(at); at += 8 + static_cast<std::size_t>(source_root_len);
-      at += 8 + 8 * 5 + sizeof(double) + 3 + 8 * 4; // selector, options, transform/totals/generation
+      at += 8 * 5 + sizeof(double) + 3 + 8 * 4; // selector, options, transform/totals/generation
       const auto serialized_root_len = u64le(at); at += 8 + static_cast<std::size_t>(serialized_root_len);
       at += 8 * 5 + 2 + 8 + 8; // index options, corpus bytes, root mtime
       at += 256 * 8 + 65536 * 4; // planner arrays
@@ -4104,8 +4098,7 @@ int main(){
       catch (const std::runtime_error& e) { count_rejected = std::string(e.what()).find("truncated") != std::string::npos; }
       assert(count_rejected);
 
-      in.clear(); in.close(); in.open(manifest_cache, std::ios::binary);
-      v7.assign(std::istreambuf_iterator<char>(in), {});
+      v7 = original_v7;
       v7[pos_block_at] = 0; v7[pos_block_at + 1] = 0; v7[pos_block_at + 2] = 0; v7[pos_block_at + 3] = 0;
       const auto pos_cache = base / "corrupt-pos-block.pgi";
       { std::ofstream out(pos_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
@@ -4114,7 +4107,7 @@ int main(){
       catch (const std::runtime_error& e) { pos_rejected = std::string(e.what()).find("positional block mismatch") != std::string::npos; }
       assert(pos_rejected);
 
-      in.clear(); in.close(); in.open(manifest_cache, std::ios::binary);
+      v7 = original_v7;
       assert(v7.size() > 20);
       v7[v7.size() - 9] ^= 1; // final positional-filter byte, before checksum trailer
       const auto filter_cache = base / "corrupt-filter.pgi";
@@ -4126,8 +4119,6 @@ int main(){
     }
 
     fs::remove_all(base);
-    std::cerr << "DIAG-OVER-DONE\n" << std::flush;
   }
-  std::cerr << "DIAG-POST-DONE\n" << std::flush;
   return 0;
 }
