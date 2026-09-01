@@ -4104,7 +4104,7 @@ int main(){
       catch (const std::runtime_error& e) { count_rejected = std::string(e.what()).find("truncated") != std::string::npos; }
       assert(count_rejected);
 
-      in.close(); in.open(manifest_cache, std::ios::binary);
+      in.clear(); in.close(); in.open(manifest_cache, std::ios::binary);
       v7.assign(std::istreambuf_iterator<char>(in), {});
       v7[pos_block_at] = 0; v7[pos_block_at + 1] = 0; v7[pos_block_at + 2] = 0; v7[pos_block_at + 3] = 0;
       const auto pos_cache = base / "corrupt-pos-block.pgi";
@@ -4114,8 +4114,7 @@ int main(){
       catch (const std::runtime_error& e) { pos_rejected = std::string(e.what()).find("positional block mismatch") != std::string::npos; }
       assert(pos_rejected);
 
-      in.close(); in.open(manifest_cache, std::ios::binary);
-      v7.assign(std::istreambuf_iterator<char>(in), {});
+      in.clear(); in.close(); in.open(manifest_cache, std::ios::binary);
       assert(v7.size() > 20);
       v7[v7.size() - 9] ^= 1; // final positional-filter byte, before checksum trailer
       const auto filter_cache = base / "corrupt-filter.pgi";
