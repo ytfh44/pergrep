@@ -55,6 +55,24 @@ static bool looks_binary(std::string_view s){auto n=std::min<size_t>(s.size(),81
 // calibration data, while legacy filter arrays remain available at any scale.
 inline constexpr std::uint64_t kPlannerCorpusCap = 128ULL * 1024 * 1024;
 inline constexpr std::size_t kPlannerDistinctQgramCap = 1ULL << 20;
+inline constexpr std::uint64_t kMaxV6PayloadBytes = 1ULL << 30; // 1 GiB per snapshot
+
+static bool unsafe_file_info_path(std::string_view path) noexcept {
+    if (path.empty()) return false;
+    if (path.front() == '/' || path.front() == '\\' ||
+        (path.size() >= 2 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':'))
+        return true;
+    std::size_t begin = 0;
+    while (begin < path.size()) {
+        const auto end = path.find_first_of("/\\", begin);
+        const auto component = path.substr(begin, end == std::string_view::npos ? end : end - begin);
+        if (component == "..") return true;
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
 static void rebuild_planner_stats(detail::IndexData& I) {
     I.exact_qgrams.clear();
     I.hash_chunk_freq.fill(0);
@@ -637,13 +655,26 @@ void Index::save(const fs::path& file) const {
 void Index::save(const fs::path& file, const CacheManifest& requested) const {
     if (!impl_) throw std::runtime_error("cannot persist an uninitialized pergrep index");
     if (impl_->ephemeral) throw std::runtime_error("cannot persist an in-memory pergrep index");
+    if (impl_->opt.persist_corpus) {
+        if (impl_->corp_bytes > kMaxV6PayloadBytes)
+            throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
+        if (impl_->loaded.size() != impl_->infos.size())
+            throw std::runtime_error("invalid v6 corpus payload");
+        std::uint64_t payload_total = 0;
+        for (std::size_t k = 0; k < impl_->infos.size(); ++k) {
+            const auto bytes = static_cast<std::uint64_t>(impl_->loaded[k].data.size());
+            if (bytes > kMaxV6PayloadBytes - payload_total)
+                throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
+            payload_total += bytes;
+        }
+    }
     CacheManifest manifest = requested;
-    if (manifest.schema_version && *manifest.schema_version != kManifestSchema)
+    if (manifest.schema_version.has_value() && *manifest.schema_version != kManifestSchema)
         throw std::runtime_error("unsupported cache manifest schema");
     manifest.schema_version = manifest.schema_version.value_or(kManifestSchema);
-    if (manifest.index_options && !same_options(*manifest.index_options, impl_->opt))
+    if (manifest.index_options.has_value() && !same_options(*manifest.index_options, impl_->opt))
         throw std::runtime_error("cache manifest index options do not match index");
-    if (manifest.selector_identity && *manifest.selector_identity == 0)
+    if (manifest.selector_identity.has_value() && *manifest.selector_identity == 0)
         manifest.selector_identity = 0;
     manifest.source_root = manifest.source_root.value_or(pergrep_cli::platform::path_to_utf8(impl_->root));
     manifest.source_identity = manifest.source_identity.value_or(source_identity(impl_->root, impl_->opt));
@@ -778,10 +809,14 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
     }
 }
 Index Index::load(const fs::path& file) {
-    return load(file, CacheManifest{});
+    return load_impl(file, CacheManifest{}, false);
 }
 
 Index Index::load(const fs::path& file, const CacheManifest& expected) {
+    return load_impl(file, expected, true);
+}
+
+Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool manifest_aware) {
     // Truncation guard: check file size is at least header before reading.
     {
         std::error_code ec;
@@ -830,15 +865,15 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
         auto mismatch = [&](bool bad, const char* what) {
             if (bad) throw std::runtime_error(std::string("stale cache manifest: ") + what);
         };
-        mismatch(expected.schema_version && *expected.schema_version != *stored.schema_version, "schema");
-        if (expected.source_identity) mismatch(*expected.source_identity != *stored.source_identity, "source identity");
-        if (expected.source_root) mismatch(*expected.source_root != *stored.source_root, "source root");
-        if (expected.selector_identity) mismatch(*expected.selector_identity != *stored.selector_identity, "selector");
-        if (expected.index_options) mismatch(!same_options(*expected.index_options, *stored.index_options), "index options");
-        if (expected.transform_identity) mismatch(*expected.transform_identity != *stored.transform_identity, "transform");
-        if (expected.corpus_files) mismatch(*expected.corpus_files != *stored.corpus_files, "corpus files");
-        if (expected.corpus_bytes) mismatch(*expected.corpus_bytes != *stored.corpus_bytes, "corpus bytes");
-        if (expected.generation) mismatch(*expected.generation != *stored.generation, "generation");
+        mismatch(expected.schema_version.has_value() && *expected.schema_version != *stored.schema_version, "schema");
+        if (expected.source_identity.has_value()) mismatch(*expected.source_identity != *stored.source_identity, "source identity");
+        if (expected.source_root.has_value()) mismatch(*expected.source_root != *stored.source_root, "source root");
+        if (expected.selector_identity.has_value()) mismatch(*expected.selector_identity != *stored.selector_identity, "selector");
+        if (expected.index_options.has_value()) mismatch(!same_options(*expected.index_options, *stored.index_options), "index options");
+        if (expected.transform_identity.has_value()) mismatch(*expected.transform_identity != *stored.transform_identity, "transform");
+        if (expected.corpus_files.has_value()) mismatch(*expected.corpus_files != *stored.corpus_files, "corpus files");
+        if (expected.corpus_bytes.has_value()) mismatch(*expected.corpus_bytes != *stored.corpus_bytes, "corpus bytes");
+        if (expected.generation.has_value()) mismatch(*expected.generation != *stored.generation, "generation");
 
 #ifdef _WIN32
         auto root_path = fs::path(std::u8string(stored.source_root->begin(), stored.source_root->end()));
@@ -855,9 +890,7 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
         // an explicit manifest-aware request.
         i.seekg(-static_cast<std::streamoff>(sizeof marker), std::ios::cur);
         if (!i) throw std::runtime_error("pergrep index: truncated");
-        if (expected.schema_version || expected.source_identity || expected.source_root || expected.selector_identity ||
-            expected.index_options || expected.transform_identity || expected.corpus_files ||
-            expected.corpus_bytes || expected.generation)
+        if (manifest_aware)
             throw std::runtime_error("cache manifest missing");
     }
 
@@ -904,6 +937,8 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
         f.size = get<uint64_t>(i);
         f.mtime_ns = get<int64_t>(i);
         f.binary = get<uint8_t>(i) != 0;
+        if (unsafe_file_info_path(f.path))
+            throw std::runtime_error("pergrep index: invalid FileInfo path");
         I->infos.push_back(std::move(f));
     }
     std::uint64_t info_total = 0;
@@ -916,6 +951,8 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
         throw std::runtime_error("pergrep index: invalid corpus totals");
     if (has_manifest && info_total != *stored.corpus_bytes)
         throw std::runtime_error("stale cache manifest: corpus bytes");
+    if (ver == 6 && I->corp_bytes > kMaxV6PayloadBytes)
+        throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
     auto nc = get<uint64_t>(i);
     if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
     I->chunks.reserve(static_cast<size_t>(nc));
@@ -976,6 +1013,8 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
         std::uint64_t payload_total = 0;
         for (size_t k = 0; k < I->infos.size(); ++k) {
             auto n = get<uint64_t>(i);
+            if (n > kMaxV6PayloadBytes - payload_total)
+                throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
             if (n != I->infos[k].size || n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
                 n > UINT64_MAX - payload_total)
                 throw std::runtime_error("pergrep index: invalid corpus payload");

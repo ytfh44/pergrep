@@ -3949,5 +3949,108 @@ int main(){
     std::filesystem::remove_all(base);
   }
 
+  // Post-M3.1 cache hardening regressions.
+  {
+    namespace fs = std::filesystem;
+    const auto base = fs::temp_directory_path() / "pergrep_m31_hardening";
+    const auto root = base / "corpus";
+    fs::remove_all(base);
+    fs::create_directories(root);
+    { std::ofstream f(root / "a.txt", std::ios::binary); f << "legacy compatibility payload\n"; }
+
+    // FileInfo paths are metadata, not an escape hatch into arbitrary files.
+    auto path_index = Index::build(root);
+    auto* path_raw = const_cast<pergrep::detail::IndexData*>(
+        static_cast<const pergrep::detail::IndexData*>(path_index.debug_index_data()));
+    assert(path_raw && path_raw->infos.size() == 1);
+    for (const std::string& bad_path : {std::string("../outside.txt"),
+                                       (root / "outside.txt").string(),
+                                       std::string("..\\outside.txt")}) {
+      path_raw->infos[0].path = bad_path;
+      const auto cache = base / ("unsafe-" + std::to_string(bad_path.size()) + ".pgi");
+      path_index.save(cache);
+      bool rejected = false;
+      try { (void)Index::load(cache); }
+      catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("invalid FileInfo path") != std::string::npos;
+      }
+      assert(rejected);
+    }
+
+    // Explicit zero manifest values are comparisons, not wildcard values.
+    auto manifest_index = Index::build(root);
+    CacheManifest manifest;
+    manifest.selector_identity = 1234;
+    manifest.transform_identity = 5678;
+    manifest.generation = 42;
+    const auto manifest_cache = base / "zero-manifest.pgi";
+    manifest_index.save(manifest_cache, manifest);
+    for (int field = 0; field != 7; ++field) {
+      CacheManifest expected = manifest;
+      switch (field) {
+        case 0: expected.schema_version = 0; break;
+        case 1: expected.source_identity = 0; break;
+        case 2: expected.source_root = std::string{}; break;
+        case 3: expected.selector_identity = 0; break;
+        case 4: expected.transform_identity = 0; break;
+        case 5: expected.corpus_files = 0; break;
+        case 6: expected.corpus_bytes = 0; break;
+      }
+      bool rejected = false;
+      try { (void)Index::load(manifest_cache, expected); }
+      catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("stale cache manifest") != std::string::npos;
+      }
+      assert(rejected);
+    }
+
+    // A pre-manifest v5 snapshot remains loadable through the legacy API only.
+    const auto qualified = base / "qualified-v5.pgi";
+    manifest_index.save(qualified);
+    std::ifstream in(qualified, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    in.close();
+    auto read_u64 = [&](std::size_t at) { std::uint64_t value = 0;
+      std::memcpy(&value, bytes.data() + at, sizeof(value)); return value; };
+    std::size_t manifest_end = 12;
+    assert(read_u64(manifest_end) == 0x4d414e4946455354ULL);
+    manifest_end += 8; // manifest marker
+    manifest_end += 4; // schema
+    manifest_end += 8; // source identity
+    const auto root_len = read_u64(manifest_end);
+    manifest_end += 8 + static_cast<std::size_t>(root_len);
+    manifest_end += 8; // selector identity
+    manifest_end += 8 * 3 + sizeof(double) + 8 + 3 + 8 * 4;
+    assert(manifest_end < bytes.size());
+    std::string legacy_bytes = bytes;
+    legacy_bytes.erase(12, manifest_end - 12);
+    const auto legacy_cache = base / "legacy-v5.pgi";
+    { std::ofstream out(legacy_cache, std::ios::binary); out.write(legacy_bytes.data(), static_cast<std::streamsize>(legacy_bytes.size())); }
+    auto legacy_loaded = Index::load(legacy_cache);
+    assert(legacy_loaded.content(0) == "legacy compatibility payload\n");
+    bool explicit_legacy_rejected = false;
+    try { (void)Index::load(legacy_cache, CacheManifest{}); }
+    catch (const std::runtime_error& e) {
+      explicit_legacy_rejected = std::string(e.what()).find("cache manifest missing") != std::string::npos;
+    }
+    assert(explicit_legacy_rejected);
+
+    // Persisted snapshots reject oversized payloads before writing or allocating.
+    IndexOptions snapshot_options;
+    snapshot_options.persist_corpus = true;
+    auto oversized = Index::build(root, snapshot_options);
+    auto* oversized_raw = const_cast<pergrep::detail::IndexData*>(
+        static_cast<const pergrep::detail::IndexData*>(oversized.debug_index_data()));
+    assert(oversized_raw);
+    oversized_raw->corp_bytes = (std::uint64_t{1} << 30) + 1;
+    bool oversized_rejected = false;
+    try { oversized.save(base / "oversized.pgi"); }
+    catch (const std::runtime_error& e) {
+      oversized_rejected = std::string(e.what()).find("v6 corpus payload exceeds 1 GiB limit") != std::string::npos;
+    }
+    assert(oversized_rejected);
+
+    fs::remove_all(base);
+  }
   return 0;
 }
