@@ -26,6 +26,9 @@ struct Result {
     bool ok = true;
     std::string stage;
     SearchStats stats{};
+    std::string observed;
+    std::string expected;
+    std::string error;
 };
 
 std::string esc(std::string_view s) {
@@ -92,7 +95,18 @@ bool same(const std::vector<Match>& a, const std::vector<Match>& b) {
     }
     return true;
 }
-
+std::string format_matches(const std::vector<Match>& matches) {
+    std::ostringstream out;
+    out << "count=" << matches.size();
+    for (const auto& match : matches) {
+        out << " [" << match.file_id << ":" << match.start << "-" << match.end
+            << ",captures=" << match.captures.size();
+        for (const auto& capture : match.captures)
+            out << " " << capture.start << "-" << capture.end;
+        out << "]";
+    }
+    return out.str();
+}
 bool ascii_upper(unsigned char c) { return c >= 'A' && c <= 'Z'; }
 bool ascii_word(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
 bool digits(std::string_view s, std::size_t begin, std::size_t count) {
@@ -164,7 +178,7 @@ std::vector<Match> reference_matches(const Case& c) {
                     }
                 } else if (kind == 1 && s.substr(at, 3) == "pre") {
                     for (std::size_t n = 1; n <= 3; ++n)
-                        if (s.substr(at + 3, n) == std::string(n, 'a') && s[at + 3 + n] == 'b' &&
+                        if (at + 4 + n + 4 <= s.size() && s.substr(at + 3, n) == std::string(n, 'a') && s[at + 3 + n] == 'b' &&
                             s.substr(at + 4 + n, 4) == "post") {
                             end = at + 4 + n + 4;
                             break;
@@ -195,8 +209,8 @@ std::vector<Match> reference_matches(const Case& c) {
                         }
                 } else if (kind == 6 && s.substr(at, 3) == "foo" && at >= 3 && s.substr(at - 3, 3) == "pre" && s.substr(at + 3, 3) == "bar") {
                     end = at + 3;
-                } else if (kind == 7 && s.substr(at, 6) == "needle") {
-                    end = at + 6;
+                } else if (kind == 7 && s.substr(at, 3) == "bad") {
+                    // The negative lookahead rejects the exact candidate prefix.
                 } else if (kind == 8 && (s.substr(at, 2) == "\xc3\xa9" || s.substr(at, 6) == "\xe4\xb8\x96\xe7\x95\x8c")) {
                     const std::size_t prefix = s.substr(at, 2) == "\xc3\xa9" ? 2 : 6;
                     for (std::size_t n = 2; n >= 1; --n)
@@ -237,6 +251,8 @@ Bounds record_bounds(std::string_view s, std::size_t at, unsigned char sep, bool
     if (crlf && sep == '\n' && e > begin && s[e - 1] == '\r') --e;
     return {begin, e};
 }
+// Third leg of the check: invoke the production bounded-region executor.
+// reference_matches is the independent byte-level oracle and does not share this path.
 std::vector<Match> bounded_region_reference(std::string_view source, const Pattern& p, const Case& c, const Match& m) {
     auto q = detail::parse_regex(p.expression(), p.options());
     const auto b = record_bounds(source, m.start, c.so.record_separator, p.options().crlf);
@@ -263,6 +279,9 @@ void report(const Case& c, const Result& r) {
               << " positional_block_bytes=" << c.io.positional_block_bytes << '\n'
               << "stats=" << stat_text(r.stats) << '\n';
     for (const auto& d : c.docs) std::cerr << "document path=" << esc(d.path) << " content=" << esc(d.content) << '\n';
+    if (!r.observed.empty()) std::cerr << "observed=" << r.observed << '\n';
+    if (!r.expected.empty()) std::cerr << "expected=" << r.expected << '\n';
+    if (!r.error.empty()) std::cerr << "error=" << r.error << '\n';
 }
 std::string noise(std::mt19937& r, std::size_t n) {
     static constexpr std::string_view alphabet = "xyz0123 _-";
@@ -283,7 +302,7 @@ Case make_case(std::uint32_t seed) {
     case 4: c.expr = R"([A-Z]{1,3}foo)"; body += "ABCfoo ABCDbar"; break;
     case 5: c.expr = R"(^foo[0-9]{1,3}bar$)"; c.po.multiline = true; c.po.line = true; c.po.crlf = variant % 2; body.push_back('\n'); body += "foo12bar"; body += c.po.crlf ? "\r\n" : "\n"; body += "foo1234bar"; c.bounded = true; break;
     case 6: c.expr = R"((?<=pre)foo(?=bar))"; c.po.engine = Engine::Pcre2Compat; body += "prefoobar prefooxbar"; break;
-    case 7: c.expr = R"((?!bad)needle)"; c.po.engine = Engine::Pcre2Compat; body += "needle badneedle"; break;
+    case 7: c.expr = R"((?!bad)bad)"; c.po.engine = Engine::Pcre2Compat; body += "bad good bad"; break;
     case 8: c.expr = R"((é|世界)[A-Z]{1,2})"; body += "éAB éaB 世界CD 世界cD"; break;
     case 9: c.expr = R"(\bfoo[0-9]{1,3}bar\b)"; c.po.word = true; body += " foo12bar xfoo12bar foo1234bar "; c.bounded = true; break;
     case 10: c.expr = R"(aba)"; c.so.overlapping = true; body += "ababa xabx"; break;
@@ -305,11 +324,18 @@ Result check(const Case& c, bool direct) {
         const auto want = reference_matches(c);
         if (!same(got, want)) {
             result.ok = false; result.stage = "indexed-vs-independent-reference";
+            result.observed = format_matches(got);
+            result.expected = format_matches(want);
             return result;
         }
         if (direct && c.bounded) for (const auto& match : want) {
             const auto region = bounded_region_reference(c.docs[match.file_id].content, pattern, c, match);
-            if (!same(region, {match})) { result.ok = false; result.stage = "region-vs-independent-reference"; return result; }
+            if (!same(region, {match})) {
+                result.ok = false; result.stage = "region-vs-independent-reference";
+                result.observed = format_matches(region);
+                result.expected = format_matches({match});
+                return result;
+            }
         }
         const unsigned kind = c.seed % 14;
         if (kind == 6 || kind == 7) {
@@ -317,14 +343,17 @@ Result check(const Case& c, bool direct) {
                 result.ok = false; result.stage = "lookaround-fallback-not-observable"; return result;
             }
         }
-    } catch (...) { result.ok = false; result.stage = "compile-or-execution-error"; }
+    } catch (const std::exception& e) { result.ok = false; result.stage = "compile-or-execution-error"; result.error = e.what(); }
+    catch (...) { result.ok = false; result.stage = "compile-or-execution-error"; result.error = "unknown exception"; }
     return result;
 }
 
-Case minimize_case(Case c) {
-    const auto fails = [](const Case& candidate) {
+Case minimize_case(Case c, std::string_view target_stage) {
+    const auto fails = [target_stage](const Case& candidate) {
         const auto result = check(candidate, true);
-        return !result.ok || (candidate.bounded && result.stats.physical_operator != "RegexBoundedRegion");
+        if (target_stage == "bounded-region-operator-not-selected")
+            return candidate.bounded && result.stats.physical_operator != "RegexBoundedRegion";
+        return !result.ok && result.stage == target_stage;
     };
     for (std::size_t di = 0; di < c.docs.size(); ++di) {
         for (std::size_t width = c.docs[di].content.size() / 2; width; width /= 2) {
@@ -351,7 +380,8 @@ int main() {
         auto c = make_case(seed);
         const auto result = check(c, true);
         if (!result.ok || (c.bounded && result.stats.physical_operator != "RegexBoundedRegion")) {
-            auto minimized = minimize_case(c);
+            const auto target_stage = result.ok ? std::string_view("bounded-region-operator-not-selected") : std::string_view(result.stage);
+            auto minimized = minimize_case(c, target_stage);
             auto minimized_result = check(minimized, true);
             if (minimized.bounded && minimized_result.stats.physical_operator != "RegexBoundedRegion") {
                 minimized_result.ok = false;
