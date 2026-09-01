@@ -4057,11 +4057,13 @@ int main(){
     }
     std::cerr << "DIAG-LEGACY-DONE\n" << std::flush;
     assert(explicit_legacy_rejected);
+    std::cerr << "DIAG-LEGACY-ASSERT-DONE\n" << std::flush;
 
     // Persisted snapshots reject oversized payloads before writing or allocating.
     IndexOptions snapshot_options;
     snapshot_options.persist_corpus = true;
     auto oversized = Index::build(root, snapshot_options);
+    std::cerr << "DIAG-OVER-BUILD-DONE\n" << std::flush;
     auto* oversized_raw = const_cast<pergrep::detail::IndexData*>(
         static_cast<const pergrep::detail::IndexData*>(oversized.debug_index_data()));
     assert(oversized_raw);
@@ -4072,6 +4074,7 @@ int main(){
       oversized_rejected = std::string(e.what()).find("v6 corpus payload exceeds 1 GiB limit") != std::string::npos;
     }
     assert(oversized_rejected);
+    std::cerr << "DIAG-OVER-ASSERT-DONE\n" << std::flush;
 
     // v7 corruption is rejected deterministically before any oversized allocation.
     {
