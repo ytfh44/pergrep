@@ -10,8 +10,13 @@
 #include <type_traits>
 #ifdef _WIN32
 #include <process.h>
+#define NOMINMAX
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 namespace pergrep::detail {
 std::uint8_t lg_for(std::size_t n){std::size_t want=std::clamp<std::size_t>(n*2,512,65536);std::uint8_t lg=9;for(std::size_t b=512;b<want&&lg<16;b<<=1)++lg;return lg;}
@@ -43,6 +48,136 @@ QueryDesc compile_qgram_query(std::string_view q, std::span<const std::uint32_t>
     }
     (void)q;
     return d;
+}
+}
+
+namespace pergrep::detail {
+static std::int64_t provider_mtime_ns(const std::filesystem::path& path) noexcept {
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) return 0;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+std::shared_ptr<const CorpusProvider> CorpusProvider::resident(std::string data) {
+    auto p = std::shared_ptr<CorpusProvider>(new CorpusProvider());
+    p->resident_ = std::move(data);
+    p->data_ = p->resident_.data();
+    p->size_ = p->resident_.size();
+    return p;
+}
+
+std::shared_ptr<const CorpusProvider> CorpusProvider::mapped(const std::filesystem::path& path,
+                                                              std::uint64_t expected_size,
+                                                              std::int64_t expected_mtime_ns) {
+    std::error_code ec;
+    const auto actual_size = std::filesystem::file_size(path, ec);
+    if (ec || actual_size != expected_size)
+        throw std::runtime_error("indexed source changed or disappeared: " + path.string());
+    if (expected_mtime_ns != 0 && provider_mtime_ns(path) != expected_mtime_ns)
+        throw std::runtime_error("indexed source changed: " + path.string());
+    auto p = std::shared_ptr<CorpusProvider>(new CorpusProvider());
+    if (expected_size == 0) return p;
+    if (expected_size > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("indexed source is too large for this platform");
+#ifdef _WIN32
+    const std::wstring wpath = path.wstring();
+    HANDLE file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER li{};
+        if (GetFileSizeEx(file, &li) && li.QuadPart >= 0 && static_cast<std::uint64_t>(li.QuadPart) == expected_size) {
+            const DWORD high = static_cast<DWORD>(expected_size >> 32);
+            const DWORD low = static_cast<DWORD>(expected_size & 0xffffffffu);
+            // Windows keeps source files with active section objects undeletable even
+            // when the original handle grants FILE_SHARE_DELETE. Populate a private
+            // pagefile-backed section, then release the source handle; the exposed
+            // bytes remain immutable and demand-paged without pinning the source path.
+            HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, high, low, nullptr);
+            if (mapping) {
+                auto* writable = static_cast<char*>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0));
+                bool copied = writable != nullptr;
+                std::uint64_t offset = 0;
+                while (copied && offset < expected_size) {
+                    const DWORD want = static_cast<DWORD>(std::min<std::uint64_t>(expected_size - offset, 1u << 20));
+                    DWORD got = 0;
+                    copied = ReadFile(file, writable + offset, want, &got, nullptr) && got == want;
+                    offset += got;
+                }
+                char extra = 0;
+                DWORD extra_bytes = 0;
+                copied = copied && ReadFile(file, &extra, 1, &extra_bytes, nullptr) && extra_bytes == 0;
+                LARGE_INTEGER final_size{};
+                copied = copied && GetFileSizeEx(file, &final_size) && final_size.QuadPart >= 0 &&
+                    static_cast<std::uint64_t>(final_size.QuadPart) == expected_size;
+                if (writable) UnmapViewOfFile(writable);
+                if (copied) {
+                    auto* data = static_cast<const char*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+                    if (data) {
+                        CloseHandle(file);
+                        p->mapping_ = mapping; p->data_ = data;
+                        p->size_ = static_cast<std::size_t>(expected_size); return p;
+                    }
+                }
+                CloseHandle(mapping);
+            }
+        }
+        CloseHandle(file);
+    }
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        struct stat st{};
+        if (fstat(fd, &st) == 0 && static_cast<std::uint64_t>(st.st_size) == expected_size &&
+            (expected_mtime_ns == 0 || static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000LL + st.st_mtim.tv_nsec == expected_mtime_ns)) {
+            // A file-backed mapping can SIGBUS after a concurrent truncation. Copy
+            // through an anonymous mapping, then revoke write access before exposing
+            // it; the provider remains immutable and independent of the source inode.
+            void* data = mmap(nullptr, static_cast<std::size_t>(expected_size), PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            bool copied = data != MAP_FAILED;
+            std::uint64_t offset = 0;
+            while (copied && offset < expected_size) {
+                const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(expected_size - offset, 1u << 20));
+                const auto got = ::pread(fd, static_cast<char*>(data) + offset, want, static_cast<off_t>(offset));
+                copied = got == static_cast<ssize_t>(want);
+                offset += got > 0 ? static_cast<std::uint64_t>(got) : 0;
+            }
+            char extra = 0;
+            copied = copied && ::pread(fd, &extra, 1, static_cast<off_t>(expected_size)) == 0;
+            struct stat final_st{};
+            copied = copied && fstat(fd, &final_st) == 0 && static_cast<std::uint64_t>(final_st.st_size) == expected_size &&
+                (expected_mtime_ns == 0 || static_cast<std::int64_t>(final_st.st_mtim.tv_sec) * 1'000'000'000LL + final_st.st_mtim.tv_nsec == expected_mtime_ns);
+            if (copied && mprotect(data, static_cast<std::size_t>(expected_size), PROT_READ) == 0) {
+                p->fd_ = fd; p->mapped_ = true; p->data_ = static_cast<const char*>(data);
+                p->size_ = static_cast<std::size_t>(expected_size); return p;
+            }
+            if (data != MAP_FAILED) munmap(data, static_cast<std::size_t>(expected_size));
+        }
+        close(fd);
+    }
+#endif
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("indexed source disappeared: " + path.string());
+        std::string data;
+        data.resize(static_cast<std::size_t>(expected_size));
+        if (expected_size) in.read(data.data(), static_cast<std::streamsize>(expected_size));
+        if (!in || in.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("indexed source changed: " + path.string());
+        p->resident_ = std::move(data); p->data_ = p->resident_.data(); p->size_ = p->resident_.size();
+        return p;
+    }
+}
+
+CorpusProvider::~CorpusProvider() {
+#ifdef _WIN32
+    if (data_ && mapping_) UnmapViewOfFile(data_);
+    if (mapping_) CloseHandle(static_cast<HANDLE>(mapping_));
+    if (file_) CloseHandle(static_cast<HANDLE>(file_));
+#else
+    if (mapped_ && data_ && size_) munmap(const_cast<char*>(data_), size_);
+    if (fd_ >= 0) close(fd_);
+#endif
 }
 }
 
@@ -86,7 +221,7 @@ static void rebuild_planner_stats(detail::IndexData& I) {
     I.planner_stats_ready = false;
     if (I.corp_bytes > kPlannerCorpusCap) return;
     for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
-        const auto& data = I.loaded[fid].data;
+        const auto& data = I.loaded[fid].view();
         std::unordered_set<std::uint32_t> document_grams;
         if (data.size() >= 4) {
             document_grams.reserve(std::min<std::size_t>(
@@ -119,10 +254,10 @@ static void rebuild_planner_stats(detail::IndexData& I) {
         // values beyond the restored corpus. Do not let transient planner
         // recomputation turn such a load into an exception.
         if (c.file_id >= I.loaded.size()) continue;
-        const auto data_size = static_cast<std::uint64_t>(I.loaded[c.file_id].data.size());
+        const auto data_size = static_cast<std::uint64_t>(I.loaded[c.file_id].view().size());
         if (c.core_begin > data_size || c.ext_end < c.core_begin || c.ext_end > data_size)
             continue;
-        const auto view = std::string_view(I.loaded[c.file_id].data).substr(
+        const auto view = std::string_view(I.loaded[c.file_id].view()).substr(
             c.core_begin, c.ext_end - c.core_begin);
         std::unordered_set<std::uint32_t> exact_in_chunk;
         std::unordered_set<std::uint16_t> hash_in_chunk;
@@ -227,12 +362,12 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
             }
         }
         I->infos.push_back(fi);
-        I->loaded.push_back({fi, std::move(s)});
+        I->loaded.push_back({fi, detail::CorpusProvider::resident(std::move(s))});
     }
 
     uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
     for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
-        uint64_t n = I->loaded[fid].data.size();
+        uint64_t n = I->loaded[fid].view().size();
         if (n == 0) {
             I->chunks.push_back({fid, 0, 0, 0});
             continue;
@@ -260,7 +395,7 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         auto& g = I->groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
         uint32_t li = local[g.lg - 9]++;
         g.gids.push_back(ci);
-        auto v = std::string_view(I->loaded[c.file_id].data).substr(c.core_begin, c.ext_end - c.core_begin);
+        auto v = std::string_view(I->loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
         uint32_t mask = g.m - 1;
         if (v.size() >= 4) {
             for (size_t j = 0; j + 4 <= v.size(); ++j) {
@@ -301,7 +436,7 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
     }
     I->pos.assign(pos_total, 0);
     for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].data);
+        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].view());
         for (uint32_t bi = 0; bi < d.blocks; ++bi) {
             uint64_t rb = uint64_t(bi) * I->pos_block;
             uint64_t chunk_len = z.ext_end - z.core_begin;
@@ -312,6 +447,21 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
             for (uint64_t j = 0; j + 4 <= re - rb; ++j) {
                 uint32_t row = detail::hash4(base + j) & (d.m - 1);
                 I->pos[d.off + size_t(row) * d.mask_bytes + (bi >> 3)] |= uint8_t(1u << (bi & 7));
+            }
+        }
+    }
+    if (!opt.persist_corpus) {
+        for (auto& lf : I->loaded) {
+#ifdef _WIN32
+            const auto source_path = I->root / fs::path(std::u8string(lf.info.path.begin(), lf.info.path.end()));
+#else
+            const auto source_path = I->root / lf.info.path;
+#endif
+            try {
+                lf.provider = detail::CorpusProvider::mapped(source_path, lf.info.size, lf.info.mtime_ns);
+            } catch (const std::exception&) {
+                // The resident bytes collected during indexing are a safe fallback
+                // when the source disappears between scan and provider attachment.
             }
         }
     }
@@ -352,12 +502,12 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
             }
         }
         I->infos.push_back(fi);
-        I->loaded.push_back({fi, std::move(d.content)});
+        I->loaded.push_back({fi, detail::CorpusProvider::resident(std::move(d.content))});
     }
 
     uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
     for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
-        uint64_t n = I->loaded[fid].data.size();
+        uint64_t n = I->loaded[fid].view().size();
         if (n == 0) {
             I->chunks.push_back({fid, 0, 0, 0});
             continue;
@@ -385,7 +535,7 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
         auto& g = I->groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
         uint32_t li = local[g.lg - 9]++;
         g.gids.push_back(ci);
-        auto v = std::string_view(I->loaded[c.file_id].data).substr(c.core_begin, c.ext_end - c.core_begin);
+        auto v = std::string_view(I->loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
         uint32_t mask = g.m - 1;
         if (v.size() >= 4) {
             for (size_t j = 0; j + 4 <= v.size(); ++j) {
@@ -414,7 +564,7 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
     }
     I->pos.assign(pos_total, 0);
     for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].data);
+        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].view());
         for (uint32_t bi = 0; bi < d.blocks; ++bi) {
             uint64_t rb = uint64_t(bi) * I->pos_block;
             uint64_t chunk_len = z.ext_end - z.core_begin;
@@ -444,7 +594,7 @@ std::span<const FileInfo> Index::files() const noexcept {
 }
 std::string_view Index::content(std::size_t file_id) const {
     if (!impl_ || file_id >= impl_->loaded.size()) throw std::out_of_range("pergrep: file_id out of range");
-    return impl_->loaded[file_id].data;
+    return impl_->loaded[file_id].view();
 }
 uint64_t Index::corpus_bytes() const noexcept {
     return impl_ ? impl_->corp_bytes : 0;
@@ -737,7 +887,7 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
             throw std::runtime_error("invalid v6 corpus payload");
         std::uint64_t payload_total = 0;
         for (std::size_t k = 0; k < impl_->infos.size(); ++k) {
-            const auto bytes = static_cast<std::uint64_t>(impl_->loaded[k].data.size());
+            const auto bytes = static_cast<std::uint64_t>(impl_->loaded[k].view().size());
             if (bytes > kMaxCorpusBytes - std::min(payload_total, kMaxCorpusBytes))
                 throw std::runtime_error("index corpus exceeds 1 GiB limit");
             payload_total += bytes;
@@ -837,7 +987,7 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
                 w.scalar<std::uint32_t>(d.blocks);
             }
             w.vector(impl_->pos);
-            if (impl_->opt.persist_corpus) for (const auto& lf : impl_->loaded) w.string(lf.data);
+            if (impl_->opt.persist_corpus) for (const auto& lf : impl_->loaded) w.string(lf.view());
             o.flush();
             if (!o) {
                 o.close();
@@ -1151,10 +1301,9 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         pos_end += static_cast<std::uint64_t>(d.m) * d.mask_bytes;
     }
     if (pos_end != I->pos.size()) throw std::runtime_error("pergrep index: invalid positional data");
-    // QO-5: decouple filter persistence from corpus re-read.
-    // v5 (persist_corpus==false): legacy path re-reads every source file via
-    // std::ifstream (O(corpus) I/O) to repopulate I->loaded. Documented as
-    // prototype cost — suitable for stable trees, large corpora pay re-read.
+    // QO-5/M3.5: decouple filter persistence from corpus materialization.
+    // Source-backed snapshots attach immutable provider handles backed by read-only
+    // mappings; a provider transparently falls back to a resident read when mapping fails.
     // v6 (persist_corpus==true): persisted corpus bytes follow the filter;
     // restore I->loaded directly from the index without touching the filesystem.
     // v7 integrity was checked before any sections were deserialized.
@@ -1183,7 +1332,7 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
                 i.read(data.data(), static_cast<std::streamsize>(n));
                 if (!i) throw std::runtime_error("pergrep index: truncated");
             }
-            I->loaded.push_back({I->infos[k], std::move(data)});
+            I->loaded.push_back({I->infos[k], detail::CorpusProvider::resident(std::move(data))});
         }
         if (payload_total != I->corp_bytes || (has_manifest && payload_total != *stored.corpus_bytes))
             throw std::runtime_error("pergrep index: invalid corpus payload totals");
@@ -1192,16 +1341,11 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         (void)0; // checksum already verified before allocation
         for (auto& f : I->infos) {
 #ifdef _WIN32
-            std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
+            const auto source_path = I->root / fs::path(std::u8string(f.path.begin(), f.path.end()));
 #else
-            std::ifstream src(I->root / f.path, std::ios::binary);
+            const auto source_path = I->root / f.path;
 #endif
-            if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
-            std::string data(static_cast<size_t>(f.size), '\0');
-            if (f.size) src.read(data.data(), static_cast<std::streamsize>(f.size));
-            if (!src || src.peek() != std::char_traits<char>::eof())
-                throw std::runtime_error("indexed source changed or disappeared: " + f.path);
-            I->loaded.push_back({f, std::move(data)});
+            I->loaded.push_back({f, detail::CorpusProvider::mapped(source_path, f.size, f.mtime_ns)});
         }
     }
     if (portable) {

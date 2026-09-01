@@ -19,6 +19,7 @@
 #endif
 using namespace pergrep;
 using namespace pergrep::benchmark;
+namespace fs = std::filesystem;
 static Index corpus(std::string s){ return Index::from_documents({{"a.txt",std::move(s)}}); }
 static bool throws_compile(std::string p, PatternOptions o={}){try{(void)Pattern::compile(std::move(p),o);return false;}catch(...){return true;}}
 static std::vector<Match> full_reference(const Index& index, const Pattern& pattern, const SearchOptions& options){
@@ -88,6 +89,39 @@ int main(){
     Searcher s(idx); auto p=Pattern::compile("alpha",{.kind=PatternKind::Fixed});
     auto m=s.find(p); assert(m.size()==2 && m[0].file_id==0 && m[1].file_id==1);
     auto r=Pattern::compile("b.ta"); auto rm=s.find(r); assert(rm.size()==2);
+  }
+  // M3.5: mapped corpus lifetime, deletion semantics, bounds, and resident parity.
+  {
+    const auto base = fs::temp_directory_path() / "pergrep_m35_provider";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    {
+      std::ofstream out(root / "mapped.txt", std::ios::binary);
+      out << "mapped alpha\n";
+    }
+    auto mapped = Index::build(root);
+    assert(mapped.content(0) == "mapped alpha\n");
+    const auto borrowed = mapped.content(0);
+    auto owner = mapped;
+    mapped = Index{};
+    assert(borrowed == "mapped alpha\n");
+    {
+      std::ofstream replace(root / "mapped.txt", std::ios::binary | std::ios::trunc);
+      replace << "changed in place\n";
+    }
+    assert(owner.content(0) == "mapped alpha\n");
+    std::error_code remove_ec;
+    const bool removed = fs::remove(root / "mapped.txt", remove_ec);
+    assert(removed && !remove_ec);
+    assert(owner.content(0) == "mapped alpha\n");
+    bool bounds = false;
+    try { (void)owner.content(1); } catch (const std::out_of_range&) { bounds = true; }
+    assert(bounds);
+    auto resident = Index::from_documents({{"mapped.txt", "mapped alpha\n"}});
+    auto pattern = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+    assert(Searcher(owner).find(pattern).size() == Searcher(resident).find(pattern).size());
+    fs::remove_all(base);
   }
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
@@ -3943,7 +3977,7 @@ int main(){
       // A v6 payload length must match FileInfo and corpus totals.
       auto* snapshot_raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(snapshot.debug_index_data()));
       assert(snapshot_raw != nullptr && !snapshot_raw->loaded.empty());
-      snapshot_raw->loaded[0].data.push_back('x');
+      snapshot_raw->loaded[0].provider = detail::CorpusProvider::resident(std::string(snapshot_raw->loaded[0].view()) + "x");
       const auto corrupt_cache = base / "snapshot-corrupt-payload.pgi";
       snapshot.save(corrupt_cache, snapshot_manifest);
       bool payload_rejected = false;

@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
+#include <filesystem>
 
 namespace pergrep::detail {
 
@@ -54,7 +55,36 @@ struct Chunk {
     std::uint64_t core_end = 0;
     std::uint64_t ext_end = 0;
 };
-struct LoadedFile { FileInfo info; std::string data; };
+class CorpusProvider {
+public:
+    static std::shared_ptr<const CorpusProvider> resident(std::string data);
+    static std::shared_ptr<const CorpusProvider> mapped(const std::filesystem::path& path, std::uint64_t expected_size, std::int64_t expected_mtime_ns);
+    ~CorpusProvider();
+    CorpusProvider(const CorpusProvider&) = delete;
+    CorpusProvider& operator=(const CorpusProvider&) = delete;
+    std::string_view view() const noexcept { return {data_, size_}; }
+    std::size_t size() const noexcept { return size_; }
+private:
+    CorpusProvider() = default;
+    std::string resident_;
+    const char* data_ = nullptr;
+    std::size_t size_ = 0;
+#ifndef _WIN32
+    bool mapped_ = false;
+#endif
+#ifdef _WIN32
+    void* file_ = nullptr;
+    void* mapping_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
+struct LoadedFile {
+    FileInfo info;
+    std::shared_ptr<const CorpusProvider> provider;
+    std::string_view view() const noexcept { return provider ? provider->view() : std::string_view{}; }
+    std::size_t size() const noexcept { return provider ? provider->size() : 0; }
+};
 
 struct UnicodeProperty {
     enum class Kind : std::uint8_t { GeneralCategory, GeneralGroup, Script, Binary, Alphabetic, WhiteSpace, Word, DecimalDigit, AsciiDigit, AsciiWord, AsciiSpace };

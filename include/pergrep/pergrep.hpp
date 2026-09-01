@@ -76,7 +76,8 @@ struct IndexOptions {
     // On-disk snapshots are always emitted as v7 by Index::save. This option
     // selects whether v7 includes its optional persisted-corpus section. When
     // false (default), save persists filter structures and file metadata; load
-    // re-reads each source file. When true, save also persists raw corpus bytes
+    // re-attaches each source file through a read-only mmap provider (with a
+    // resident fallback). When true, save also persists raw corpus bytes
     // and load restores content without touching the filesystem. Legacy v5/v6
     // files remain readable as host-representation compatibility formats only.
     bool persist_corpus = false;
@@ -126,6 +127,8 @@ public:
     std::uint64_t index_bytes() const noexcept;
     bool is_snapshot() const noexcept;
     bool fresh() const;
+    // The returned view is borrowed from this Index and remains valid while this Index
+    // (or a copy sharing its storage) is alive; callers must not retain it after destruction.
     std::string_view content(std::size_t file_id) const;
     // QO-4 test hook: expose underlying IndexData for cost-model unit tests.
     // Returns nullptr if index is empty. Stable for the lifetime of the Index.

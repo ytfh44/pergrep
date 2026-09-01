@@ -750,7 +750,7 @@ static std::uint64_t scoped_extended_bytes(
     std::uint64_t n = 0;
     for (const auto& c : I.chunks) {
         if (c.file_id >= I.loaded.size()) continue;
-        const auto size = static_cast<std::uint64_t>(I.loaded[c.file_id].data.size());
+        const auto size = static_cast<std::uint64_t>(I.loaded[c.file_id].view().size());
         if (c.core_begin > size || c.ext_end < c.core_begin || c.ext_end > size) continue;
         if (scope.empty() || scope_contains(scope, c.file_id))
             n += c.ext_end - c.core_begin;
@@ -1748,6 +1748,7 @@ Searcher::Searcher(std::shared_ptr<const Index> i) : owned_(std::move(i)), index
 Searcher::Searcher(const Index& i) : index_(&i) {}
 
 std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchStats* stats) const {
+
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
@@ -1785,6 +1786,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     // conservative hash-bucket bounds are never used to reject candidates.
     PlanKey plan_key = make_plan_key(p, opt, I.opt, 0);
     auto qc = estimateCost(plan_key, I);
+
     if (stats && p.is_fixed()) {
         const auto q = std::string_view(p.impl_->expr);
         const auto selected = planned_hashes(I, q);
@@ -1867,7 +1869,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             if (stop_requested()) goto done;
             if (!accounting.allows(fid)) continue;
             if (!opt.include_binary && I.infos[fid].binary) continue;
-            const auto& data = I.loaded[fid].data;
+            const auto& data = I.loaded[fid].view();
             accounting.touch(fid, 0, data.size());
             std::size_t b = 0;
             while (b < data.size() || (b == 0 && data.empty())) {
@@ -1940,7 +1942,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             for (auto fid : files) {
                 if (stop_requested()) goto done;
                 if (!opt.include_binary && I.infos[fid].binary) continue;
-                const auto& data = I.loaded[fid].data;
+                const auto& data = I.loaded[fid].view();
                 accounting.touch(fid, 0, data.size());
                 size_t pos = 0;
                 size_t max_pos = data.size() + (q.empty() ? 1 : 0);
@@ -2013,7 +2015,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 auto z = I.chunks[ci];
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
                 if (done_chunks.insert(ci).second) {
-                    auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin, z.ext_end - z.core_begin);
+                    auto v = I.loaded[z.file_id].view().substr(z.core_begin, z.ext_end - z.core_begin);
                     accounting.touch(z.file_id, z.core_begin, z.ext_end);
                     size_t pos = 0;
                     const auto core = z.core_end - z.core_begin;
@@ -2025,7 +2027,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         uint64_t abs = z.core_begin + x, abs_end = z.core_begin + local_end;
                         bool ok = true;
                         if (p.impl_->opt.word) {
-                            auto& s = I.loaded[z.file_id].data;
+                            const auto s = I.loaded[z.file_id].view();
                             if (p.impl_->opt.unicode) {
                                 auto l = decode_prev(s, abs), r = decode_rune(s, abs_end);
                                 if (l.ok && unicode_word_cp(l.cp)) ok = false;
@@ -2037,7 +2039,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                             }
                         }
                         if (p.impl_->opt.line) {
-                            auto& s = I.loaded[z.file_id].data;
+                            const auto s = I.loaded[z.file_id].view();
                             unsigned char sep = opt.record_separator;
                             if (abs > 0 && static_cast<unsigned char>(s[abs - 1]) != sep) ok = false;
                             if (abs_end < s.size() && static_cast<unsigned char>(s[abs_end]) != sep &&
@@ -2089,7 +2091,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                     continue;
                 uint32_t core = std::min<uint32_t>(I.pos_block, (z.core_end - z.core_begin) - rb);
                 uint32_t re = std::min<uint32_t>(z.ext_end - z.core_begin, rb + I.pos_block + 64);
-                auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin + rb, re - rb);
+                auto v = I.loaded[z.file_id].view().substr(z.core_begin + rb, re - rb);
                 size_t pos = 0;
                 const auto max_start = static_cast<size_t>(core) + (q.empty() ? 1 : 0);
                 accounting.touch(z.file_id, z.core_begin + rb, z.core_begin + re);
@@ -2134,7 +2136,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             for (auto ci : cv) {
                 auto z = I.chunks[ci];
                 if (!opt.include_binary && I.infos[z.file_id].binary) continue;
-                auto v = std::string_view(I.loaded[z.file_id].data).substr(z.core_begin, z.ext_end - z.core_begin);
+                auto v = I.loaded[z.file_id].view().substr(z.core_begin, z.ext_end - z.core_begin);
                 accounting.touch(z.file_id, z.core_begin, z.ext_end);
                 size_t pos = 0;
                 while (pos < z.core_end - z.core_begin) {
@@ -2263,7 +2265,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
             for (auto fid : bounded_files) {
                 if (stop_requested()) goto done;
                 if (!opt.include_binary && I.infos[fid].binary) continue;
-                const auto& data = I.loaded[fid].data;
+                const auto& data = I.loaded[fid].view();
                 const auto remain = [&]() {
                     return first_hit_objective ? std::size_t{1} :
                         (opt.max_matches ? opt.max_matches - out.size() : 0);
@@ -2386,7 +2388,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         for (auto fid : files) {
             if (stop_requested()) goto done;
             if (!opt.include_binary && I.infos[fid].binary) continue;
-            auto const& data = I.loaded[fid].data;
+            auto const& data = I.loaded[fid].view();
             if (!lit.empty() && lit.size() < 4 && p.impl_->opt.case_mode == CaseMode::Sensitive &&
                 data.find(lit) == std::string::npos) continue;
             accounting.touch(fid, 0, data.size());
