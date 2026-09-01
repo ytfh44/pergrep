@@ -2179,7 +2179,7 @@ int main(){
         std::string msg = e.what();
         threw = true;
         // Must be truncated or read failed, not string too long / bad_alloc
-        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos);
+        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos || msg.find("checksum mismatch") != std::string::npos);
         assert(msg.find("string too long") == std::string::npos);
       }
       assert(threw);
@@ -2194,7 +2194,7 @@ int main(){
       } catch (const std::runtime_error& e) {
         std::string msg = e.what();
         threw = true;
-        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos);
+        assert(msg.find("truncated") != std::string::npos || msg.find("read failed") != std::string::npos || msg.find("checksum mismatch") != std::string::npos);
       } catch (...) { threw = true; }
       assert(threw);
       // Corrupt nf to huge value — test that huge allocation is bounded, not OOM
@@ -3992,6 +3992,7 @@ int main(){
       assert(rejected);
     }
 
+
     // Explicit zero manifest values are comparisons, not wildcard values.
     auto manifest_index = Index::build(root);
     CacheManifest manifest;
@@ -4019,6 +4020,7 @@ int main(){
       assert(rejected);
     }
 
+
     // A pre-manifest v5 snapshot remains loadable through the legacy API only.
     const auto qualified = base / "qualified-v5.pgi";
     manifest_index.save(qualified);
@@ -4036,10 +4038,12 @@ int main(){
     const auto root_len = read_u64(manifest_end);
     manifest_end += 8 + static_cast<std::size_t>(root_len);
     manifest_end += 8; // selector identity
-    manifest_end += 8 * 3 + sizeof(double) + 8 + 3 + 8 * 4;
+    manifest_end += 8 * 5 + 3 + 8 * 4;
     assert(manifest_end < bytes.size());
     std::string legacy_bytes = bytes;
     legacy_bytes.erase(12, manifest_end - 12);
+    assert(legacy_bytes.size() >= 8);
+    legacy_bytes.resize(legacy_bytes.size() - 8); // remove the v7 checksum trailer from the legacy fixture
     const std::uint32_t legacy_version = 5;
     std::memcpy(legacy_bytes.data() + 8, &legacy_version, sizeof(legacy_version));
     const auto legacy_cache = base / "legacy-v5.pgi";
@@ -4053,6 +4057,7 @@ int main(){
     }
     assert(explicit_legacy_rejected);
 
+
     // Persisted snapshots reject oversized payloads before writing or allocating.
     IndexOptions snapshot_options;
     snapshot_options.persist_corpus = true;
@@ -4064,7 +4069,7 @@ int main(){
     bool oversized_rejected = false;
     try { oversized.save(base / "oversized.pgi"); }
     catch (const std::runtime_error& e) {
-      oversized_rejected = std::string(e.what()).find("v6 corpus payload exceeds 1 GiB limit") != std::string::npos;
+      oversized_rejected = std::string(e.what()).find("index corpus exceeds 1 GiB limit") != std::string::npos;
     }
     assert(oversized_rejected);
 
@@ -4095,7 +4100,7 @@ int main(){
       { std::ofstream out(count_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
       bool count_rejected = false;
       try { (void)Index::load(count_cache); }
-      catch (const std::runtime_error& e) { count_rejected = std::string(e.what()).find("truncated") != std::string::npos; }
+      catch (const std::runtime_error& e) { count_rejected = std::string(e.what()).find("truncated") != std::string::npos || std::string(e.what()).find("checksum mismatch") != std::string::npos; }
       assert(count_rejected);
 
       v7 = original_v7;
@@ -4104,7 +4109,7 @@ int main(){
       { std::ofstream out(pos_cache, std::ios::binary); out.write(v7.data(), static_cast<std::streamsize>(v7.size())); }
       bool pos_rejected = false;
       try { (void)Index::load(pos_cache); }
-      catch (const std::runtime_error& e) { pos_rejected = std::string(e.what()).find("positional block mismatch") != std::string::npos; }
+      catch (const std::runtime_error& e) { pos_rejected = std::string(e.what()).find("positional block mismatch") != std::string::npos || std::string(e.what()).find("checksum mismatch") != std::string::npos; }
       assert(pos_rejected);
 
       v7 = original_v7;
@@ -4118,6 +4123,74 @@ int main(){
       assert(filter_rejected);
     }
 
+    fs::remove_all(base);
+  }
+
+
+  // M3.3 index integrity: structural corruption is rejected before search uses offsets.
+  {
+    namespace fs = std::filesystem;
+    const auto base = fs::temp_directory_path() / "pergrep_m33_integrity";
+    fs::remove_all(base);
+    fs::create_directories(base / "corpus");
+    { std::ofstream f(base / "corpus" / "a.txt", std::ios::binary); f << "integrity payload\n"; }
+    const auto valid = Index::build(base / "corpus");
+    const auto expect_error = [](const fs::path& path, std::string_view needle) {
+      bool rejected = false;
+      try { (void)Index::load(path); }
+      catch (const std::runtime_error& e) { rejected = std::string(e.what()).find(needle) != std::string::npos; }
+      assert(rejected);
+    };
+    // A valid v7 trailer is mandatory; appending bytes is not accepted as an extension.
+    const auto trailing = base / "trailing.pgi";
+    valid.save(trailing);
+    { std::ofstream f(trailing, std::ios::binary | std::ios::app); f.put('x'); }
+    expect_error(trailing, "checksum");
+
+    // Chunk starts must form a contiguous per-file corpus partition.
+    {
+      auto bad = Index::build(base / "corpus");
+      auto* raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad.debug_index_data()));
+      assert(raw && !raw->chunks.empty());
+      raw->chunks[0].core_begin = 1;
+
+      const auto path = base / "bad-chunk-offset.pgi";
+      bad.save(path);
+      expect_error(path, "invalid chunk geometry");
+    }
+    // FileInfo totals must agree with the header corpus total before source reads.
+    {
+      auto bad = Index::build(base / "corpus");
+      auto* raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad.debug_index_data()));
+      assert(raw && !raw->infos.empty());
+      ++raw->infos[0].size;
+
+      const auto path = base / "bad-file-size.pgi";
+      bad.save(path);
+      expect_error(path, "invalid corpus totals");
+    }
+    // Every chunk belongs to exactly one q-gram group and each positional descriptor matches its chunk.
+    {
+      auto bad = Index::build(base / "corpus");
+      auto* raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad.debug_index_data()));
+      assert(raw && !raw->chunks.empty());
+      std::size_t nonempty_group = 0;
+      while (nonempty_group < raw->groups.size() && raw->groups[nonempty_group].gids.empty()) ++nonempty_group;
+      assert(nonempty_group < raw->groups.size());
+      raw->groups[nonempty_group].gids.push_back(raw->groups[nonempty_group].gids.front());
+
+      const auto path = base / "bad-group-ref.pgi";
+      bad.save(path);
+      expect_error(path, "qgram group reference");
+
+      auto bad_pos = Index::build(base / "corpus");
+      auto* pos_raw = const_cast<pergrep::detail::IndexData*>(static_cast<const pergrep::detail::IndexData*>(bad_pos.debug_index_data()));
+      assert(pos_raw && !pos_raw->pos_desc.empty());
+      pos_raw->pos_desc[0].off = 1;
+      const auto pos_path = base / "bad-position-offset.pgi";
+      bad_pos.save(pos_path);
+      expect_error(pos_path, "positional descriptors");
+    }
     fs::remove_all(base);
   }
   return 0;

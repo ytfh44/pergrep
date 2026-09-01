@@ -57,7 +57,11 @@ static bool looks_binary(std::string_view s){auto n=std::min<size_t>(s.size(),81
 // calibration data, while legacy filter arrays remain available at any scale.
 inline constexpr std::uint64_t kPlannerCorpusCap = 128ULL * 1024 * 1024;
 inline constexpr std::size_t kPlannerDistinctQgramCap = 1ULL << 20;
-inline constexpr std::uint64_t kMaxV6PayloadBytes = 1ULL << 30; // 1 GiB per snapshot
+inline constexpr std::uint64_t kMaxV6PayloadBytes = 1ULL << 30; // legacy name retained for compatibility
+inline constexpr std::uint64_t kMaxCorpusBytes = 1ULL << 30;
+inline constexpr std::uint64_t kMaxSnapshotBytes = kMaxCorpusBytes + 256ULL * 1024 * 1024;
+inline constexpr std::size_t kMaxManifestFiles = 1'000'000;
+inline constexpr std::uint64_t kMaxManifestMetadataBytes = 256ULL * 1024 * 1024;
 
 static bool unsafe_file_info_path(std::string_view path) noexcept {
     if (path.empty()) return false;
@@ -212,6 +216,8 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         fi.size = s.size();
         fi.mtime_ns = mtime_ns(p);
         fi.binary = looks_binary(s);
+        if (s.size() > kMaxCorpusBytes - std::min(I->corp_bytes, kMaxCorpusBytes))
+            throw std::runtime_error("index corpus exceeds 1 GiB limit");
         I->corp_bytes += s.size();
         for (unsigned char c : s) ++I->byte_freq[c];
         if (s.size() >= 4) {
@@ -335,6 +341,8 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
         fi.path = d.path;
         fi.size = d.content.size();
         fi.binary = looks_binary(d.content);
+        if (d.content.size() > kMaxCorpusBytes - std::min(I->corp_bytes, kMaxCorpusBytes))
+            throw std::runtime_error("index corpus exceeds 1 GiB limit");
         I->corp_bytes += d.content.size();
         for (unsigned char c : d.content) ++I->byte_freq[c];
         if (d.content.size() >= 4) {
@@ -528,10 +536,9 @@ static std::uint64_t fnv_mix(std::uint64_t h, std::uint64_t v) noexcept {
 // of file-content reads so stale v5 entries can be rejected before filters or
 // resident corpus bytes are materialized.
 static std::uint64_t source_identity(const fs::path& root, const IndexOptions& opt) {
-    constexpr std::size_t kMaxManifestFiles = 1'000'000;
-    constexpr std::uint64_t kMaxManifestMetadataBytes = 256ULL * 1024 * 1024;
     std::vector<std::tuple<std::string, std::uint64_t, std::int64_t>> files;
     std::uint64_t metadata_bytes = 0;
+    std::uint64_t corpus_bytes = 0;
     std::error_code ec;
     if (!fs::is_directory(root, ec) || ec) return 0;
     std::unordered_set<std::string> visited_dirs;
@@ -572,9 +579,11 @@ static std::uint64_t source_identity(const fs::path& root, const IndexOptions& o
             // accumulate an attacker-controlled vector before payload checks.
             if (files.size() >= kMaxManifestFiles ||
                 metadata_bytes > kMaxManifestMetadataBytes ||
-                rel.size() > kMaxManifestMetadataBytes - metadata_bytes)
+                rel.size() > kMaxManifestMetadataBytes - metadata_bytes ||
+                size > kMaxCorpusBytes - std::min(corpus_bytes, kMaxCorpusBytes))
                 return 0;
             metadata_bytes += rel.size();
+            corpus_bytes += size;
             files.emplace_back(std::move(rel), size, mtime_ns(e.path()));
         }
     }
@@ -631,6 +640,7 @@ constexpr uint64_t kMaxFiles = 10'000'000;
 constexpr uint64_t kMaxChunks = 100'000'000;
 constexpr uint64_t kMaxPosDesc = 100'000'000;
 constexpr uint64_t kMaxVectorElems = 200'000'000;
+// Keep reader and writer limits identical for every index generation.
 // Reader/Writer make the v7 snapshot contract explicit: every scalar has a
 // fixed width and is encoded little-endian. Legacy mode is used only for v5/v6.
 struct Writer {
@@ -691,7 +701,7 @@ static std::uint64_t hash_file_range(const fs::path& file, std::uint64_t offset,
     if (!in) throw std::runtime_error("cannot open index for integrity check: " + file.string());
     in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!in) throw std::runtime_error("pergrep index: truncated");
-    std::uint64_t h = 1469598103934665603ULL;
+    std::uint64_t h = 14695981039346656037ULL;
     char buf[64 * 1024];
     while (bytes) {
         const auto want = static_cast<std::streamsize>(std::min<std::uint64_t>(bytes, sizeof(buf)));
@@ -720,16 +730,16 @@ void Index::save(const fs::path& file) const {
 void Index::save(const fs::path& file, const CacheManifest& requested) const {
     if (!impl_) throw std::runtime_error("cannot persist an uninitialized pergrep index");
     if (impl_->ephemeral) throw std::runtime_error("cannot persist an in-memory pergrep index");
+    if (impl_->corp_bytes > kMaxCorpusBytes)
+        throw std::runtime_error("index corpus exceeds 1 GiB limit");
     if (impl_->opt.persist_corpus) {
-        if (impl_->corp_bytes > kMaxV6PayloadBytes)
-            throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
         if (impl_->loaded.size() != impl_->infos.size())
             throw std::runtime_error("invalid v6 corpus payload");
         std::uint64_t payload_total = 0;
         for (std::size_t k = 0; k < impl_->infos.size(); ++k) {
             const auto bytes = static_cast<std::uint64_t>(impl_->loaded[k].data.size());
-            if (bytes > kMaxV6PayloadBytes - payload_total)
-                throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
+            if (bytes > kMaxCorpusBytes - std::min(payload_total, kMaxCorpusBytes))
+                throw std::runtime_error("index corpus exceeds 1 GiB limit");
             payload_total += bytes;
         }
     }
@@ -882,6 +892,7 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         snapshot_size = sz;
         constexpr uint64_t kMinHeader = 8 + 4; // magic + version
         if (sz < kMinHeader) throw std::runtime_error("pergrep index: truncated");
+        if (sz > kMaxSnapshotBytes) throw std::runtime_error("pergrep index: exceeds size limit");
     }
     std::ifstream i(file, std::ios::binary);
     if (!i) throw std::runtime_error("cannot open index: " + file.string());
@@ -902,6 +913,18 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
     if (!portable && ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
     if (portable && snapshot_size < 12 + 8) throw std::runtime_error("pergrep index: truncated");
     Reader r{i, portable, snapshot_size};
+    // Verify the v7 checksum before reading any attacker-controlled lengths or
+    // allocating vectors/corpus payloads. The legacy formats have no trailer.
+    if (portable) {
+        if (snapshot_size < 20) throw std::runtime_error("pergrep index: truncated");
+        std::ifstream tail(file, std::ios::binary);
+        if (!tail) throw std::runtime_error("cannot open index for integrity check: " + file.string());
+        tail.seekg(static_cast<std::streamoff>(snapshot_size - 8), std::ios::beg);
+        if (!tail) throw std::runtime_error("pergrep index: truncated");
+        const auto expected_checksum = get_le64(tail);
+        if (expected_checksum != hash_file_range(file, 12, snapshot_size - 20))
+            throw std::runtime_error("pergrep index: checksum mismatch");
+    }
     std::uint32_t feature_flags = 0;
     bool persisted_corpus = ver == 6;
 
@@ -1043,13 +1066,16 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         throw std::runtime_error("pergrep index: invalid corpus totals");
     if (has_manifest && info_total != *stored.corpus_bytes)
         throw std::runtime_error("stale cache manifest: corpus bytes");
-    if (persisted_corpus && I->corp_bytes > kMaxV6PayloadBytes)
-        throw std::runtime_error("v6 corpus payload exceeds 1 GiB limit");
+    if (I->corp_bytes > kMaxCorpusBytes)
+        throw std::runtime_error("index corpus exceeds 1 GiB limit");
     auto nc = r.scalar<std::uint64_t>();
     if (nc > kMaxChunks) throw std::runtime_error("pergrep index: truncated");
     // Each chunk record is four fixed-width fields. Check before reserve.
     if (nc > r.remaining() / 28) throw std::runtime_error("pergrep index: truncated");
     I->chunks.reserve(static_cast<size_t>(nc));
+    std::vector<std::uint64_t> next_core(static_cast<size_t>(nf), 0);
+    std::vector<std::uint8_t> file_seen(static_cast<size_t>(nf), 0);
+    std::uint32_t previous_file = 0;
     for (uint64_t k = 0; k < nc; ++k) {
         Chunk c;
         c.file_id = r.scalar<std::uint32_t>();
@@ -1057,10 +1083,25 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         c.core_end = r.scalar<std::uint64_t>();
         c.ext_end = r.scalar<std::uint64_t>();
         if (c.file_id >= nf || c.core_begin > c.core_end || c.core_end > c.ext_end ||
-            c.ext_end > I->infos[c.file_id].size)
+            c.ext_end > I->infos[c.file_id].size ||
+            c.core_end - c.core_begin > I->opt.chunk_bytes ||
+            (c.core_end > UINT64_MAX - I->opt.chunk_overlap ? true :
+             c.ext_end > std::min(I->infos[c.file_id].size, c.core_end + I->opt.chunk_overlap)) ||
+            (k != 0 && c.file_id < previous_file) ||
+            c.core_begin != next_core[c.file_id] ||
+            (c.core_begin == c.core_end && I->infos[c.file_id].size != 0))
             throw std::runtime_error("pergrep index: invalid chunk geometry");
+        if (k != 0 && c.file_id > previous_file && next_core[previous_file] != I->infos[previous_file].size)
+            throw std::runtime_error("pergrep index: invalid chunk relationships");
+        next_core[c.file_id] = c.core_end;
+        file_seen[c.file_id] = 1;
+        previous_file = c.file_id;
         I->chunks.push_back(c);
     }
+    for (std::uint64_t fid = 0; fid < nf; ++fid)
+        if (!file_seen[static_cast<size_t>(fid)] || next_core[static_cast<size_t>(fid)] != I->infos[static_cast<size_t>(fid)].size)
+            throw std::runtime_error("pergrep index: invalid chunk relationships");
+    std::vector<std::uint8_t> chunk_grouped(static_cast<size_t>(nc), 0);
     for (auto& g : I->groups) {
         g.lg = r.scalar<std::uint8_t>();
         g.m = r.scalar<std::uint32_t>();
@@ -1072,9 +1113,15 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
             static_cast<std::uint64_t>(g.words) > UINT64_MAX / (1u << g.lg) ||
             g.bits.size() != static_cast<std::uint64_t>(1u << g.lg) * g.words)
             throw std::runtime_error("pergrep index: invalid qgram group");
-        for (auto gid : g.gids)
-            if (gid >= nc) throw std::runtime_error("pergrep index: invalid qgram group reference");
+        for (auto gid : g.gids) {
+            if (gid >= nc || chunk_grouped[gid] != 0 ||
+                detail::lg_for(static_cast<size_t>(I->chunks[gid].ext_end - I->chunks[gid].core_begin)) != g.lg)
+                throw std::runtime_error("pergrep index: invalid qgram group reference");
+            chunk_grouped[gid] = 1;
+        }
     }
+    for (auto grouped : chunk_grouped)
+        if (grouped == 0) throw std::runtime_error("pergrep index: incomplete qgram groups");
     auto npd = r.scalar<std::uint64_t>();
     if (npd != nc || npd > kMaxPosDesc) throw std::runtime_error("pergrep index: invalid positional descriptors");
     if (npd > r.remaining() / 18) throw std::runtime_error("pergrep index: invalid positional descriptors");
@@ -1089,11 +1136,17 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
     }
     I->pos = r.vector<std::uint8_t>();
     std::uint64_t pos_end = 0;
-    for (const auto& d : I->pos_desc) {
-        if (d.m < 64 || d.m > 1024 || (d.m & (d.m - 1)) != 0 || d.blocks == 0 ||
-            d.mask_bytes != (static_cast<std::uint64_t>(d.blocks) + 7) / 8 ||
-            d.off != pos_end || static_cast<std::uint64_t>(d.mask_bytes) >
-                (I->pos.size() - std::min<std::uint64_t>(pos_end, I->pos.size())) / d.m)
+    for (std::size_t k = 0; k < I->pos_desc.size(); ++k) {
+        const auto& d = I->pos_desc[k];
+        const auto& c = I->chunks[k];
+        const auto core_len = c.core_end - c.core_begin;
+        const auto expected_blocks = std::max<std::uint64_t>(1, (core_len + I->pos_block - 1) / I->pos_block);
+        const auto expected_mask_bytes = (expected_blocks + 7) / 8;
+        if (d.m < 64 || d.m > 1024 || (d.m & (d.m - 1)) != 0 ||
+            d.blocks != expected_blocks || d.mask_bytes != expected_mask_bytes ||
+            d.off != pos_end || d.mask_bytes >
+                (I->pos.size() - std::min<std::uint64_t>(pos_end, I->pos.size())) / d.m ||
+            pos_end > UINT64_MAX - static_cast<std::uint64_t>(d.m) * d.mask_bytes)
             throw std::runtime_error("pergrep index: invalid positional descriptors");
         pos_end += static_cast<std::uint64_t>(d.m) * d.mask_bytes;
     }
@@ -1104,15 +1157,15 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
     // prototype cost — suitable for stable trees, large corpora pay re-read.
     // v6 (persist_corpus==true): persisted corpus bytes follow the filter;
     // restore I->loaded directly from the index without touching the filesystem.
-    auto verify_integrity = [&] {
-        if (!portable) return;
-        const auto checksum_pos = i.tellg();
-        if (checksum_pos < 0 || static_cast<std::uint64_t>(checksum_pos) != snapshot_size - 8)
-            throw std::runtime_error("pergrep index: invalid checksum trailer");
-        const auto expected_checksum = r.scalar<std::uint64_t>();
-        if (expected_checksum != hash_file_range(file, 12, snapshot_size - 20))
-            throw std::runtime_error("pergrep index: checksum mismatch");
-    };
+    // v7 integrity was checked before any sections were deserialized.
+    if (!persisted_corpus) {
+        std::uint64_t source_total = 0;
+        for (const auto& f : I->infos) {
+            if (f.size > kMaxCorpusBytes - source_total)
+                throw std::runtime_error("indexed source corpus exceeds 1 GiB limit");
+            source_total += f.size;
+        }
+    }
     if (persisted_corpus) {
         std::uint64_t payload_total = 0;
         for (size_t k = 0; k < I->infos.size(); ++k) {
@@ -1134,9 +1187,9 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
         }
         if (payload_total != I->corp_bytes || (has_manifest && payload_total != *stored.corpus_bytes))
             throw std::runtime_error("pergrep index: invalid corpus payload totals");
-        verify_integrity();
+        (void)0; // checksum already verified before allocation
     } else {
-        verify_integrity();
+        (void)0; // checksum already verified before allocation
         for (auto& f : I->infos) {
 #ifdef _WIN32
             std::ifstream src(I->root / fs::path(std::u8string(f.path.begin(), f.path.end())), std::ios::binary);
@@ -1144,11 +1197,19 @@ Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool
             std::ifstream src(I->root / f.path, std::ios::binary);
 #endif
             if (!src) throw std::runtime_error("indexed source disappeared: " + f.path);
-            std::string data((std::istreambuf_iterator<char>(src)), {});
-            if (data.size() != f.size)
+            std::string data(static_cast<size_t>(f.size), '\0');
+            if (f.size) src.read(data.data(), static_cast<std::streamsize>(f.size));
+            if (!src || src.peek() != std::char_traits<char>::eof())
                 throw std::runtime_error("indexed source changed or disappeared: " + f.path);
             I->loaded.push_back({f, std::move(data)});
         }
+    }
+    if (portable) {
+        const auto body_end = i.tellg();
+        if (body_end < 0 || static_cast<std::uint64_t>(body_end) != snapshot_size - 8)
+            throw std::runtime_error("pergrep index: unexpected trailing data");
+    } else if (i.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("pergrep index: unexpected trailing data");
     }
     // Legacy v5/v6 and portable v7 do not contain planner statistics. Recompute them from the loaded
     // corpus rather than interpreting legacy qgram_freq bytes as exact stats.

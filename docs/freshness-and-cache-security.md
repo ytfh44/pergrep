@@ -13,11 +13,11 @@ This document establishes the formal specification for **corpus freshness valida
 2. **Deterministic snapshot search & artifact auditing**: Offline or containerized execution against immutable datasets where search results must be 100% reproducible and isolated from external filesystem mutations.
 
 To serve both workflows without sacrificing performance or introducing silent data corruption:
-- **Explicit Taxonomy**: Indexes are categorized as either **Source-Backed Live Views (v5)** or **Self-Contained Immutable Snapshots (v6)**, exposed via the `Index::is_snapshot()` query API.
+- **Explicit Taxonomy**: New indexes use portable **v7**; `persist_corpus = false` is source-backed and `persist_corpus = true` is an immutable snapshot. Legacy v5/v6 files remain readable for compatibility, and `Index::is_snapshot()` reports persisted-corpus mode.
 - **Strict Freshness Contract**: Live view indexes provide an $O(\text{files})$ metadata validation pass via `Index::fresh()`, detecting filesystem drift before executing verification against underlying source files.
 - **TOCTOU Hazard Isolation**: Immutable snapshots decouple candidate verification from the live filesystem by persisting exact document byte sequences into the index, eliminating time-of-check to time-of-use divergence.
 - **Zero-Trust Cache Security**: Index cache files containing persisted cleartext corpus bytes must enforce strict user-private access controls (POSIX `0600`/`0700` and restricted Windows NTFS ACLs) to prevent cross-user privilege escalation.
-- **Fail-Safe Integrity Gates**: Deserialization is protected by multi-tier validation guards: 8-byte magic header checks, strict version gating, allocation bounds, and explicit truncation detection.
+- **Fail-Safe Integrity Gates**: Deserialization is protected by a mandatory FNV-1a checksum trailer for v7, strict version/feature gating, bounded sections, relationship validation, explicit truncation detection, and a reject-by-default trailing-data policy.
 
 ---
 
@@ -99,7 +99,7 @@ t3: Searcher verifies candidate by reading live file root/doc.txt
 | Characteristic | Source-Backed Live View (v5) | Persisted Immutable Snapshot (v6) |
 | --- | --- | --- |
 | **Persistence Option** | `IndexOptions::persist_corpus = false` | `IndexOptions::persist_corpus = true` |
-| **Disk Format Version** | Version `5` | Version `6` |
+| **Disk Format Version** | Portable version `7` (legacy `5` readable) | Portable version `7` (legacy `6` readable) |
 | **Query API (`is_snapshot`)** | `idx.is_snapshot() == false` | `idx.is_snapshot() == true` |
 | **C API (`pg_index_is_snapshot`)**| `pg_index_is_snapshot(idx) == 0` | `pg_index_is_snapshot(idx) == 1` |
 | **Index File Size** | Compact: $\approx 1\% - 5\%$ of corpus size (filter bitsets + metadata) | Larger: filter bitsets + metadata + 100% corpus raw bytes |
@@ -219,7 +219,7 @@ Binary Layout:
 | Magic (8 bytes)   | Version (4B)    | Metadata, Options & Filter Blocks      |
 | "PERGREP\0"       | uint32_t (5 / 6)| Groups, Bits, Positional Descriptors   |
 +-------------------+-----------------+----------------------------------------+
-| Positional Matrix | (v6 only) Corpus Stream                                  |
+| Positional Matrix | (v7 persisted mode only) Corpus Stream + checksum       |
 | pos vector bytes  | [size_64, raw_bytes] * nf                                |
 +-------------------+----------------------------------------------------------+
 ```
@@ -232,10 +232,10 @@ Binary Layout:
 
 #### 2. Strict Version Gating
 - Bytes 8–11 encode the 32-bit unsigned little-endian format version.
-- Currently valid versions are **`5`** (v5 source-backed) and **`6`** (v6 persisted corpus snapshot).
+- New files use portable **`7`**; host-representation **`5`** and **`6`** remain readable through the unqualified API for compatibility.
 - Any other version (e.g. `0`, legacy `1..4`, future `7+`, or corrupted values like `0xFFFFFFFF`) is rejected immediately:
   ```cpp
-  if (ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
+  if (ver != 7 && ver != 5 && ver != 6) throw std::runtime_error("unsupported pergrep index version");
   ```
 
 #### 3. Manifest-First Cache Validation
