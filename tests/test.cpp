@@ -287,6 +287,56 @@ int main(){
     fs::remove_all(base);
   }
 
+  // M3.9: transformed input and ephemeral indexes stay on their own storage
+  // boundary. They must never be persisted through the source cache, must keep
+  // transformed bytes in content()/search, and each transform identity must not
+  // reuse another transform's corpus.
+  {
+    // (a) Transformed content is what content()/search see, not the raw source.
+    auto transformed = Index::from_documents({{"x.cpp", "/* raw */ Confidential_TOKEN_1\n"}});
+    assert(transformed.content(0) == "/* raw */ Confidential_TOKEN_1\n");
+    Searcher ts(transformed);
+    assert(ts.find(Pattern::compile("Confidential_TOKEN_1", {.kind = PatternKind::Fixed})).size() == 1);
+
+    // (b) Ephemeral indexes are never persistable: save() must reject explicitly.
+    {
+      const auto out = fs::temp_directory_path() / "pergrep_m39_ephemeral.pgi";
+      fs::remove(out);
+      bool threw = false;
+      try { transformed.save(out); } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("in-memory") != std::string::npos);
+      }
+      assert(threw);
+      assert(!fs::exists(out));
+    }
+
+    // (c) Ephemeral indexes are not snapshots and are never fresh on the raw source.
+    assert(!transformed.is_snapshot());
+    assert(!transformed.fresh());
+
+    // (d) Two different transforms over the same path are distinct corpora and
+    // must not alias each other's content. A second from_documents index with
+    // different transformed bytes yields that transformed content, and a fresh()
+    // check never falsely validates it against the raw source.
+    auto first  = Index::from_documents({{"x.cpp", "alpha\n"}});
+    auto second = Index::from_documents({{"x.cpp", "beta\n"}});
+    assert(first.content(0) == "alpha\n");
+    assert(second.content(0) == "beta\n");
+    assert(Searcher(first).find(Pattern::compile("alpha", {.kind = PatternKind::Fixed})).size() == 1);
+    assert(Searcher(second).find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).size() == 1);
+    assert(!first.fresh() && !second.fresh());
+
+    // (e) The plan-cache key separates transformed identities so distinct
+    // transforms never reuse one another's selected plan.
+    {
+      PlanKey key0 = make_plan_key(Pattern::compile("alpha"), SearchOptions{}, transformed.options(), 0);
+      PlanKey key1 = make_plan_key(Pattern::compile("alpha"), SearchOptions{}, transformed.options(), 1);
+      assert(key0.hash() != key1.hash());
+      assert(!(key0 == key1));
+    }
+  }
+
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));
