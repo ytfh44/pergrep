@@ -630,6 +630,107 @@ int main(){
       assert(!Searcher(merged).find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).empty());
     }
   }
+  // M4.4: segment-local statistics and candidate unions. append() recomputes the
+  // merged view's global planner statistics (byte_freq / qgram_freq / hash-chunk /
+  // exact q-grams) over the union of base survivors + changed + added documents,
+  // minus tombstones, through the shared M3.6 materialize_index_filters contract.
+  // Candidate generation is therefore conservative and tombstone-excluded: the
+  // merged index yields the same candidates and zero false negatives as a full
+  // from_documents rebuild, and removed content contributes no candidates or
+  // rarity bias.
+  {
+    std::vector<Document> base_docs = {
+        {"a.txt", "alpha needle duo\n"},
+        {"b.txt", "beta duo oldbytes\n"},
+        {"c.txt", "gamma zebra_gone\n"}};
+    auto base = Index::from_documents(base_docs);
+
+    // Append {b -> b', d}, tombstone c. Survivors are {a, b', d}: "needle" survives
+    // in all three, "alpha"/"bravo"/"delta" in exactly one each, "zebra_gone" and
+    // "gamma" only ever lived in the tombstoned c.txt, and "oldbytes" only in the
+    // replaced b.txt content.
+    std::vector<Document> changed = {
+        {"b.txt", "bravo needle duo\n"},
+        {"d.txt", "delta needle\n"}};
+    SegmentManifest manifest;
+    manifest.paths = {"b.txt", "d.txt"};
+    manifest.tombstones = {"c.txt"};
+    auto merged = Index::append(base, changed, manifest);
+
+    // Path-sorted merged identity: {a.txt, b.txt, d.txt}.
+    {
+      std::vector<std::string> paths;
+      for (const auto& fi : merged.files()) paths.push_back(fi.path);
+      assert((paths == std::vector<std::string>{"a.txt", "b.txt", "d.txt"}));
+    }
+
+    // Full from_documents rebuild over the same post-merge set is the oracle.
+    auto full = Index::from_documents({
+        {"a.txt", "alpha needle duo\n"},
+        {"b.txt", "bravo needle duo\n"},
+        {"d.txt", "delta needle\n"}});
+    Searcher smerged(merged), sfull(full);
+    auto same_matches = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end)
+          return false;
+      return true;
+    };
+
+    // (a) Zero false negatives and identical candidates across a rare literal, a
+    // common regex, and a word=true pattern: merged == full rebuild.
+    for (const auto& expr : {"alpha", "bravo", "delta", "needle", "duo", "[a-z]+", "e.*[en]"}) {
+      auto pm = smerged.find(Pattern::compile(expr));
+      auto pf = sfull.find(Pattern::compile(expr));
+      assert(same_matches(pm, pf));
+    }
+    {
+      auto pw = Pattern::compile("needle", PatternOptions{.kind = PatternKind::Fixed, .word = true});
+      assert(same_matches(smerged.find(pw), sfull.find(pw)));
+    }
+
+    // (b) A literal appearing only in the tombstoned document (or only in the
+    // replaced b.txt content) returns 0 matches: removed segments contribute no
+    // candidates.
+    assert(smerged.find(Pattern::compile("zebra_gone", {.kind = PatternKind::Fixed})).empty());
+    assert(smerged.find(Pattern::compile("gamma", {.kind = PatternKind::Fixed})).empty());
+    assert(smerged.find(Pattern::compile("oldbytes", {.kind = PatternKind::Fixed})).empty());
+
+    // (c) Candidate/selectivity stats are reported and non-negative; find() does
+    // not throw while populating them.
+    {
+      SearchStats st;
+      (void)smerged.find(Pattern::compile("needle", {.kind = PatternKind::Fixed}), {}, &st);
+      assert(st.candidate_chunks >= 0);
+      assert(st.estimated_selectivity >= 0.0);
+    }
+
+    // (d) Tombstone-excluded planner stats: the merged index's candidate_files and
+    // estimated selectivity are identical to the clean rebuild's (so removed
+    // content cannot bias rarity), and a rare token's candidate_files equals the
+    // number of surviving files that contain it.
+    for (const auto& expr : {"alpha", "needle", "zebra_gone"}) {
+      SearchStats ms, fs;
+      auto mm = smerged.find(Pattern::compile(expr, {.kind = PatternKind::Fixed}), {}, &ms);
+      auto ff = sfull.find(Pattern::compile(expr, {.kind = PatternKind::Fixed}), {}, &fs);
+      assert(mm.size() == ff.size());
+      assert(ms.candidate_files == fs.candidate_files);
+      assert(ms.estimated_selectivity == fs.estimated_selectivity);
+    }
+    {
+      SearchStats ast;
+      auto am = smerged.find(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {}, &ast);
+      assert(am.size() == 1);
+      assert(ast.candidate_files == 1); // "alpha" lives only in a.txt
+    }
+    {
+      SearchStats gst;
+      auto gm = smerged.find(Pattern::compile("zebra_gone", {.kind = PatternKind::Fixed}), {}, &gst);
+      assert(gm.empty());
+      assert(gst.candidate_files == 0); // c.txt was tombstoned; no candidate survives
+    }
+  }
 
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
