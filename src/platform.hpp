@@ -16,6 +16,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
+#include <aclapi.h>
+#include <sddl.h>
+#include <sys/stat.h>
 #include <filesystem>
 
 namespace pergrep_cli::platform {
@@ -357,6 +360,40 @@ inline std::string utf8_from_argv(const char* s) {
     return out;
 }
 
+inline bool harden_private_permissions(const std::filesystem::path& p, bool is_directory) {
+    // Restrict a cache file or directory to the current user (and SYSTEM) only.
+    std::wstring w = p.wstring();
+    int bits = _S_IREAD | _S_IWRITE;
+    if (is_directory) bits |= _S_IEXEC;
+    const bool crt_ok = ::_wchmod(w.c_str(), bits) == 0;
+
+    // Replace the DACL with an owner+SYSTEM allow list so inherited Everyone/Users
+    // grants from a shared parent cannot expose clear-text corpus bytes.
+    HANDLE tok = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &tok)) return crt_ok;
+    DWORD need = 0;
+    ::GetTokenInformation(tok, TokenUser, nullptr, 0, &need);
+    std::vector<unsigned char> buf(need ? need : 1);
+    TOKEN_USER* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+    bool have_user = need && ::GetTokenInformation(tok, TokenUser, tu, need, &need);
+    ::CloseHandle(tok);
+    if (!have_user) return crt_ok;
+
+    LPWSTR sidstr = nullptr;
+    if (!::ConvertSidToStringSidW(tu->User.Sid, &sidstr)) return crt_ok;
+    std::wstring sddl = L"D:P(A;OICI;FA;;;";
+    sddl += sidstr;
+    ::LocalFree(sidstr);
+    sddl += L")(A;OICI;FA;;;SY)";
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
+        return crt_ok;
+    const DWORD rc = ::SetFileSecurityW(w.c_str(), DACL_SECURITY_INFORMATION, sd);
+    ::LocalFree(sd);
+    return rc != 0;
+}
+
 } // namespace pergrep_cli::platform
 
 #else // !_WIN32
@@ -485,6 +522,11 @@ inline bool same_device(const std::filesystem::path& a, const std::filesystem::p
 inline bool run_capture(const std::vector<std::string>& argv, std::string_view input, std::string& output) {
     (void)argv; (void)input; (void)output;
     return false;
+}
+
+inline bool harden_private_permissions(const std::filesystem::path& p, bool is_directory) {
+    const ::mode_t mode = is_directory ? (S_IRWXU) : (S_IRUSR | S_IWUSR);
+    return ::chmod(p.c_str(), mode) == 0;
 }
 
 } // namespace pergrep_cli::platform
