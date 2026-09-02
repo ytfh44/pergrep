@@ -105,6 +105,18 @@ struct CacheManifest {
     std::optional<std::uint64_t> generation;
 };
 
+// M4.2: an appended immutable segment's identity. Unlike CacheManifest (which
+// describes a whole on-disk snapshot), a SegmentManifest is carried in memory
+// alongside a merged Index and records which documents an append introduced or
+// replaced, plus the post-merge totals and generation ownership. On-disk
+// segment files are deferred to M4.7 (crash-safe publication).
+struct SegmentManifest {
+    std::vector<std::string> paths;      // changed/new document relative paths (UTF-8)
+    std::uint64_t source_identity = 0;   // fingerprint of the NEW full source set (base + segment)
+    std::uint64_t generation = 0;        // monotonic generation counter (reuse root_mtime_ns semantics)
+    std::uint64_t corpus_files = 0;      // total files after merge (0 = wildcard)
+    std::uint64_t corpus_bytes = 0;      // total corpus bytes after merge (0 = wildcard)
+};
 struct Document {
     std::string path;
     std::string content;
@@ -115,6 +127,12 @@ public:
     Index();
     static Index build(const std::filesystem::path& root, IndexOptions options = {});
     static Index from_documents(std::vector<Document> documents, IndexOptions options = {});
+    // M4.2: append changed documents as immutable segments. Rebuilds a merged
+    // document vector from the base's files (replace-by-path, else append) and
+    // materializes an ephemeral resident index over it. The manifest records
+    // which documents were introduced/replaced and the post-merge totals.
+    static Index append(const Index& base, std::vector<Document> changed,
+                        const SegmentManifest& manifest, IndexOptions options = {});
     static Index load(const std::filesystem::path& file);
     static Index load(const std::filesystem::path& file, const CacheManifest& expected);
     void save(const std::filesystem::path& file) const;

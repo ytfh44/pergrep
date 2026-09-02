@@ -497,6 +497,44 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
     return Index(I);
 }
 
+Index Index::append(const Index& base, std::vector<Document> changed, const SegmentManifest& manifest, IndexOptions opt) {
+    validate_index_options(opt);
+    if (!base.files().size() && changed.empty())
+        return Index::from_documents({}, opt);
+
+    // Rebuild a merged document view: start from the base's files (path-sorted),
+    // then apply each changed document by path — replace in place when present,
+    // otherwise append as a new file. Deletion is not part of the append model.
+    std::vector<Document> merged;
+    merged.reserve(base.files().size() + changed.size());
+    for (std::size_t i = 0; i < base.files().size(); ++i)
+        merged.push_back(Document{base.files()[i].path, std::string(base.content(i))});
+    for (auto& c : changed) {
+        bool replaced = false;
+        for (auto& m : merged) {
+            if (m.path == c.path) { m.content = std::move(c.content); replaced = true; break; }
+        }
+        if (!replaced) merged.push_back(Document{c.path, std::move(c.content)});
+    }
+
+    // Validate the manifest's declared post-merge totals against the actual
+    // merged set. Zero denotes "wildcard" (recompute); a provided nonzero value
+    // that disagrees is a hard error so a stale segment can never be accepted.
+    const std::uint64_t final_files = merged.size();
+    std::uint64_t final_bytes = 0;
+    for (const auto& m : merged) final_bytes += m.content.size();
+    if (manifest.corpus_files != 0 && manifest.corpus_files != final_files)
+        throw std::runtime_error("pergrep: segment manifest corpus_files mismatch");
+    if (manifest.corpus_bytes != 0 && manifest.corpus_bytes != final_bytes)
+        throw std::runtime_error("pergrep: segment manifest corpus_bytes mismatch");
+
+    // M4.2 has no incremental filter-structure merge yet: the normal path and
+    // the full-rebuild fallback (changed delta >= base corpus, or an empty base
+    // filter set) are observably identical. Both converge on from_documents,
+    // which materializes filter structures via the shared M3.6 contract.
+    return Index::from_documents(std::move(merged), opt);
+}
+
 const fs::path& Index::root() const noexcept {
     static const fs::path empty_path;
     return impl_ ? impl_->root : empty_path;
