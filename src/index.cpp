@@ -503,12 +503,16 @@ Index Index::append(const Index& base, std::vector<Document> changed, const Segm
         return Index::from_documents({}, opt);
 
     // Rebuild a merged document view: start from the base's files (path-sorted),
-    // then apply each changed document by path — replace in place when present,
-    // otherwise append as a new file. Deletion is not part of the append model.
+    // drop any path carrying a tombstone (M4.3 delete/rename-away), then apply
+    // each changed document by path — replace in place when present, otherwise
+    // append as a new file.
+    std::unordered_set<std::string> tombstone_set(manifest.tombstones.begin(), manifest.tombstones.end());
     std::vector<Document> merged;
     merged.reserve(base.files().size() + changed.size());
-    for (std::size_t i = 0; i < base.files().size(); ++i)
+    for (std::size_t i = 0; i < base.files().size(); ++i) {
+        if (tombstone_set.count(base.files()[i].path)) continue;
         merged.push_back(Document{base.files()[i].path, std::string(base.content(i))});
+    }
     for (auto& c : changed) {
         bool replaced = false;
         for (auto& m : merged) {

@@ -507,6 +507,130 @@ int main(){
     }
   }
 
+  // M4.3: delete/rename tombstones. A tombstone removes its path from the merged
+  // view before changed documents are applied, so a deleted path is never
+  // matched, and a rename is encoded as tombstone(old) + changed{new} (old path
+  // vanishes, new path appears exactly once).
+  {
+    std::vector<Document> base_docs = {
+        {"a.txt", "alpha\n"}, {"b.txt", "beta\n"}, {"c.txt", "gamma\n"}};
+    auto base = Index::from_documents(base_docs);
+
+    // Deletion: tombstone b.txt, add d.txt. The merged view is {a,c,d}; "beta"
+    // (which only lived under b.txt) matches nothing, and "delta" matches once.
+    {
+      std::vector<Document> changed = {{"d.txt", "delta\n"}};
+      SegmentManifest manifest;
+      manifest.paths = {"d.txt"};
+      manifest.tombstones = {"b.txt"};
+      manifest.corpus_files = 3; // a, c, d after dropping b
+      manifest.corpus_bytes =
+          std::string("alpha\n").size() +
+          std::string("gamma\n").size() +
+          std::string("delta\n").size();
+
+      auto merged = Index::append(base, changed, manifest);
+
+      std::vector<std::string> paths;
+      for (const auto& fi : merged.files()) paths.push_back(fi.path);
+      assert((paths == std::vector<std::string>{"a.txt", "c.txt", "d.txt"}));
+      assert(merged.files().size() == 3);
+      assert(merged.corpus_bytes() == manifest.corpus_bytes);
+
+      // deleted-never-matches: "beta" was only ever in b.txt.
+      assert(Searcher(merged).find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).empty());
+
+      // "delta" matches exactly once under d.txt.
+      auto dm = Searcher(merged).find(Pattern::compile("delta", {.kind = PatternKind::Fixed}));
+      assert(dm.size() == 1);
+      std::size_t d_id = 0;
+      bool fd = false;
+      for (std::size_t i = 0; i < merged.files().size(); ++i)
+        if (merged.files()[i].path == "d.txt") { d_id = i; fd = true; }
+      assert(fd && dm[0].file_id == d_id);
+
+      // Equivalence vs a full from_documents rebuild over {a,c,d}.
+      auto full = Index::from_documents({{"a.txt", "alpha\n"}, {"c.txt", "gamma\n"}, {"d.txt", "delta\n"}});
+      Searcher smerged(merged), sfull(full);
+      for (const auto& expr : {"alpha", "beta", "gamma", "delta", "a.*a", "e"}) {
+        auto pm = smerged.find(Pattern::compile(expr));
+        auto pf = sfull.find(Pattern::compile(expr));
+        assert(pm.size() == pf.size());
+        for (std::size_t i = 0; i < pm.size(); ++i) {
+          assert(pm[i].file_id == pf[i].file_id);
+          assert(pm[i].start == pf[i].start);
+          assert(pm[i].end == pf[i].end);
+        }
+      }
+    }
+
+    // Rename: tombstone b.txt, add z.txt carrying b.txt's old content. z.txt
+    // appears exactly once; b.txt is gone; "beta" matches once under z.txt's id.
+    {
+      std::vector<Document> changed = {{"z.txt", "beta\n"}};
+      SegmentManifest manifest;
+      manifest.paths = {"z.txt"};
+      manifest.tombstones = {"b.txt"};
+      manifest.corpus_files = 3;
+      manifest.corpus_bytes =
+          std::string("alpha\n").size() +
+          std::string("gamma\n").size() +
+          std::string("beta\n").size();
+
+      auto merged = Index::append(base, changed, manifest);
+
+      std::vector<std::string> paths;
+      for (const auto& fi : merged.files()) paths.push_back(fi.path);
+      assert((paths == std::vector<std::string>{"a.txt", "c.txt", "z.txt"}));
+
+      // z.txt exactly once, b.txt never present.
+      std::size_t z_count = 0, b_count = 0;
+      for (const auto& fi : merged.files()) {
+        if (fi.path == "z.txt") ++z_count;
+        if (fi.path == "b.txt") ++b_count;
+      }
+      assert(z_count == 1 && b_count == 0);
+
+      // "beta" matches once under z.txt's file_id.
+      auto bm = Searcher(merged).find(Pattern::compile("beta", {.kind = PatternKind::Fixed}));
+      assert(bm.size() == 1);
+      std::size_t z_id = 0;
+      for (std::size_t i = 0; i < merged.files().size(); ++i)
+        if (merged.files()[i].path == "z.txt") z_id = i;
+      assert(bm[0].file_id == z_id);
+
+      // Full from_documents rebuild over {a,c,z} is byte-identical in files() and
+      // search results (offsets/counts identical).
+      auto full = Index::from_documents({{"a.txt", "alpha\n"}, {"c.txt", "gamma\n"}, {"z.txt", "beta\n"}});
+      assert(merged.files().size() == full.files().size());
+      for (std::size_t i = 0; i < merged.files().size(); ++i)
+        assert(merged.files()[i].path == full.files()[i].path);
+      Searcher smerged(merged), sfull(full);
+      for (const auto& expr : {"alpha", "beta", "gamma", "z", "a.*a"}) {
+        auto pm = smerged.find(Pattern::compile(expr));
+        auto pf = sfull.find(Pattern::compile(expr));
+        assert(pm.size() == pf.size());
+        for (std::size_t i = 0; i < pm.size(); ++i) {
+          assert(pm[i].file_id == pf[i].file_id);
+          assert(pm[i].start == pf[i].start);
+          assert(pm[i].end == pf[i].end);
+        }
+      }
+    }
+
+    // Unknown tombstone is a harmless no-op: tombstoning a path absent from the
+    // base neither throws nor changes the merged set.
+    {
+      std::vector<Document> changed = {{"d.txt", "delta\n"}};
+      SegmentManifest manifest;
+      manifest.paths = {"d.txt"};
+      manifest.tombstones = {"nonexistent.txt"};
+      auto merged = Index::append(base, changed, manifest);
+      assert(merged.files().size() == 4); // a, b, c, d
+      assert(!Searcher(merged).find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).empty());
+    }
+  }
+
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));

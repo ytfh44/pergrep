@@ -110,8 +110,15 @@ struct CacheManifest {
 // alongside a merged Index and records which documents an append introduced or
 // replaced, plus the post-merge totals and generation ownership. On-disk
 // segment files are deferred to M4.7 (crash-safe publication).
+//
+// M4.3: tombstones remove documents from the merged view. A tombstoned path is
+// excluded before changed/new documents are applied, so a deleted document is
+// never reachable by search and a rename is encoded as tombstone(old) +
+// changed{new} (the old path vanishes, the new path appears exactly once).
+// Tombstoning a path absent from the base is a harmless no-op, not an error.
 struct SegmentManifest {
     std::vector<std::string> paths;      // changed/new document relative paths (UTF-8)
+    std::vector<std::string> tombstones; // deleted/renamed-away document relative paths (UTF-8)
     std::uint64_t source_identity = 0;   // fingerprint of the NEW full source set (base + segment)
     std::uint64_t generation = 0;        // monotonic generation counter (reuse root_mtime_ns semantics)
     std::uint64_t corpus_files = 0;      // total files after merge (0 = wildcard)
