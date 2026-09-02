@@ -11,6 +11,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <sddl.h>
+#include <aclapi.h>
+// rpcndr.h (pulled in by windows.h) #defines `small` as `char`; the benchmark
+// matrix reuses `small`/`medium`/`large` as identifiers, so undefine it here.
+#undef small
+#else
+#include <sys/stat.h>
+#endif
 #if __has_include("../src/internal.hpp")
 #include "../src/internal.hpp"
 #endif
@@ -206,6 +220,70 @@ int main(){
       SearchOptions ov; ov.overlapping = true;
       assert(sfs.find(pw, ov).size() == smem.find(pw, ov).size());
     }
+    fs::remove_all(base);
+  }
+
+  // M3.8: a persisted-corpus snapshot enforces user-private cache permissions;
+  // the file must be non-world-readable/writable on the platform that supports it.
+  {
+    const auto base = fs::temp_directory_path() / "pergrep_m38_permissions";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    {
+      std::ofstream f(root / "secret.txt", std::ios::binary);
+      f << "confidential alpha\n";
+    }
+    IndexOptions opt;
+    opt.persist_corpus = true;
+    auto idx = Index::build(root, opt);
+    const auto p = base / "snapshot.pgi";
+    idx.save(p);
+    assert(fs::exists(p));
+    // The persisted snapshot loaded after source removal must still search.
+    fs::remove_all(root);
+    auto loaded = Index::load(p);
+    Searcher s(loaded);
+    assert(s.find(Pattern::compile("confidential", {.kind = PatternKind::Fixed})).size() == 1);
+
+    // POSIX: the snapshot must be mode 0600 (owner read/write only).
+#if !defined(_WIN32)
+    {
+      struct stat st{};
+      assert(::stat(p.c_str(), &st) == 0);
+      assert((st.st_mode & 0777) == 0600);
+    }
+#endif
+    // Windows: the DACL must carry no Everyone/Users grant. Presence of an
+    // owner-only private DACL is the enforcement; verify the file is not
+    // readable by the Everyone well-known SID.
+#if defined(_WIN32)
+    {
+      const std::wstring w = p.wstring();
+      PSECURITY_DESCRIPTOR sd = nullptr;
+      DWORD err = ::GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                          nullptr, nullptr, nullptr, nullptr, &sd);
+      assert(err == ERROR_SUCCESS && sd != nullptr);
+      PACL dacl = nullptr;
+      BOOL present = FALSE, defaulted = FALSE;
+      assert(::GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl != nullptr);
+      // Every ACE must be an ACCESS_ALLOWED_ACE for a non-Everyone SID.
+      bool has_everyone = false;
+      SID_IDENTIFIER_AUTHORITY world = SECURITY_WORLD_SID_AUTHORITY;
+      PSID everyone = nullptr;
+      assert(::AllocateAndInitializeSid(&world, 1, SECURITY_WORLD_RID, 0,0,0,0,0,0,0, &everyone));
+      for (DWORD i = 0; i < dacl->AceCount; ++i) {
+        ACE_HEADER* hdr = nullptr;
+        if (::GetAce(dacl, i, reinterpret_cast<void**>(&hdr)) && hdr->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+          auto* ace = reinterpret_cast<ACCESS_ALLOWED_ACE*>(hdr);
+          if (::EqualSid(&ace->SidStart, everyone)) has_everyone = true;
+        }
+      }
+      ::FreeSid(everyone);
+      assert(!has_everyone);
+      ::LocalFree(sd);
+    }
+#endif
     fs::remove_all(base);
   }
 

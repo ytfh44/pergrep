@@ -826,6 +826,15 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
     manifest.corpus_bytes = manifest.corpus_bytes.value_or(impl_->corp_bytes);
     manifest.generation = manifest.generation.value_or(static_cast<std::uint64_t>(impl_->root_mtime_ns));
     if (!file.parent_path().empty()) fs::create_directories(file.parent_path());
+    if (impl_->opt.persist_corpus) {
+        // M3.8: a persisted corpus embeds clear-text source bytes; the cache
+        // file and its immediate parent directory must be user-private. A
+        // failure to enforce permissions is explicit, not a silent downgrade.
+        const bool dir_ok = file.parent_path().empty() ||
+            pergrep_cli::platform::harden_private_permissions(file.parent_path(), true);
+        if (!dir_ok)
+            throw std::runtime_error("cannot enforce private permissions on persisted-corpus cache directory");
+    }
     // Crash-safe: write to temp file then atomic rename. fs::rename is atomic on
     // POSIX and uses MoveFileExW on Windows (atomic when on same volume).
     fs::path tmp = file;
@@ -837,6 +846,9 @@ void Index::save(const fs::path& file, const CacheManifest& requested) const {
         {
             std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
             if (!o) throw std::runtime_error("cannot create index: " + tmp.string());
+            if (impl_->opt.persist_corpus &&
+                !pergrep_cli::platform::harden_private_permissions(tmp, false))
+                throw std::runtime_error("cannot enforce private permissions on persisted-corpus index file");
             o.write("PERGREP\0", 8);
             // v7 is the current portable snapshot format. Every scalar below is
             // fixed-width little-endian; optional sections are advertised by flags.
