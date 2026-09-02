@@ -36,14 +36,14 @@ namespace pergrep::benchmark {
 
 // M1.5/M1.6: candidate predictions and shadow observation metrics are versioned;
 // increment when workload classes or measurement semantics change.
-inline constexpr std::uint32_t kWorkloadMatrixVersion = 4;
+inline constexpr std::uint32_t kWorkloadMatrixVersion = 5;
 
 // The classes are intentionally closed: later milestones may add cases, but must not
 // silently change what a class measures.
 enum class WorkloadClass { OneShot, WarmRepeated, InteractiveLargeRepository, BatchMultiPattern };
 enum class ScenarioPhase { Cold, Warm, Repeated, FilteredScope, TransformedInput };
 enum class InputTransform { Native, CrLf, NulRecords };
-enum class StorageBackend { InMemory, Filesystem };
+enum class StorageBackend { InMemory, Filesystem, Packed };
 
 enum class ScopeSelector { AllFiles, CppFiles, EveryOtherFile };
 
@@ -79,6 +79,7 @@ inline const char* to_string(StorageBackend value) noexcept {
     switch (value) {
         case StorageBackend::InMemory: return "in-memory";
         case StorageBackend::Filesystem: return "filesystem";
+        case StorageBackend::Packed: return "packed";
     }
     return "unknown";
 }
@@ -201,6 +202,10 @@ inline std::vector<WorkloadScenario> scenarios() {
          {rare_short, common_short}, 1, true, ScopeSelector::AllFiles, StorageBackend::Filesystem},
         {"filesystem.warm-repeated.medium", WorkloadClass::WarmRepeated, ScenarioPhase::Warm,
          medium, {rare_long, bounded}, 4, false, ScopeSelector::AllFiles, StorageBackend::Filesystem},
+        {"packed.cold.roundtrip", WorkloadClass::OneShot, ScenarioPhase::Cold, small,
+         {rare_short, common_short}, 1, true, ScopeSelector::AllFiles, StorageBackend::Packed},
+        {"packed.warm-repeated.medium", WorkloadClass::WarmRepeated, ScenarioPhase::Warm,
+         medium, {rare_long, bounded}, 4, false, ScopeSelector::AllFiles, StorageBackend::Packed},
     };
 }
 
