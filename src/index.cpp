@@ -285,10 +285,7 @@ static void rebuild_planner_stats(detail::IndexData& I) {
     I.planner_stats_ready = true;
 }
 
-Index::Index() = default;
-Index::Index(std::shared_ptr<Impl> i) : impl_(std::move(i)) {}
-
-Index Index::build(const fs::path& root, IndexOptions opt) {
+static void validate_index_options(const IndexOptions& opt) {
     if (opt.chunk_bytes < 64 || opt.chunk_bytes > (1ULL << 30))
         throw std::runtime_error("pergrep: chunk_bytes out of range [64, 1073741824]");
     if (opt.positional_block_bytes < 16 || opt.positional_block_bytes > (1ULL << 20))
@@ -299,6 +296,90 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         throw std::runtime_error("pergrep: planned_qgrams out of range [0, 64]");
     if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
         throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
+}
+// M3.6: shared index-construction contract. Both Index::build (source-backed)
+// and Index::from_documents (resident/ephemeral) converge on this helper so the
+// chunk layout, planner statistics, group Bloom, and positional Bloom stay
+// byte-for-byte identical. Ownership (how corpus bytes are provided) is the only
+// deliberately different axis; the derived filter structures must not drift.
+static void materialize_index_filters(detail::IndexData& I) {
+    const uint64_t core = I.opt.chunk_bytes, over = I.opt.chunk_overlap;
+    for (uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+        const uint64_t n = I.loaded[fid].view().size();
+        if (n == 0) {
+            I.chunks.push_back({fid, 0, 0, 0});
+            continue;
+        }
+        for (uint64_t b = 0; b < n; b += core) {
+            const uint64_t e = std::min(n, b + core), x = std::min(n, e + over);
+            I.chunks.push_back({fid, b, e, x});
+        }
+    }
+    rebuild_planner_stats(I);
+
+    std::array<uint32_t, 8> cnt{};
+    for (auto const& c : I.chunks) ++cnt[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
+    for (int k = 0; k < 8; ++k) {
+        auto& g = I.groups[k];
+        g.lg = k + 9;
+        g.m = 1u << g.lg;
+        g.words = (cnt[k] + 63) / 64;
+        g.gids.reserve(cnt[k]);
+        g.bits.assign((size_t)g.m * g.words, 0);
+    }
+    std::array<uint32_t, 8> local{};
+    for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+        auto c = I.chunks[ci];
+        auto& g = I.groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
+        const uint32_t li = local[g.lg - 9]++;
+        g.gids.push_back(ci);
+        auto v = std::string_view(I.loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
+        const uint32_t mask = g.m - 1;
+        if (v.size() >= 4) {
+            for (size_t j = 0; j + 4 <= v.size(); ++j) {
+                const uint32_t b = detail::hash4((const unsigned char*)v.data() + j) & mask;
+                g.bits[(size_t)b * g.words + (li >> 6)] |= 1ull << (li & 63);
+            }
+        }
+    }
+
+    const uint32_t PO = 64;
+    I.pos_desc.resize(I.chunks.size());
+    size_t pos_total = 0;
+    auto choose_m = [&](uint64_t core_len, uint32_t mask_bytes) {
+        const size_t budget = size_t(double(core_len) * I.opt.positional_budget_ratio);
+        const size_t want = std::max<size_t>(64, budget / std::max<uint32_t>(1, mask_bytes));
+        uint16_t m = 64; while (m < 1024 && static_cast<size_t>(m << 1) <= want) m <<= 1; return m;
+    };
+    for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+        auto z = I.chunks[ci]; const uint64_t core_len = z.core_end - z.core_begin;
+        const uint32_t blocks = std::max<uint32_t>(1, (uint32_t)((core_len + I.pos_block - 1) / I.pos_block));
+        const uint32_t mask_bytes = (blocks + 7) / 8; const uint16_t m = choose_m(core_len, mask_bytes);
+        I.pos_desc[ci] = {uint64_t(pos_total), m, mask_bytes, blocks};
+        pos_total += size_t(m) * mask_bytes;
+    }
+    I.pos.assign(pos_total, 0);
+    for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+        auto z = I.chunks[ci]; const auto d = I.pos_desc[ci]; const auto whole = std::string_view(I.loaded[z.file_id].view());
+        for (uint32_t bi = 0; bi < d.blocks; ++bi) {
+            const uint64_t rb = uint64_t(bi) * I.pos_block;
+            const uint64_t chunk_len = z.ext_end - z.core_begin;
+            if (rb >= chunk_len) continue;
+            const uint64_t re = std::min<uint64_t>(chunk_len, rb + I.pos_block + PO);
+            if (re <= rb || re - rb < 4) continue;
+            auto base = (const unsigned char*)whole.data() + z.core_begin + rb;
+            for (uint64_t j = 0; j + 4 <= re - rb; ++j) {
+                const uint32_t row = detail::hash4(base + j) & (d.m - 1);
+                I.pos[d.off + size_t(row) * d.mask_bytes + (bi >> 3)] |= uint8_t(1u << (bi & 7));
+            }
+        }
+    }
+}
+Index::Index() = default;
+Index::Index(std::shared_ptr<Impl> i) : impl_(std::move(i)) {}
+
+Index Index::build(const fs::path& root, IndexOptions opt) {
+    validate_index_options(opt);
     auto I = std::make_shared<Impl>();
     I->root = fs::weakly_canonical(root);
     std::error_code ec_root;
@@ -365,91 +446,7 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
         I->loaded.push_back({fi, detail::CorpusProvider::resident(std::move(s))});
     }
 
-    uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
-    for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
-        uint64_t n = I->loaded[fid].view().size();
-        if (n == 0) {
-            I->chunks.push_back({fid, 0, 0, 0});
-            continue;
-        }
-        for (uint64_t b = 0; b < n; b += core) {
-            uint64_t e = std::min(n, b + core), x = std::min(n, e + over);
-            I->chunks.push_back({fid, b, e, x});
-        }
-    }
-    rebuild_planner_stats(*I);
-
-    std::array<uint32_t, 8> cnt{};
-    for (auto const& c : I->chunks) ++cnt[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
-    for (int k = 0; k < 8; ++k) {
-        auto& g = I->groups[k];
-        g.lg = k + 9;
-        g.m = 1u << g.lg;
-        g.words = (cnt[k] + 63) / 64;
-        g.gids.reserve(cnt[k]);
-        g.bits.assign((size_t)g.m * g.words, 0);
-    }
-    std::array<uint32_t, 8> local{};
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto c = I->chunks[ci];
-        auto& g = I->groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
-        uint32_t li = local[g.lg - 9]++;
-        g.gids.push_back(ci);
-        auto v = std::string_view(I->loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
-        uint32_t mask = g.m - 1;
-        if (v.size() >= 4) {
-            for (size_t j = 0; j + 4 <= v.size(); ++j) {
-                uint32_t b = detail::hash4((const unsigned char*)v.data() + j) & mask;
-                g.bits[(size_t)b * g.words + (li >> 6)] |= 1ull << (li & 63);
-            }
-        }
-    }
-
-    // Positional Bloom construction — per-chunk block-level q-gram filter.
-    // For each chunk we build a Bloom matrix `pos` of size `m * mask_bytes` bytes:
-    // - `blocks = ceil(core_len / pos_block)` — number of positional blocks in the chunk.
-    //   When core_len is not divisible by pos_block, the last block is smaller but still
-    //   represented; mask_bytes = ceil(blocks/8) ensures one bit per block, with trailing
-    //   bits in the last byte masked off (see fixed_candidate_blocks).
-    // - `mask_bytes = (blocks+7)/8` — bytes needed for one Bloom row's block mask.
-    // - `choose_m(core_len, mask_bytes)` — selects number of Bloom rows `m` (power of two
-    //   in [64,1024]) based on budget = core_len * positional_budget_ratio. `want` is the
-    //   desired total bytes per row budget, and `m` is capped to keep `m * mask_bytes`
-    //   within budget while keeping per-chunk overhead bounded. Larger `m` reduces collisions
-    //   but increases memory; 64 is minimum for reasonable selectivity.
-    // - `PO = 64` — positional overlap: each block's Bloom window extends 64 bytes beyond
-    //   the block boundary to capture q-grams that straddle block edges (conservative).
-    const uint32_t PO = 64;
-    I->pos_desc.resize(I->chunks.size());
-    size_t pos_total = 0;
-    auto choose_m = [&](uint64_t core_len, uint32_t mask_bytes) {
-        size_t budget = size_t(double(core_len) * I->opt.positional_budget_ratio);
-        size_t want = std::max<size_t>(64, budget / std::max<uint32_t>(1, mask_bytes));
-        uint16_t m = 64; while (m < 1024 && static_cast<size_t>(m << 1) <= want) m <<= 1; return m;
-    };
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; uint64_t core_len = z.core_end - z.core_begin;
-        uint32_t blocks = std::max<uint32_t>(1, (uint32_t)((core_len + I->pos_block - 1) / I->pos_block));
-        uint32_t mask_bytes = (blocks + 7) / 8; uint16_t m = choose_m(core_len, mask_bytes);
-        I->pos_desc[ci] = {uint64_t(pos_total), m, mask_bytes, blocks};
-        pos_total += size_t(m) * mask_bytes;
-    }
-    I->pos.assign(pos_total, 0);
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].view());
-        for (uint32_t bi = 0; bi < d.blocks; ++bi) {
-            uint64_t rb = uint64_t(bi) * I->pos_block;
-            uint64_t chunk_len = z.ext_end - z.core_begin;
-            if (rb >= chunk_len) continue;
-            uint64_t re = std::min<uint64_t>(chunk_len, rb + I->pos_block + PO);
-            if (re <= rb || re - rb < 4) continue;
-            auto base = (const unsigned char*)whole.data() + z.core_begin + rb;
-            for (uint64_t j = 0; j + 4 <= re - rb; ++j) {
-                uint32_t row = detail::hash4(base + j) & (d.m - 1);
-                I->pos[d.off + size_t(row) * d.mask_bytes + (bi >> 3)] |= uint8_t(1u << (bi & 7));
-            }
-        }
-    }
+    materialize_index_filters(*I);
     if (!opt.persist_corpus) {
         for (auto& lf : I->loaded) {
 #ifdef _WIN32
@@ -469,16 +466,7 @@ Index Index::build(const fs::path& root, IndexOptions opt) {
 }
 
 Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
-    if (opt.chunk_bytes < 64 || opt.chunk_bytes > (1ULL << 30))
-        throw std::runtime_error("pergrep: chunk_bytes out of range [64, 1073741824]");
-    if (opt.positional_block_bytes < 16 || opt.positional_block_bytes > (1ULL << 20))
-        throw std::runtime_error("pergrep: positional_block_bytes out of range [16, 1048576]");
-    if (opt.chunk_overlap > opt.chunk_bytes / 2)
-        throw std::runtime_error("pergrep: chunk_overlap must be <= chunk_bytes / 2");
-    if (opt.planned_qgrams > 64)
-        throw std::runtime_error("pergrep: planned_qgrams out of range [0, 64]");
-    if (opt.positional_budget_ratio < 0.0 || opt.positional_budget_ratio > 10.0)
-        throw std::runtime_error("pergrep: positional_budget_ratio out of range [0.0, 10.0]");
+    validate_index_options(opt);
 
     auto I = std::make_shared<Impl>();
     I->opt = opt;
@@ -505,79 +493,7 @@ Index Index::from_documents(std::vector<Document> documents, IndexOptions opt) {
         I->loaded.push_back({fi, detail::CorpusProvider::resident(std::move(d.content))});
     }
 
-    uint64_t core = opt.chunk_bytes, over = opt.chunk_overlap;
-    for (uint32_t fid = 0; fid < I->loaded.size(); ++fid) {
-        uint64_t n = I->loaded[fid].view().size();
-        if (n == 0) {
-            I->chunks.push_back({fid, 0, 0, 0});
-            continue;
-        }
-        for (uint64_t b = 0; b < n; b += core) {
-            uint64_t e = std::min(n, b + core), x = std::min(n, e + over);
-            I->chunks.push_back({fid, b, e, x});
-        }
-    }
-    rebuild_planner_stats(*I);
-
-    std::array<uint32_t, 8> cnt{};
-    for (auto const& c : I->chunks) ++cnt[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
-    for (int k = 0; k < 8; ++k) {
-        auto& g = I->groups[k];
-        g.lg = k + 9;
-        g.m = 1u << g.lg;
-        g.words = (cnt[k] + 63) / 64;
-        g.gids.reserve(cnt[k]);
-        g.bits.assign((size_t)g.m * g.words, 0);
-    }
-    std::array<uint32_t, 8> local{};
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto c = I->chunks[ci];
-        auto& g = I->groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
-        uint32_t li = local[g.lg - 9]++;
-        g.gids.push_back(ci);
-        auto v = std::string_view(I->loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
-        uint32_t mask = g.m - 1;
-        if (v.size() >= 4) {
-            for (size_t j = 0; j + 4 <= v.size(); ++j) {
-                uint32_t b = detail::hash4((const unsigned char*)v.data() + j) & mask;
-                g.bits[(size_t)b * g.words + (li >> 6)] |= 1ull << (li & 63);
-            }
-        }
-    }
-
-    // Positional Bloom — same construction as in Index::build (see comment above).
-    // Blocks = ceil(core_len / pos_block), mask_bytes = ceil(blocks/8), choose_m as above.
-    const uint32_t PO = 64;
-    I->pos_desc.resize(I->chunks.size());
-    size_t pos_total = 0;
-    auto choose_m = [&](uint64_t core_len, uint32_t mask_bytes) {
-        size_t budget = size_t(double(core_len) * I->opt.positional_budget_ratio);
-        size_t want = std::max<size_t>(64, budget / std::max<uint32_t>(1, mask_bytes));
-        uint16_t m = 64; while (m < 1024 && static_cast<size_t>(m << 1) <= want) m <<= 1; return m;
-    };
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; uint64_t core_len = z.core_end - z.core_begin;
-        uint32_t blocks = std::max<uint32_t>(1, (uint32_t)((core_len + I->pos_block - 1) / I->pos_block));
-        uint32_t mask_bytes = (blocks + 7) / 8; uint16_t m = choose_m(core_len, mask_bytes);
-        I->pos_desc[ci] = {uint64_t(pos_total), m, mask_bytes, blocks};
-        pos_total += size_t(m) * mask_bytes;
-    }
-    I->pos.assign(pos_total, 0);
-    for (uint32_t ci = 0; ci < I->chunks.size(); ++ci) {
-        auto z = I->chunks[ci]; auto d = I->pos_desc[ci]; auto whole = std::string_view(I->loaded[z.file_id].view());
-        for (uint32_t bi = 0; bi < d.blocks; ++bi) {
-            uint64_t rb = uint64_t(bi) * I->pos_block;
-            uint64_t chunk_len = z.ext_end - z.core_begin;
-            if (rb >= chunk_len) continue;
-            uint64_t re = std::min<uint64_t>(chunk_len, rb + I->pos_block + PO);
-            if (re <= rb || re - rb < 4) continue;
-            auto base = (const unsigned char*)whole.data() + z.core_begin + rb;
-            for (uint64_t j = 0; j + 4 <= re - rb; ++j) {
-                uint32_t row = detail::hash4(base + j) & (d.m - 1);
-                I->pos[d.off + size_t(row) * d.mask_bytes + (bi >> 3)] |= uint8_t(1u << (bi & 7));
-            }
-        }
-    }
+    materialize_index_filters(*I);
     return Index(I);
 }
 
