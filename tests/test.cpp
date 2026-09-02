@@ -404,6 +404,109 @@ int main(){
     fs::remove_all(base);
   }
 
+  // M4.2: appended immutable segments. append() rebuilds a merged document view
+  // from the base's files (replace-by-path, else append) and materializes an
+  // ephemeral resident index that is byte-identical to a full from_documents
+  // rebuild over the same merged document set.
+  {
+    std::vector<Document> base_docs = {
+        {"a.txt", "alpha\n"}, {"b.txt", "beta\n"}, {"c.txt", "gamma\n"}};
+    auto base = Index::from_documents(base_docs);
+
+    std::vector<Document> changed = {
+        {"b.txt", "beta-CHANGED\n"}, {"d.txt", "delta\n"}};
+    SegmentManifest manifest;
+    manifest.paths = {"b.txt", "d.txt"};
+    manifest.corpus_files = 4; // a, b, c, d after merge
+    manifest.corpus_bytes = std::string("alpha\n").size() +
+                            std::string("beta-CHANGED\n").size() +
+                            std::string("gamma\n").size() +
+                            std::string("delta\n").size();
+
+    auto merged = Index::append(base, changed, manifest);
+
+    // Path-sorted merged identity: b.txt replaced in place, d.txt appended.
+    {
+      std::vector<std::string> paths;
+      for (const auto& fi : merged.files()) paths.push_back(fi.path);
+      assert((paths == std::vector<std::string>{"a.txt", "b.txt", "c.txt", "d.txt"}));
+    }
+    // Replacement and new-file contents; unchanged documents stay intact.
+    {
+      std::size_t a = 0, b = 0, c = 0, d = 0;
+      bool fa = false, fb = false, fc = false, fd = false;
+      for (std::size_t i = 0; i < merged.files().size(); ++i) {
+        if (merged.files()[i].path == "a.txt") { a = i; fa = true; }
+        if (merged.files()[i].path == "b.txt") { b = i; fb = true; }
+        if (merged.files()[i].path == "c.txt") { c = i; fc = true; }
+        if (merged.files()[i].path == "d.txt") { d = i; fd = true; }
+      }
+      assert(fa && fb && fc && fd);
+      assert(merged.content(b) == "beta-CHANGED\n");
+      assert(merged.content(d) == "delta\n");
+      assert(merged.content(a) == "alpha\n");
+      assert(merged.content(c) == "gamma\n");
+    }
+
+    // Manifest consistency: paths carry the appended documents and the declared
+    // post-merge totals match the recomputed merged result.
+    assert(manifest.paths.size() == 2);
+    assert(manifest.paths[0] == "b.txt" && manifest.paths[1] == "d.txt");
+    assert(manifest.corpus_files == merged.files().size());
+    assert(manifest.corpus_bytes == merged.corpus_bytes());
+
+    // Equivalence vs a full from_documents rebuild over the same document set,
+    // across literal, regex, and word modes.
+    std::vector<Document> full_docs = {
+        {"a.txt", "alpha\n"}, {"b.txt", "beta-CHANGED\n"},
+        {"c.txt", "gamma\n"}, {"d.txt", "delta\n"}};
+    auto full = Index::from_documents(full_docs);
+    Searcher smerged(merged), sfull(full);
+    for (const auto& pat_expr : {"alpha", "beta-CHANGED", "delta", "a.*a", "e[tT]"}) {
+      auto p = Pattern::compile(pat_expr);
+      auto m1 = smerged.find(p), m2 = sfull.find(p);
+      assert(m1.size() == m2.size());
+      for (std::size_t i = 0; i < m1.size(); ++i) {
+        assert(m1[i].file_id == m2[i].file_id);
+        assert(m1[i].start == m2[i].start);
+        assert(m1[i].end == m2[i].end);
+      }
+    }
+    {
+      auto pw = Pattern::compile("alpha", PatternOptions{.kind = PatternKind::Fixed, .word = true});
+      assert(smerged.find(pw).size() == sfull.find(pw).size());
+    }
+
+    // Wildcard manifest (zero totals) must not throw and still produce the
+    // identical merged index.
+    SegmentManifest wildcard;
+    wildcard.paths = {"b.txt", "d.txt"};
+    auto merged_wc = Index::append(base, changed, wildcard);
+    assert(merged_wc.files().size() == merged.files().size());
+    for (std::size_t i = 0; i < merged_wc.files().size(); ++i)
+      assert(merged_wc.content(i) == merged.content(i));
+
+    // Fallback: a delta at least as large as the base corpus is rebuilt
+    // identically and remains fully queryable versus the full rebuild.
+    {
+      auto small_base = Index::from_documents({{"f0.txt", "ab\n"}});
+      std::string big = "needle needle needle needle needle\n";
+      assert(big.size() >= small_base.corpus_bytes());
+      std::vector<Document> big_changed = {{"f0.txt", big}};
+      SegmentManifest big_manifest; big_manifest.paths = {"f0.txt"};
+      auto merged_big = Index::append(small_base, big_changed, big_manifest);
+      auto ref_big = Index::from_documents({{"f0.txt", big}});
+      auto pm = Searcher(merged_big).find(Pattern::compile("needle", {.kind = PatternKind::Fixed}));
+      auto pr = Searcher(ref_big).find(Pattern::compile("needle", {.kind = PatternKind::Fixed}));
+      assert(pm.size() == pr.size());
+      for (std::size_t i = 0; i < pm.size(); ++i) {
+        assert(pm[i].file_id == pr[i].file_id);
+        assert(pm[i].start == pr[i].start);
+        assert(pm[i].end == pr[i].end);
+      }
+    }
+  }
+
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));
