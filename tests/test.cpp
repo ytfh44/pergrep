@@ -123,6 +123,92 @@ int main(){
     assert(Searcher(owner).find(pattern).size() == Searcher(resident).find(pattern).size());
     fs::remove_all(base);
   }
+  // M3.6: equivalent source-backed and resident indexes produce identical
+  // filter structures (chunks, group Bloom, positional Bloom) and search results;
+  // only the storage provider differs. Guards the shared construction contract.
+  {
+    const auto base = fs::temp_directory_path() / "pergrep_m36_equivalence";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    const std::string a = "alpha beta gamma alpha\nsecond line alpha\n";
+    const std::string b = "another file with lambda and needle\n";
+    const std::string c = ""; // empty file, still contributes one empty chunk
+    {
+      std::ofstream f(root / "a.txt", std::ios::binary); f << a;
+      std::ofstream g(root / "b.txt", std::ios::binary); g << b;
+      std::ofstream h(root / "c.txt", std::ios::binary); h << c;
+    }
+    // Non-default parameters forces the shared chunk/positional math to be
+    // exercised identically on both paths (chunk cores < file size).
+    IndexOptions opt;
+    opt.chunk_bytes = 96; opt.chunk_overlap = 16;
+    opt.positional_block_bytes = 48; opt.positional_budget_ratio = 1.5;
+
+    auto fs_idx = Index::build(root, opt);
+    std::vector<Document> docs = {{"a.txt", a}, {"b.txt", b}, {"c.txt", c}};
+    auto mem_idx = Index::from_documents(docs, opt);
+
+    const auto& F = *static_cast<const pergrep::detail::IndexData*>(fs_idx.debug_index_data());
+    const auto& M = *static_cast<const pergrep::detail::IndexData*>(mem_idx.debug_index_data());
+
+    // Filter structures must be byte-identical. Provider/root/ephemeral differ
+    // by design, so those are the only excluded fields.
+    assert(F.corp_bytes == M.corp_bytes);
+    assert(F.infos.size() == M.infos.size());
+    for (size_t i = 0; i < F.infos.size(); ++i) {
+      assert(F.infos[i].path == M.infos[i].path);
+      assert(F.infos[i].size == M.infos[i].size);
+      assert(F.infos[i].binary == M.infos[i].binary);
+    }
+    // Chunk/PosDesc aggregates lack operator==; compare trivially-copyable
+    // layouts byte-for-byte and the widened planner tables element-wise.
+    assert(F.chunks.size() == M.chunks.size());
+    for (size_t ci = 0; ci < F.chunks.size(); ++ci) {
+      assert(F.chunks[ci].file_id == M.chunks[ci].file_id);
+      assert(F.chunks[ci].core_begin == M.chunks[ci].core_begin);
+      assert(F.chunks[ci].core_end == M.chunks[ci].core_end);
+      assert(F.chunks[ci].ext_end == M.chunks[ci].ext_end);
+    }
+    for (int k = 0; k < 8; ++k) {
+      assert(F.groups[k].lg == M.groups[k].lg);
+      assert(F.groups[k].m == M.groups[k].m);
+      assert(F.groups[k].words == M.groups[k].words);
+      assert(F.groups[k].gids == M.groups[k].gids);
+      assert(F.groups[k].bits == M.groups[k].bits);
+    }
+    assert(F.pos_desc.size() == M.pos_desc.size());
+    for (size_t pi = 0; pi < F.pos_desc.size(); ++pi) {
+      assert(F.pos_desc[pi].off == M.pos_desc[pi].off);
+      assert(F.pos_desc[pi].m == M.pos_desc[pi].m);
+      assert(F.pos_desc[pi].mask_bytes == M.pos_desc[pi].mask_bytes);
+      assert(F.pos_desc[pi].blocks == M.pos_desc[pi].blocks);
+    }
+    assert(F.pos == M.pos);
+    assert(F.byte_freq == M.byte_freq);
+    assert(F.qgram_freq == M.qgram_freq);
+
+    // Search equivalence across literal, regex, word, and overlapping modes.
+    Searcher sfs(fs_idx), smem(mem_idx);
+    for (const auto& pat_expr : {"alpha", "lambda", "needle", "a.*e", "e[nt]d"}) {
+      auto p = Pattern::compile(pat_expr);
+      auto mf = sfs.find(p), mm = smem.find(p);
+      assert(mf.size() == mm.size());
+      for (size_t i = 0; i < mf.size(); ++i) {
+        assert(mf[i].file_id == mm[i].file_id);
+        assert(mf[i].start == mm[i].start);
+        assert(mf[i].end == mm[i].end);
+      }
+    }
+    {
+      auto pw = Pattern::compile("alpha", PatternOptions{.kind = PatternKind::Fixed, .word = true});
+      assert(sfs.find(pw).size() == smem.find(pw).size());
+      SearchOptions ov; ov.overlapping = true;
+      assert(sfs.find(pw, ov).size() == smem.find(pw, ov).size());
+    }
+    fs::remove_all(base);
+  }
+
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));
