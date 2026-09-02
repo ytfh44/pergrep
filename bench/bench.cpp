@@ -174,12 +174,26 @@ bool validate_scenario(const WorkloadScenario& scenario, const std::vector<Docum
                        const IndexOptions& options, const IndexOptions& ref_options) {
     std::unique_ptr<TempDirectory> temp_dir;
     Index indexed;
-    if (scenario.storage == StorageBackend::Filesystem) {
+    if (scenario.storage == StorageBackend::Filesystem || scenario.storage == StorageBackend::Packed) {
         temp_dir = std::make_unique<TempDirectory>("pergrep_val_" + scenario.name);
         for (const auto& doc : documents) {
             temp_dir->write_file(doc.path, doc.content);
         }
-        indexed = Index::build(temp_dir->path(), options);
+        IndexOptions opt = options;
+        opt.persist_corpus = (scenario.storage == StorageBackend::Packed);
+        indexed = Index::build(temp_dir->path(), opt);
+        if (opt.persist_corpus) {
+            std::unique_ptr<TempDirectory> idx_dir =
+                std::make_unique<TempDirectory>("pergrep_val_idx_" + scenario.name);
+            const auto index_file = idx_dir->path() / "index.pgi";
+            indexed.save(index_file);
+            // Drop the source tree; the snapshot must be self-contained.
+            for (const auto& doc : documents) {
+                std::error_code ec;
+                std::filesystem::remove(temp_dir->path() / doc.path, ec);
+            }
+            indexed = Index::load(index_file);
+        }
     } else {
         indexed = Index::from_documents(documents, options);
     }
@@ -288,16 +302,18 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
 
     std::vector<double> scenario_latencies;
 
-    if (scenario.storage == StorageBackend::Filesystem) {
+    if (scenario.storage == StorageBackend::Filesystem || scenario.storage == StorageBackend::Packed) {
         TempDirectory temp_dir("pergrep_bench_fs_" + scenario.name);
         TempDirectory index_dir("pergrep_bench_idx_" + scenario.name);
         for (const auto& doc : documents) {
             temp_dir.write_file(doc.path, doc.content);
         }
+        IndexOptions opt = options;
+        opt.persist_corpus = (scenario.storage == StorageBackend::Packed);
         const auto index_file = index_dir.path() / "index.pgi";
         // 1. Build
         const auto build_start = std::chrono::steady_clock::now();
-        auto index = Index::build(temp_dir.path(), options);
+        auto index = Index::build(temp_dir.path(), opt);
         const auto build_end = std::chrono::steady_clock::now();
         totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
         totals.corpus_bytes = index.corpus_bytes();
@@ -307,13 +323,22 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
         const auto save_start = std::chrono::steady_clock::now();
         index.save(index_file);
         const auto save_end = std::chrono::steady_clock::now();
-        totals.index_save_ms = std::chrono::duration<double, std::milli>(save_end - save_start).count();
-
+        // 2b. Packed snapshot independence: the persisted corpus must reload
+        // without the source tree.
+        if (opt.persist_corpus) {
+            for (const auto& doc : documents) {
+                std::error_code ec;
+                std::filesystem::remove(temp_dir.path() / doc.path, ec);
+            }
+        }
         // 3. Load
         const auto load_start = std::chrono::steady_clock::now();
         auto loaded_index = Index::load(index_file);
         const auto load_end = std::chrono::steady_clock::now();
         totals.index_load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
+        if (opt.persist_corpus && !loaded_index.is_snapshot()) {
+            std::cerr << "WARNING: packed load did not report is_snapshot for scenario=" << scenario.name << "\n";
+        }
 
         // 4. Freshness
         const auto fresh_start = std::chrono::steady_clock::now();
