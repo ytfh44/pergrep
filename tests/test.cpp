@@ -337,6 +337,73 @@ int main(){
     }
   }
 
+  // M4.1: stable document identity. file_id is the path-sorted position and is
+  // invariant to traversal/insertion order; rename retires the old path and adds
+  // a new one; replace-in-place keeps the path but serves new content.
+  {
+    const auto base = fs::temp_directory_path() / "pergrep_m41_identity";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    {
+      std::ofstream f(root / "a.txt", std::ios::binary); f << "alpha\n";
+      std::ofstream g(root / "b.txt", std::ios::binary); g << "beta alpha\n";
+      std::ofstream h(root / "c.txt", std::ios::binary); h << "gamma\n";
+    }
+    auto idx1 = Index::build(root);
+    // Same document set enumerated in a different order must map to the identical
+    // path-sorted file_id assignment: files()/content()/search all align.
+    std::vector<Document> shuffled = {
+        {"c.txt", "gamma\n"}, {"a.txt", "alpha\n"}, {"b.txt", "beta alpha\n"}};
+    auto idx2 = Index::from_documents(shuffled);
+    assert(idx1.files().size() == idx2.files().size());
+    for (std::size_t i = 0; i < idx1.files().size(); ++i) {
+      assert(idx1.files()[i].path == idx2.files()[i].path);
+      assert(idx1.files()[i].size == idx2.files()[i].size);
+      assert(idx1.content(i) == idx2.content(i));
+    }
+    {
+      auto p = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto m1 = Searcher(idx1).find(p), m2 = Searcher(idx2).find(p);
+      assert(m1.size() == m2.size());
+      for (std::size_t i = 0; i < m1.size(); ++i) {
+        assert(m1[i].file_id == m2[i].file_id);
+        assert(m1[i].start == m2[i].start);
+        assert(m1[i].end == m2[i].end);
+      }
+    }
+    // Rename b.txt -> z.txt: the old path is tombstoned (retired), the new path
+    // occupies its own sorted slot. No stale alias of b.txt's file_id remains.
+    fs::rename(root / "b.txt", root / "z.txt");
+    auto renamed = Index::build(root);
+    bool has_b = false, has_z = false;
+    for (const auto& fi : renamed.files()) {
+      if (fi.path == "b.txt") has_b = true;
+      if (fi.path == "z.txt") has_z = true;
+    }
+    assert(!has_b && has_z);
+    // Replace a.txt in place: the path identity persists, the content is new.
+    {
+      std::ofstream f(root / "a.txt", std::ios::binary | std::ios::trunc);
+      f << "alpha-REPLACED\n";
+    }
+    auto replaced = Index::build(root);
+    Searcher sr(replaced);
+    auto rep = sr.find(Pattern::compile("REPLACED", {.kind = PatternKind::Fixed}));
+    assert(rep.size() == 1);
+    std::size_t a_id = 0;
+    bool found_a = false;
+    for (std::size_t i = 0; i < replaced.files().size(); ++i) {
+      if (replaced.files()[i].path == "a.txt") { a_id = i; found_a = true; break; }
+    }
+    assert(found_a);
+    assert(rep[0].file_id == a_id);
+    // The old exact bytes ("alpha\n") are no longer served for a.txt's identity.
+    assert(replaced.content(a_id) == "alpha-REPLACED\n");
+    assert(replaced.content(a_id) != "alpha\n");
+    fs::remove_all(base);
+  }
+
   // Default engine is regular: PCRE-only constructs are compile errors.
   assert(throws_compile(R"((ab)\1)"));
   assert(throws_compile(R"(a(?=b))"));
