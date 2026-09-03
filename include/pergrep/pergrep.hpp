@@ -162,6 +162,10 @@ public:
     static Index load(const std::filesystem::path& file, const CacheManifest& expected);
     void save(const std::filesystem::path& file) const;
     void save(const std::filesystem::path& file, const CacheManifest& manifest) const;
+    // M4.7: remove stale temp files matching pattern (default ".tmp.") from a directory.
+    // Returns true if any were removed. No-throw; intended for startup recovery.
+    static bool cleanup_orphans(const std::filesystem::path& dir,
+                                std::string_view pattern = ".tmp.");
 
     const std::filesystem::path& root() const noexcept;
     const IndexOptions& options() const noexcept;

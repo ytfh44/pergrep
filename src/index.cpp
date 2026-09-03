@@ -864,6 +864,23 @@ inline std::string pid_suffix() {
 #endif
 }
 }
+// M4.7: remove stale temp files matching pattern from dir. Returns true if any were removed. No-throw.
+bool pergrep::Index::cleanup_orphans(const fs::path& dir, std::string_view pattern) {
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || ec) return false;
+    bool any = false;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        auto name = entry.path().filename().string();
+        if (name.find(pattern) != std::string::npos) {
+            std::error_code ec_rm;
+            fs::remove(entry.path(), ec_rm);
+            any = true;
+        }
+    }
+    return any;
+}
 void Index::save(const fs::path& file) const {
     save(file, CacheManifest{});
 }
@@ -1036,6 +1053,8 @@ Index Index::load(const fs::path& file, const CacheManifest& expected) {
 }
 
 Index Index::load_impl(const fs::path& file, const CacheManifest& expected, bool manifest_aware) {
+    // M4.7: reclaim any crashed writer's temp before opening the target.
+    Index::cleanup_orphans(file.parent_path(), ".tmp.");
     // Truncation guard: check file size is at least header before reading.
     std::uint64_t snapshot_size = 0;
     {
