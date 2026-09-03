@@ -394,6 +394,14 @@ using PosDesc = detail::PosDesc;
     std::int64_t root_mtime_ns = 0;
     std::uint32_t pos_block = 256;
     bool ephemeral = false;
+    // M4.5 compaction bounds: transient accounting of the accumulated append
+    // segment chain (logical segments only; on-disk files are deferred to M4.7).
+    // Never serialized. Reset to zero by a fresh full build (build /
+    // from_documents / load) and by compaction. appended_bytes sums the bytes of
+    // documents changed/replaced/added and of tombstone-removed base documents
+    // across the chain since the last full materialization.
+    std::size_t segment_count = 0;
+    std::uint64_t appended_bytes = 0;
 
     std::uint64_t bytes() const noexcept {
         std::uint64_t n = pos.size() + pos_desc.size()*sizeof(PosDesc) + chunks.size()*sizeof(Chunk);
