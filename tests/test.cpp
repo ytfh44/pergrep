@@ -4942,5 +4942,72 @@ int main(){
       assert(!Index::should_compact(compacted.corpus_bytes(), cs.segment_count, cs.appended_bytes));
     }
   }
+  // M4.6: immutable generation + snapshot consistency. An Index value (and its
+  // copies) names one immutable generation; producing a newer generation never
+  // mutates one a reader still holds, and no reader observes cross-generation
+  // mixing (old filters with new content, old paths with new file-ids).
+  {
+    // Base generation {a,b,c}.
+    Index idx = Index::from_documents({
+        {"a.txt", "alpha\n"},
+        {"b.txt", "beta\n"},
+        {"c.txt", "gamma\n"}});
+    Index snap = idx; // a copy shares the SAME immutable Impl (generation)
+
+    // Advance to a new generation: replace b.txt's bytes, add d.txt.
+    idx = Index::from_documents({
+        {"a.txt", "alpha\n"},
+        {"b.txt", "B2\n"},
+        {"c.txt", "gamma\n"},
+        {"d.txt", "delta\n"}});
+
+    // (a) The held snapshot still reports the OLD files/content; the reassigned
+    // handle reports the new set. A held snapshot never mixes old and new.
+    assert(snap.files().size() == 3);
+    assert(idx.files().size() == 4);
+    std::size_t snap_b = 0, idx_b = 0;
+    for (std::size_t i = 0; i < 3; ++i) if (snap.files()[i].path == "b.txt") snap_b = i;
+    for (std::size_t i = 0; i < 4; ++i) if (idx.files()[i].path == "b.txt") idx_b = i;
+    assert(snap.content(snap_b) == "beta\n"); // old bytes still served by snapshot
+    assert(idx.content(idx_b)   == "B2\n");   // new bytes served by new handle
+    bool snap_has_d = false, idx_has_d = false;
+    for (const auto& fi : snap.files()) snap_has_d |= (fi.path == "d.txt");
+    for (const auto& fi : idx.files())  idx_has_d  |= (fi.path == "d.txt");
+    assert(!snap_has_d && idx_has_d); // d.txt exists only in the new generation
+
+    // (b) Search consistency: every match's file_id/offset slice exactly the
+    // literal within the SAME generation that produced it (no cross-contamination).
+    auto consistent = [](const Index& ix, const Pattern& p, std::string_view lit) {
+      std::vector<Match> ms = Searcher(ix).find(p);
+      for (const auto& m : ms) {
+        std::string_view c = ix.content(m.file_id);
+        assert(m.end <= c.size());
+        assert(c.substr(m.start, m.end - m.start) == lit);
+      }
+      return ms;
+    };
+
+    Pattern pBeta  = Pattern::compile("beta",  {.kind = PatternKind::Fixed});
+    Pattern pB2    = Pattern::compile("B2",    {.kind = PatternKind::Fixed});
+    Pattern pAlpha = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+    Pattern pDelta = Pattern::compile("delta", {.kind = PatternKind::Fixed});
+
+    auto sb = consistent(snap, pBeta, "beta");
+    assert(sb.size() == 1 && sb[0].file_id == snap_b); // old gen sees old beta
+    assert(consistent(idx, pBeta, "beta").empty());    // beta entirely gone in new gen
+    auto ib = consistent(idx, pB2, "B2");
+    assert(ib.size() == 1 && ib[0].file_id == idx_b);   // new gen sees B2
+    assert(consistent(snap, pB2, "B2").empty());        // old gen never sees B2
+    auto sa = consistent(snap, pAlpha, "alpha");
+    auto ia = consistent(idx,  pAlpha, "alpha");
+    assert(sa.size() == 1 && ia.size() == 1 && sa[0].file_id == ia[0].file_id);
+    auto id = consistent(idx, pDelta, "delta");
+    assert(id.size() == 1); // delta (d.txt) appears only in the new generation
+
+    // (c) A copy of the new handle shares storage: identical content per file id.
+    Index c = idx;
+    for (std::size_t i = 0; i < idx.files().size(); ++i)
+      assert(c.content(i) == idx.content(i));
+  }
   return 0;
 }
