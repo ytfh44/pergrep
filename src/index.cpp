@@ -506,11 +506,19 @@ Index Index::append(const Index& base, std::vector<Document> changed, const Segm
     // drop any path carrying a tombstone (M4.3 delete/rename-away), then apply
     // each changed document by path — replace in place when present, otherwise
     // append as a new file.
+    // M4.5: while walking the base, account the bytes this append introduces or
+    // removes (changed/replaced content plus tombstoned base bytes) so the
+    // transient compaction bound can be advanced without a second traversal.
     std::unordered_set<std::string> tombstone_set(manifest.tombstones.begin(), manifest.tombstones.end());
+    std::uint64_t appended_delta = 0;
+    for (const auto& c : changed) appended_delta += c.content.size();
     std::vector<Document> merged;
     merged.reserve(base.files().size() + changed.size());
     for (std::size_t i = 0; i < base.files().size(); ++i) {
-        if (tombstone_set.count(base.files()[i].path)) continue;
+        if (tombstone_set.count(base.files()[i].path)) {
+            appended_delta += base.files()[i].size;
+            continue;
+        }
         merged.push_back(Document{base.files()[i].path, std::string(base.content(i))});
     }
     for (auto& c : changed) {
@@ -536,7 +544,14 @@ Index Index::append(const Index& base, std::vector<Document> changed, const Segm
     // the full-rebuild fallback (changed delta >= base corpus, or an empty base
     // filter set) are observably identical. Both converge on from_documents,
     // which materializes filter structures via the shared M3.6 contract.
-    return Index::from_documents(std::move(merged), opt);
+    Index result = Index::from_documents(std::move(merged), opt);
+    // M4.5: advance the transient compaction accounting by one logical segment
+    // and the bytes this append introduced/removed, carried over from the base.
+    if (result.impl_ && base.impl_) {
+        result.impl_->segment_count = base.impl_->segment_count + 1;
+        result.impl_->appended_bytes = base.impl_->appended_bytes + appended_delta;
+    }
+    return result;
 }
 
 const fs::path& Index::root() const noexcept {
@@ -565,6 +580,24 @@ bool Index::is_snapshot() const noexcept {
 }
 const void* Index::debug_index_data() const noexcept {
     return impl_ ? static_cast<const void*>(impl_.get()) : nullptr;
+}
+CompactionStats Index::compaction_stats() const noexcept {
+    CompactionStats stats;
+    if (!impl_) return stats;
+    stats.segment_count = impl_->segment_count;
+    stats.appended_bytes = impl_->appended_bytes;
+    const std::uint64_t corpus = impl_->corp_bytes;
+    if (corpus != 0)
+        stats.read_amplification = static_cast<double>(impl_->appended_bytes) / static_cast<double>(corpus);
+    return stats;
+}
+bool Index::should_compact(std::uint64_t corpus_bytes, std::size_t segments,
+                           std::uint64_t appended_bytes) noexcept {
+    if (segments > kMaxSegmentFanout) return true;
+    if (corpus_bytes != 0 &&
+        appended_bytes > static_cast<std::uint64_t>(static_cast<double>(corpus_bytes) * kCompactionByteRatio))
+        return true;
+    return false;
 }
 
 // QO-5: Freshness check is O(files) — re-traverses the directory tree and compares

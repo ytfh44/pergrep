@@ -4836,5 +4836,111 @@ int main(){
     }
     fs::remove_all(base);
   }
+  // M4.5: bound compaction cost and segment read amplification. Logical append
+  // segments accumulate a transient chain (segment_count / appended_bytes); a
+  // full from_documents rebuild (compaction) resets that chain and is observably
+  // identical to the last appended index.
+  {
+    const std::string a0 = "alpha 111\n";
+    const std::string b0 = "beta  222\n";
+    const std::string c0 = "gamma 333\n";
+    // A large never-touched document keeps the live corpus large enough that a
+    // short chain of small replacements stays under the 25% byte ratio.
+    const std::string pad0 = std::string(400, 'q');
+    std::vector<Document> base_docs = {{"a.txt", a0}, {"b.txt", b0}, {"c.txt", c0}, {"pad.txt", pad0}};
+    auto base = Index::from_documents(base_docs);
+
+    // A fresh full build reports a zero chain and never triggers compaction.
+    {
+      auto cs = base.compaction_stats();
+      assert(cs.segment_count == 0);
+      assert(cs.appended_bytes == 0);
+      assert(cs.read_amplification == 0.0);
+      assert(!Index::should_compact(base.corpus_bytes(), cs.segment_count, cs.appended_bytes));
+    }
+
+    // Accumulate a chain: repeated replacements of a.txt plus a tombstone of b.txt.
+    auto cur = base;
+    std::size_t expected_segments = 0;
+    std::uint64_t expected_appended = 0;
+
+    {
+      const std::string a1 = "alpha REPLACED 1\n";
+      SegmentManifest m;
+      m.paths = {"a.txt"};
+      cur = Index::append(cur, {{"a.txt", a1}}, m);
+      expected_segments += 1;
+      expected_appended += a1.size();
+    }
+    {
+      auto cs = cur.compaction_stats();
+      assert(cs.segment_count == expected_segments);
+      assert(cs.appended_bytes == expected_appended);
+    }
+
+    {
+      const std::string a2 = "alpha REPLACED 2\n";
+      SegmentManifest m;
+      m.paths = {"a.txt"};
+      m.tombstones = {"b.txt"};
+      cur = Index::append(cur, {{"a.txt", a2}}, m);
+      expected_segments += 1;
+      expected_appended += a2.size() + b0.size();
+    }
+    {
+      auto cs = cur.compaction_stats();
+      assert(cs.segment_count == expected_segments);
+      assert(cs.appended_bytes == expected_appended);
+      // read_amplification == appended_bytes / corpus_bytes (deterministic doubles).
+      assert(cs.read_amplification == static_cast<double>(expected_appended) /
+                                         static_cast<double>(cur.corpus_bytes()));
+    }
+
+    // The declared bounds flip should_compact: >64 segments, or appended bytes
+    // strictly exceeding 25% of a non-empty corpus. Empty corpus never byte-triggers.
+    assert(!Index::should_compact(cur.corpus_bytes(), cur.compaction_stats().segment_count,
+                                  cur.compaction_stats().appended_bytes));
+    assert(Index::should_compact(cur.corpus_bytes(), kMaxSegmentFanout + 1, 0));
+    assert(Index::should_compact(cur.corpus_bytes(), 0, cur.corpus_bytes()));
+    assert(!Index::should_compact(16, 1, 4)); // 4 == 25% of 16 is NOT strictly greater
+    assert(!Index::should_compact(0, 1, 100)); // empty corpus: byte bound has no divisor
+
+    // Compaction == full from_documents rebuild over the merged set: identical
+    // files/content and identical search results for every pattern.
+    auto last_append = cur;
+    std::vector<Document> merged_docs;
+    for (std::size_t i = 0; i < last_append.files().size(); ++i)
+      merged_docs.push_back({last_append.files()[i].path, std::string(last_append.content(i))});
+    auto compacted = Index::from_documents(std::move(merged_docs));
+
+    assert(compacted.files().size() == last_append.files().size());
+    for (std::size_t i = 0; i < compacted.files().size(); ++i) {
+      assert(compacted.files()[i].path == last_append.files()[i].path);
+      assert(compacted.files()[i].size == last_append.files()[i].size);
+      assert(compacted.content(i) == last_append.content(i));
+    }
+    Searcher sc(compacted), sl(last_append);
+    for (const auto& expr : {"alpha", "REPLACED", "gamma", "beta", "a.*a", "[0-9]"}) {
+      auto pc = sc.find(Pattern::compile(expr));
+      auto pl = sl.find(Pattern::compile(expr));
+      assert(pc.size() == pl.size());
+      for (std::size_t i = 0; i < pc.size(); ++i) {
+        assert(pc[i].file_id == pl[i].file_id);
+        assert(pc[i].start == pl[i].start);
+        assert(pc[i].end == pl[i].end);
+      }
+    }
+    // The tombstoned b.txt's unique token is gone from the merged set.
+    assert(sc.find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).empty());
+
+    // A full rebuild (single-threaded, pure from_documents) resets the chain to zero.
+    {
+      auto cs = compacted.compaction_stats();
+      assert(cs.segment_count == 0);
+      assert(cs.appended_bytes == 0);
+      assert(cs.read_amplification == 0.0);
+      assert(!Index::should_compact(compacted.corpus_bytes(), cs.segment_count, cs.appended_bytes));
+    }
+  }
   return 0;
 }

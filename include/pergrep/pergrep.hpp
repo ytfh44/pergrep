@@ -124,6 +124,24 @@ struct SegmentManifest {
     std::uint64_t corpus_files = 0;      // total files after merge (0 = wildcard)
     std::uint64_t corpus_bytes = 0;      // total corpus bytes after merge (0 = wildcard)
 };
+// M4.5: bound compaction cost and segment read amplification. There are no
+// on-disk segment files yet (deferred to M4.7), so a "segment" is one logical
+// accumulated append; "compaction" materializes the accumulated append chain
+// into a single fresh base (equivalent to a full from_documents rebuild of the
+// merged set). Compaction is triggered when the number of accumulated appended
+// segments exceeds kMaxSegmentFanout, or when the accumulated changed/
+// replaced/tombstoned bytes exceed kCompactionByteRatio of the live corpus.
+inline constexpr std::size_t kMaxSegmentFanout = 64;
+inline constexpr double kCompactionByteRatio = 0.25;
+// Reflects the accumulated append manifest chain carried in memory alongside a
+// merged Index. segment_count is the number of logical segments appends have
+// accumulated; appended_bytes is the summed changed/replaced/tombstoned bytes;
+// read_amplification is appended_bytes / corpus_bytes (0 when corpus is empty).
+struct CompactionStats {
+    std::size_t segment_count = 0;
+    std::uint64_t appended_bytes = 0;
+    double read_amplification = 0.0;
+};
 struct Document {
     std::string path;
     std::string content;
@@ -158,6 +176,16 @@ public:
     // QO-4 test hook: expose underlying IndexData for cost-model unit tests.
     // Returns nullptr if index is empty. Stable for the lifetime of the Index.
     const void* debug_index_data() const noexcept;
+    // M4.5: reflect the accumulated append segment chain (logical segments) and
+    // its read amplification. Zero after a fresh full build / from_documents /
+    // load and after compaction; bumped by append().
+    CompactionStats compaction_stats() const noexcept;
+    // M4.5: compaction trigger predicate. True when the accumulated segment
+    // count exceeds kMaxSegmentFanout or the accumulated appended bytes exceed
+    // kCompactionByteRatio of the live corpus. Declared constants are used; the
+    // predicate performs no I/O and is safe to call from any thread.
+    static bool should_compact(std::uint64_t corpus_bytes, std::size_t segments,
+                               std::uint64_t appended_bytes) noexcept;
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
