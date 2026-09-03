@@ -5009,5 +5009,86 @@ int main(){
     for (std::size_t i = 0; i < idx.files().size(); ++i)
       assert(c.content(i) == idx.content(i));
   }
+  // M4.7: crash-safe segment/snapshot publication — ADR-0052
+  {
+    std::cerr << "M4.7 crash-safe publication" << std::flush;
+    namespace fs = std::filesystem;
+
+    const auto base = fs::temp_directory_path() / "pergrep_m47_crash_safe";
+    fs::remove_all(base);
+    fs::create_directories(base / "corpus");
+
+    // Helper: build a minimal valid index
+    auto make_index = [&](const fs::path& root) {
+      { std::ofstream f(root / "a.txt", std::ios::binary); f << "alpha beta gamma\n"; }
+      { std::ofstream f(root / "b.txt", std::ios::binary); f << "delta epsilon zeta\n"; }
+      IndexOptions opt;
+      opt.persist_corpus = true;
+      return Index::build(root, opt);
+    };
+
+    const auto final = base / "snapshot.pgi";
+
+    // 1. Valid save/load round-trip
+    { auto idx = make_index(base / "corpus"); idx.save(final); assert(fs::exists(final)); }
+
+    // 2. Orphan cleanup: stale temps removed on next load
+    {
+      auto orphan1 = final; orphan1 += ".tmp.12345.0"; { std::ofstream f(orphan1, std::ios::binary); f << "GARBAGE"; }
+      auto orphan2 = final; orphan2 += ".tmp.99999.5"; { std::ofstream f(orphan2, std::ios::binary); f << "MORE GARBAGE TRUNCATED DATA"; }
+      assert(fs::exists(orphan1)); assert(fs::exists(orphan2));
+      bool removed = Index::cleanup_orphans(base, ".tmp."); assert(removed);
+      assert(!fs::exists(orphan1)); assert(!fs::exists(orphan2));
+        auto loaded = Index::load(final); assert(loaded.files().size() == 2);
+    }
+
+    // 3. Atomic commit: temp without rename leaves final untouched
+    {
+      Index before = Index::load(final);
+      auto bm = Searcher(before).find(Pattern::compile("alpha", {.kind = PatternKind::Fixed})); assert(bm.size() == 1);
+      const auto bc = before.content(bm[0].file_id).substr(bm[0].start, bm[0].end - bm[0].start); assert(bc == "alpha");
+      fs::path tmp = final; tmp += ".tmp.54321.0"; std::error_code ec_rm; fs::remove(tmp, ec_rm);
+      { std::ofstream o(tmp, std::ios::binary | std::ios::trunc); o << "INCOMPLETE_TEMP_DATA_CORRUPT"; o.flush(); o.close(); }
+        Index during = Index::load(final); auto dm = Searcher(during).find(Pattern::compile("alpha", {.kind = PatternKind::Fixed})); assert(dm.size() == 1);
+      const auto dc = during.content(dm[0].file_id).substr(dm[0].start, dm[0].end - dm[0].start); assert(dc == "alpha");
+      fs::remove(tmp, ec_rm);
+    }
+
+    // 3b. Proper atomic commit: a source-backed (persistable) index replaces final
+    {
+      const auto root3 = base / "corpus3"; fs::remove_all(root3); fs::create_directories(root3);
+      { std::ofstream f(root3 / "a.txt", std::ios::binary); f << "NEW_ALPHA_CONTENT\n"; }
+      { std::ofstream f(root3 / "c.txt", std::ios::binary); f << "NEW_FILE_ONLY_IN_TEMP\n"; }
+      IndexOptions opt; opt.persist_corpus = true;
+      auto new_idx = Index::build(root3, opt);
+      new_idx.save(final);
+        Index after = Index::load(final); assert(after.files().size() == 2);
+      auto am = Searcher(after).find(Pattern::compile("NEW_ALPHA", {.kind = PatternKind::Fixed})); assert(am.size() == 1);
+      assert(after.content(am[0].file_id).substr(am[0].start, am[0].end - am[0].start) == "NEW_ALPHA");
+    }
+
+    // 4. Concurrent-writer smoke: last-writer-wins, no leftover temps
+    {
+      const auto conc = base / "concurrent";
+      const auto conc_corpus = conc / "corpus";
+      const auto conc_final = conc / "snap.pgi";
+      IndexOptions opt; opt.persist_corpus = true;
+      auto write_and_save = [&](const std::string& content) {
+        fs::remove_all(conc_corpus); fs::create_directories(conc_corpus);
+        { std::ofstream f(conc_corpus / "x.txt", std::ios::binary); f << content; }
+        Index::build(conc_corpus, opt).save(conc_final);
+      };
+      write_and_save("FIRST_WRITER\n");
+      write_and_save("SECOND_WRITER\n");
+        auto loaded = Index::load(conc_final);
+      auto cm = Searcher(loaded).find(Pattern::compile("SECOND", {.kind = PatternKind::Fixed})); assert(cm.size() == 1);
+      assert(loaded.content(cm[0].file_id).substr(cm[0].start, cm[0].end - cm[0].start) == "SECOND");
+      for (const auto& entry : fs::directory_iterator(base / "concurrent")) {
+        auto name = entry.path().filename().string(); assert(name.find(".tmp.") == std::string::npos);
+      }
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
