@@ -5201,5 +5201,71 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M4.9: optional watcher daemon — opt-in only; foreground search (no daemon)
+  // remains correct, and a simulated daemon reconcile (M4.8 pattern) converges.
+  {
+    std::cerr << "M4.9 watcher daemon (opt-in)" << std::flush;
+    namespace fs = std::filesystem;
+    const auto base = fs::temp_directory_path() / "pergrep_m49_watch_daemon";
+    fs::remove_all(base);
+    fs::create_directories(base / "corpus");
+
+    auto write_file = [&](const fs::path& p, const std::string& s) {
+      std::ofstream f(p, std::ios::binary); f << s;
+    };
+    write_file(base / "corpus" / "a.txt", "alpha one\n");
+    write_file(base / "corpus" / "b.txt", "beta one\n");
+
+    // (a) Default path: plain foreground build, no daemon, is fully correct.
+    Index fg = Index::build(base / "corpus");
+    assert(fg.fresh() == true);
+    {
+      auto m = Searcher(fg).find(Pattern::compile("alpha", {.kind = PatternKind::Fixed}));
+      assert(m.size() == 1);
+    }
+
+    // (b) Simulated daemon: apply edits + a rename, then reconcile.
+    //     The daemon loop is: on event/loss -> if !fresh() -> rebuild (M4.8).
+    auto daemon_reconcile = [&](const Index& held) -> Index {
+      return held.fresh() ? held : Index::build(base / "corpus");
+    };
+
+    // b1: edit b.txt and add c.txt
+    write_file(base / "corpus" / "b.txt", "beta CHANGED one\n");
+    write_file(base / "corpus" / "c.txt", "gamma one\n");
+    Index rec = daemon_reconcile(fg);
+    assert(rec.fresh() == true);
+    Index fresh = Index::build(base / "corpus");
+    auto m1 = Searcher(rec).find(Pattern::compile("CHANGED", {.kind = PatternKind::Fixed}));
+    auto m1f = Searcher(fresh).find(Pattern::compile("CHANGED", {.kind = PatternKind::Fixed}));
+    assert(m1.size() == m1f.size() && m1.size() == 1);
+    assert(Searcher(rec).find(Pattern::compile("gamma", {.kind = PatternKind::Fixed})).size() == 1);
+
+    // b2: rename a.txt -> z.txt; signal loss, then reconcile (converges).
+    fs::rename(base / "corpus" / "a.txt", base / "corpus" / "z.txt");
+    Index rec2 = daemon_reconcile(rec);
+    {
+      bool has_a = false, has_z = false;
+      for (const auto& fi : rec2.files()) { if (fi.path == "a.txt") has_a=true; if (fi.path == "z.txt") has_z=true; }
+      assert(!has_a && has_z);
+      auto zz = Searcher(rec2).find(Pattern::compile("alpha", {.kind = PatternKind::Fixed}));
+      assert(zz.size() == 1 && rec2.files()[zz[0].file_id].path == "z.txt");
+    }
+
+    // (c) Restart-style reconcile: rebuild from scratch, converges to fresh build.
+    Index restart = Index::build(base / "corpus");
+    Index fresh2 = Index::build(base / "corpus");
+    assert(restart.files().size() == fresh2.files().size());
+    for (std::size_t i = 0; i < restart.files().size(); ++i)
+      assert(restart.files()[i].path == fresh2.files()[i].path);
+    {
+      auto r = Searcher(restart).find(Pattern::compile("CHANGED", {.kind = PatternKind::Fixed}));
+      auto f = Searcher(fresh2).find(Pattern::compile("CHANGED", {.kind = PatternKind::Fixed}));
+      assert(r.size() == f.size());
+      for (std::size_t i = 0; i < r.size(); ++i) { assert(r[i].file_id==f[i].file_id); assert(r[i].start==f[i].start); assert(r[i].end==f[i].end); }
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
