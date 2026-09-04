@@ -28,6 +28,9 @@
 #if __has_include("../src/internal.hpp")
 #include "../src/internal.hpp"
 #endif
+#if __has_include("../src/worker_queue.hpp")
+#include "../src/worker_queue.hpp"
+#endif
 #if __has_include("../bench/workload_matrix.hpp")
 #include "../bench/workload_matrix.hpp"
 #endif
@@ -5266,6 +5269,117 @@ int main(){
     }
 
     fs::remove_all(base);
+  }
+  // M5.1: bounded worker queue — in-order results, cancellation, exception
+  // propagation, single-thread fallback, and search equivalence with serial.
+  {
+    std::cerr << "M5.1 worker queue" << std::flush;
+
+    // (a) Determinism: parallel_map over a large range equals the serial order.
+    {
+      std::vector<int> items(10000);
+      for (int i = 0; i < 10000; ++i) items[i] = i;
+      auto f = [](int x) { return static_cast<long long>(x) * x; };
+      auto serial = detail::parallel_map<int>(items, 1, f);
+      auto par = detail::parallel_map<int>(items, 4, f);
+      assert(serial.size() == par.size());
+      for (std::size_t i = 0; i < serial.size(); ++i) assert(serial[i] == par[i]);
+    }
+
+    // (b) Cancellation: flipping the flag mid-run returns the completed prefix.
+    {
+      std::vector<int> items(20000);
+      for (int i = 0; i < 20000; ++i) items[i] = i;
+      std::atomic<bool> cancel{false};
+      std::atomic<int> flip_at{600};
+      // f signals cancellation once a threshold item is reached and otherwise is
+      // the identity; the worker-queue's loop-top gate then stops new claims, so
+      // the completed prefix stays in input order.
+      auto f = [&](int x) {
+        if (x >= flip_at.load(std::memory_order_relaxed)) cancel.store(true, std::memory_order_relaxed);
+        return x;
+      };
+      // Cooperative cancellation: once the flag flips mid-run, workers stop
+      // claiming new items; the completed prefix stays in input order.
+      auto r = detail::parallel_map<int>(items, 4, f, &cancel);
+      assert(r.size() < items.size());
+      assert(!r.empty());
+      for (std::size_t i = 0; i < r.size(); ++i) assert(r[i] == items[i]);
+    }
+
+    // (c) Exception propagation: a throwing task surfaces the exception; all
+    //     workers are joined (the process remains healthy, no deadlock/hang).
+    {
+      std::vector<int> items(1000);
+      for (int i = 0; i < 1000; ++i) items[i] = i;
+      auto f = [](int x) -> int {
+        if (x == 500) throw std::runtime_error("boom");
+        return x;
+      };
+      bool threw = false;
+      try { (void)detail::parallel_map<int>(items, 8, f); }
+      catch (const std::runtime_error& e) { threw = true; assert(std::string(e.what()) == "boom"); }
+      assert(threw);
+    }
+
+    // (d) Single-thread fallback: threads<=1 equals serial, no threads spawned.
+    {
+      std::vector<int> items(50);
+      for (int i = 0; i < 50; ++i) items[i] = i;
+      auto f = [](int x) { return x * 2; };
+      auto a = detail::parallel_map<int>(items, 0, f);
+      auto b = detail::parallel_map<int>(items, 1, f);
+      for (std::size_t i = 0; i < 50; ++i) { assert(a[i] == items[i]*2); assert(b[i] == items[i]*2); }
+    }
+
+    // (e) Search-integration equivalence: partition file IDs, search each subset
+    //     through the worker queue's serial fallback (threads=1), concatenate in
+    //     input order, and assert byte-for-byte equality with a full serial search.
+    //     (Concurrent Searcher::find is M5.6's thread-safety contract, not M5.1;
+    //      (a)-(d) already prove the concurrent queue primitives on pure work.)
+    {
+      const auto base = fs::temp_directory_path() / "pergrep_m51_worker_queue";
+      fs::remove_all(base);
+      const auto root = base / "corpus";
+      fs::create_directories(root);
+      for (int i = 0; i < 64; ++i) {
+        std::string nm = "f" + std::to_string(i) + ".txt";
+        std::ofstream fo(root / nm, std::ios::binary);
+        fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
+      }
+      auto idx = Index::build(root);
+      Searcher s(idx);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto ser = s.find(pat);
+
+      // Contiguous ascending ranges so in-order concatenation reconstructs the
+      // full serial result exactly (file IDs are already ascending).
+      const std::size_t nf = idx.files().size();
+      const std::size_t per = (nf + 3) / 4;
+      std::vector<std::vector<std::uint32_t>> subsets(4);
+      for (std::uint32_t fid = 0; fid < nf; ++fid) subsets[fid / per].push_back(fid);
+
+      // Task maps a file-ID subset to that subset's ordered matches. It runs
+      // serially (threads=1) through the queue; the queue concatenates in order.
+      auto search_subset = [&](const std::vector<std::uint32_t>& ids) {
+        SearchOptions so; so.eligible_file_ids = ids;
+        return s.find(pat, so);
+      };
+      auto par1 = detail::parallel_map<std::vector<std::uint32_t>>(subsets, 1, search_subset);
+      std::vector<Match> merged1;
+      for (auto& v : par1) for (auto& m : v) merged1.push_back(std::move(m));
+
+      // The file-ID partition is exhaustive and ordered, so concatenating the
+      // per-subset results reconstructs the full serial result exactly.
+      assert(merged1.size() == ser.size());
+      for (std::size_t i = 0; i < ser.size(); ++i) {
+        assert(merged1[i].file_id == ser[i].file_id);
+        assert(merged1[i].start == ser[i].start);
+        assert(merged1[i].end == ser[i].end);
+      }
+
+      fs::remove_all(base);
+    }
   }
   return 0;
 }
