@@ -5090,5 +5090,116 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M4.8: rescan-recovery convergence regression — ADR-0053
+  {
+    std::cerr << "M4.8 rescan-recovery convergence" << std::flush;
+    namespace fs = std::filesystem;
+
+    const auto base = fs::temp_directory_path() / "pergrep_m48_rescan";
+    fs::remove_all(base);
+    fs::create_directories(base / "corpus");
+
+    auto write_file = [&](const fs::path& p, const std::string& s) {
+      std::ofstream f(p, std::ios::binary); f << s;
+    };
+    auto fresh_build = [&](const fs::path& root) { return Index::build(root); };
+    auto files_vec = [](const Index& idx) {
+      std::vector<std::string> v;
+      for (const auto& fi : idx.files()) v.push_back(fi.path);
+      return v;
+    };
+    auto same_matches = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      assert(a.size() == b.size());
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        assert(a[i].file_id == b[i].file_id);
+        assert(a[i].start == b[i].start);
+        assert(a[i].end == b[i].end);
+      }
+    };
+    // ADR-0053 reconcile: a full canonical rebuild when the held generation is
+    // stale; otherwise the held generation is returned unchanged.
+    auto reconcile = [&](const Index& held) {
+      if (!held.fresh()) return Index::build(base / "corpus");
+      return held;
+    };
+
+    Pattern pat_literal = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+    Pattern pat_regex   = Pattern::compile("al.ha", {}); // regex (dot wildcard)
+    Pattern pat_word    = Pattern::compile("one", {.kind = PatternKind::Fixed, .word = true});
+
+    // --- Step 0: canonical index idx0 over {a.txt, b.txt, c.txt}
+    write_file(base / "corpus" / "a.txt", "alpha one\n");
+    write_file(base / "corpus" / "b.txt", "beta one\n");
+    write_file(base / "corpus" / "c.txt", "gamma one\n");
+
+    Index idx0 = fresh_build(base / "corpus");
+    assert(idx0.fresh() == true);
+    assert(files_vec(idx0) == (std::vector<std::string>{"a.txt", "b.txt", "c.txt"}));
+
+    // --- Mutation (i): delete b.txt AND add d.txt (coalesced delete+add)
+    fs::remove(base / "corpus" / "b.txt");
+    write_file(base / "corpus" / "d.txt", "delta one\n");
+    assert(idx0.fresh() == false); // stale after the coalesced mutation
+
+    Index rec1 = reconcile(idx0);
+    assert(rec1.fresh() == true); // fresh again after the reconcile rebuild
+    Index fresh1 = fresh_build(base / "corpus");
+    assert(files_vec(rec1) == files_vec(fresh1)); // (a) path set + order agree
+    // (b) literal/regex/word agree with a fresh build; zero dup/missing.
+    same_matches(Searcher(rec1).find(pat_literal), Searcher(fresh1).find(pat_literal));
+    same_matches(Searcher(rec1).find(pat_regex), Searcher(fresh1).find(pat_regex));
+    same_matches(Searcher(rec1).find(pat_word), Searcher(fresh1).find(pat_word));
+    // Deleted content (beta) never matches; alpha survives only under a.txt.
+    assert(Searcher(rec1).find(Pattern::compile("beta", {.kind = PatternKind::Fixed})).empty());
+    {
+      auto lit = Searcher(rec1).find(pat_literal);
+      assert(lit.size() == 1 && rec1.files()[lit[0].file_id].path == "a.txt");
+      auto dl = Searcher(rec1).find(Pattern::compile("delta", {.kind = PatternKind::Fixed}));
+      assert(dl.size() == 1 && rec1.files()[dl[0].file_id].path == "d.txt");
+    }
+
+    // --- Mutation (ii): rename a.txt -> z.txt (delete old + add new in one step)
+    fs::rename(base / "corpus" / "a.txt", base / "corpus" / "z.txt");
+    assert(rec1.fresh() == false); // renamed-away path makes the held gen stale
+
+    Index rec2 = reconcile(rec1);
+    assert(rec2.fresh() == true);
+    Index fresh2 = fresh_build(base / "corpus");
+    assert(files_vec(rec2) == files_vec(fresh2));
+    same_matches(Searcher(rec2).find(pat_literal), Searcher(fresh2).find(pat_literal));
+    same_matches(Searcher(rec2).find(pat_regex), Searcher(fresh2).find(pat_regex));
+    same_matches(Searcher(rec2).find(pat_word), Searcher(fresh2).find(pat_word));
+    // Renamed content appears exactly once under the NEW path z.txt, never a.txt.
+    {
+      bool has_a = false, has_z = false;
+      for (const auto& fi : rec2.files()) {
+        if (fi.path == "a.txt") has_a = true;
+        if (fi.path == "z.txt") has_z = true;
+      }
+      assert(!has_a && has_z);
+      auto lit = Searcher(rec2).find(pat_literal);
+      assert(lit.size() == 1 && rec2.files()[lit[0].file_id].path == "z.txt");
+    }
+
+    // --- Mutation (iii): overwrite c.txt in place (same path, new bytes/mtime)
+    write_file(base / "corpus" / "c.txt", "gamma OVERWRITTEN two\n");
+    assert(rec2.fresh() == false); // in-place overwrite changes size/mtime
+
+    Index rec3 = reconcile(rec2);
+    assert(rec3.fresh() == true);
+    Index fresh3 = fresh_build(base / "corpus");
+    assert(files_vec(rec3) == files_vec(fresh3));
+    same_matches(Searcher(rec3).find(pat_literal), Searcher(fresh3).find(pat_literal));
+    same_matches(Searcher(rec3).find(pat_regex), Searcher(fresh3).find(pat_regex));
+    same_matches(Searcher(rec3).find(pat_word), Searcher(fresh3).find(pat_word));
+    // Old c.txt bytes no longer match; the new overwrite matches exactly once.
+    assert(Searcher(rec3).find(Pattern::compile("gamma one", {.kind = PatternKind::Fixed})).empty());
+    {
+      auto new_c = Searcher(rec3).find(Pattern::compile("OVERWRITTEN", {.kind = PatternKind::Fixed}));
+      assert(new_c.size() == 1 && rec3.files()[new_c[0].file_id].path == "c.txt");
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
