@@ -5893,5 +5893,106 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M5.8: threading test matrix — selective/large scans, mapped vs resident
+  // providers, and exhaustion/fallback behave identically under threads.
+  {
+    std::cerr << "M5.8 thread matrix" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m58_matrix";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    std::vector<Document> docs;
+    for (int i = 0; i < 48; ++i) {
+      std::string nm = "m" + std::to_string(i) + ".txt";
+      std::string body = "alpha beta file " + std::to_string(i) + "\n";
+      for (int k = 0; k < (i % 5); ++k) body += "padding lorem ipsum\n";
+      if (i == 7 || i == 41) body += "ZZZ_RARE_NEEDLE_9\n";
+      if (i == 0) for (int k = 0; k < 4000; ++k) body += "alpha bulk line\n";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << body;
+      docs.push_back({nm, body});
+    }
+    auto mapped = Index::build(root);           // mapped (mmap) provider
+    auto resident = Index::from_documents(docs); // resident provider
+    Searcher sm(mapped), sr(resident);
+
+    // (a) Small selective query: rare needle, few matches.
+    {
+      auto pat = Pattern::compile("ZZZ_RARE_NEEDLE_9", {.kind = PatternKind::Fixed});
+      auto serial = sm.find(pat);
+      assert(serial.size() == 2);
+      for (unsigned nt : {2u, 8u}) {
+        SearchOptions so; so.threads = nt;
+        assert(same(sm.find(pat, so), serial));
+      }
+    }
+    // (b) Large scan: common pattern over the bulky file.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = sm.find(pat);
+      assert(serial.size() > 4000u);
+      for (unsigned nt : {2u, 8u}) {
+        SearchOptions so; so.threads = nt;
+        assert(same(sm.find(pat, so), serial));
+      }
+    }
+    // (c) Mapped vs resident providers agree, serial and parallel.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto mser = sm.find(pat), rser = sr.find(pat);
+      assert(mser.size() == rser.size());
+      SearchOptions so; so.threads = 8;
+      assert(same(sr.find(pat, so), rser));
+      assert(same(sm.find(pat, so), mser));
+      // Cross-provider parallel results agree as (path, start, end) multisets
+      // regardless of each provider's internal file order.
+      auto keyed = [](const std::vector<Match>& ms, const Index& ix) {
+        std::vector<std::string> keys;
+        for (const auto& m : ms)
+          keys.push_back(ix.files()[m.file_id].path + ":" + std::to_string(m.start) + ":" + std::to_string(m.end));
+        std::sort(keys.begin(), keys.end());
+        return keys;
+      };
+      auto mpar = sm.find(pat, so), rpar = sr.find(pat, so);
+      assert(keyed(mpar, mapped) == keyed(rpar, resident));
+    }
+    // (d) Resource exhaustion: far more threads than files.
+    {
+      auto tiny = Index::from_documents({{"a.txt", "alpha\n"}, {"b.txt", "beta\n"}, {"c.txt", "alpha beta\n"}});
+      Searcher st(tiny);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = st.find(pat);
+      SearchOptions so; so.threads = 64;
+      assert(same(st.find(pat, so), serial));
+    }
+    // (e) Scalar fallback: single-file and empty corpora ignore threads.
+    {
+      auto one = Index::from_documents({{"only.txt", "alpha alpha\n"}});
+      Searcher s1(one);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = s1.find(pat);
+      assert(serial.size() == 2);
+      for (unsigned nt : {0u, 1u, 8u}) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s1.find(pat, so), serial));
+      }
+      auto empty = Index::from_documents({});
+      Searcher se(empty);
+      SearchOptions soe; soe.threads = 4;
+      assert(se.find(pat, soe).empty() && se.find(pat).empty());
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
