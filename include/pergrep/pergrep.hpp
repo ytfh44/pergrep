@@ -227,6 +227,13 @@ struct SearchOptions {
     // candidate/record boundaries; absent means no cancellation is possible.
     std::function<bool()> should_cancel = {};
     SearchObjective objective = SearchObjective::Exhaustive;
+    // M5.2: worker count for the ordered per-file parallel merge. 1 (default)
+    // means serial, identical to the pre-M5.2 path. Values above 1 enable the
+    // parallel merge only for exhaustive, unlimited, unobserved searches; all
+    // other semantics (max_matches, non-exhaustive objectives, cancellation,
+    // stats collection) fall back to serial. Execution-only; never part of a
+    // PlanKey and never serialized.
+    std::uint32_t threads = 1;
 };
 
 // M1.3 PlanKey: explicit, deterministic plan input. Captures all semantic

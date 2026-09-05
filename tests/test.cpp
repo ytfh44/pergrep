@@ -5381,5 +5381,99 @@ int main(){
       fs::remove_all(base);
     }
   }
+  // M5.2: deterministic file merge — the ordered per-file parallel merge is
+  // byte-identical to serial across thread counts, modes, scopes, generations.
+  {
+    std::cerr << "M5.2 deterministic merge" << std::flush;
+    assert(SearchOptions().threads == 1);
+
+    const auto base = fs::temp_directory_path() / "pergrep_m52_merge";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    // Uneven files: content length and match density vary with i.
+    for (int i = 0; i < 64; ++i) {
+      std::string nm = "f" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
+      for (int k = 0; k < (i % 9); ++k) fo << "padding line " << k << " lorem ipsum dolor\n";
+      if (i % 5 == 0) fo << "extra alpha occurrence " << i << "\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    struct Case { const char* expr; PatternOptions po; SearchOptions so; };
+    SearchOptions ov; ov.overlapping = true;
+    SearchOptions inv; inv.invert_match = true;
+    SearchOptions fw; fw.files_with_matches = true;
+    SearchOptions fwo; fwo.files_without_match = true;
+    const Case cases[] = {
+      {"alpha", {.kind = PatternKind::Fixed}, {}},
+      {"file ([0-9]+) ([a-z]+)", {}, {}},
+      {"alpha", {.kind = PatternKind::Fixed, .word = true}, {}},
+      {"alpha", {.kind = PatternKind::Fixed}, ov},
+      {"alpha", {.kind = PatternKind::Fixed}, inv},
+      {"alpha", {.kind = PatternKind::Fixed}, fw},
+      {"alpha", {.kind = PatternKind::Fixed}, fwo},
+    };
+    const unsigned thread_counts[] = {1, 2, 3, 4, 8};
+    for (const auto& cs : cases) {
+      auto pat = Pattern::compile(cs.expr, cs.po);
+      auto serial = s.find(pat, cs.so); // threads defaults to 1: serial oracle
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = cs.so; so.threads = nt;
+        auto par = s.find(pat, so);
+        assert(same(par, serial));
+      }
+    }
+
+    // Non-contiguous eligible scope with duplicates: prelude sorts+dedupes, so
+    // the parallel partition matches the serial traversal exactly.
+    {
+      std::vector<std::uint32_t> scope = {60, 5, 2, 5, 61, 2, 7, 60, 0, 63};
+      SearchOptions so; so.eligible_file_ids = scope;
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      auto par = s.find(pat, sop);
+      assert(same(par, serial));
+      assert(!serial.empty());
+    }
+
+    // Segment generation (M4 append chain): parallel search over an appended
+    // index equals the serial search over the same generation.
+    {
+      auto b0 = Index::from_documents({{"a.txt", "alpha one\n"}, {"b.txt", "beta one\n"}});
+      SegmentManifest m;
+      m.paths = {"c.txt"};
+      m.corpus_files = 3;
+      m.corpus_bytes = std::string("alpha one\n").size() + std::string("beta one\n").size() +
+                       std::string("gamma alpha\n").size();
+      auto app = Index::append(b0, {{"c.txt", "gamma alpha\n"}}, m);
+      Searcher sa(app);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = sa.find(pat);
+      assert(serial.size() == 2);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(sa.find(pat, so), serial));
+      }
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }

@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "worker_queue.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1758,6 +1759,40 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
         std::sort(normalized_scope.begin(), normalized_scope.end());
         normalized_scope.erase(std::unique(normalized_scope.begin(), normalized_scope.end()), normalized_scope.end());
         opt.eligible_file_ids = normalized_scope;
+    }
+    // M5.2: ordered per-file parallel merge. Each eligible file is searched by
+    // an independent per-task Searcher (sharing this Searcher's immutable
+    // Index), and per-file results are concatenated in file-id order — no sort,
+    // so the merged result is byte-identical to the serial traversal whatever
+    // the thread count or completion order. Eligible only for exhaustive,
+    // unlimited, unobserved searches; every other semantic (max_matches,
+    // non-exhaustive objectives, cooperative cancellation, stats) falls back
+    // to the serial path below. Uneven file sizes are balanced dynamically by
+    // the worker queue's shared atomic cursor.
+    if (opt.threads > 1 && stats == nullptr && opt.objective == SearchObjective::Exhaustive &&
+        opt.max_matches == 0 && !opt.should_cancel) {
+        std::vector<std::uint32_t> fids;
+        if (opt.eligible_file_ids.empty()) {
+            fids.reserve(I.loaded.size());
+            for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) fids.push_back(fid);
+        } else {
+            fids.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
+        }
+        if (fids.size() > 1) {
+            const Index& idx = *index_;
+            const auto one_file = [&](const std::uint32_t& fid) {
+                Searcher worker(idx);
+                SearchOptions sub = opt;
+                sub.threads = 1;
+                sub.eligible_file_ids = std::span<const std::uint32_t>(&fid, 1);
+                return worker.find(p, sub, nullptr);
+            };
+            auto parts = detail::parallel_map<std::uint32_t>(fids, opt.threads, one_file);
+            std::vector<Match> merged;
+            for (auto& part : parts) for (auto& m : part) merged.push_back(std::move(m));
+            return merged;
+        }
+        // 0/1 files: fall through to serial (identical result, no thread overhead).
     }
     StatsRecorder accounting(stats, I, opt.eligible_file_ids);
     if (stats) {
