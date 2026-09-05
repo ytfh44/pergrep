@@ -2282,6 +2282,7 @@ int main(){
   }
   std::cerr << "M23 QO-2 done\n" << std::flush;
 
+  std::cerr << "DBG-M19\n" << std::flush;
   // M1.9 planned_qgrams contract: the configured value is a shared maximum
   // for chunk and positional probes; zero means auto (all available rows).
   {
@@ -2354,6 +2355,7 @@ int main(){
     assert(short_stats.effective_k == 1 && short_stats.selected_qgram_count == 1);
   }
 
+  std::cerr << "DBG-QO3\n" << std::flush;
   // QO-3 positional — compile positional filter with safe fallback
   {
     // 1. Positional pruning: rare literal in large corpus should prune candidate_blocks << total blocks.
@@ -2421,6 +2423,7 @@ int main(){
     }
   }
 
+  std::cerr << "DBG-BF2\n" << std::flush;
   // BF-2 resource bounds
   {
     // 1. Lookbehind window capped to 8192 — very long prefix must not crash.
@@ -2543,6 +2546,7 @@ int main(){
     }
   }
 
+  std::cerr << "DBG-BF3\n" << std::flush;
   // BF-3 CLI regression — differential invert / max-count / stats multi-pattern
   {
     // BF-3 audit: CLI performs OR-then-invert via `selected = !matched` after
@@ -2644,6 +2648,7 @@ int main(){
       assert(st_bar.matches==m_bar.size());
     }
   }
+  std::cerr << "DBG-QO4\n" << std::flush;
   // QO-4 cost model & scheduler: skewed rarity picks rarest q-gram branch
 #if __has_include("../src/internal.hpp")
   {
@@ -6217,6 +6222,127 @@ int main(){
     }
 
     fs::remove_all(base);
+  }
+  // M6.3: Unicode folding and scoped inline flags — portfolio agrees with the
+  // reference on mixed scoped flags and Unicode edges; folded eligibility pinned.
+  {
+    std::cerr << "M6.3 scoped unicode" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (fixed) { if (!a[i].captures.empty()) return false; continue; }
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+    IndexOptions tiny; tiny.chunk_bytes = 64; tiny.chunk_overlap = 32;
+    auto check = [&](std::vector<Document> docs, std::string expr,
+                     PatternOptions popt = {}, SearchOptions sopt = {}) {
+      sopt.include_binary = true;
+      auto indexed = Index::from_documents(docs, tiny);
+      auto reference = Index::from_documents(docs, tiny);
+      const bool fixed = popt.kind == PatternKind::Fixed;
+      auto pattern = Pattern::compile(std::move(expr), popt);
+      assert(same(Searcher(indexed).find(pattern, sopt), full_reference(reference, pattern, sopt), fixed));
+      return Searcher(indexed).find(pattern, sopt);
+    };
+
+    std::vector<Document> uni = {
+      {"uni.txt", std::string("Stra\xC3\x9F") + "e STRASSE Strasse\nKelvin \xE2\x84\xAA here\nCaf\xC3\xA9 CAF\xC3\x89\n"},
+      {"mix.txt", std::string("Alpha alpha ALPHA\n") + "\xCE\xB2" + "eta " + "\xCE\x92" + "ETA\n"},
+      {"inv.txt", std::string("ab\xFF") + "cd\xFE" + "ef\n"},
+    };
+    const PatternOptions icase = {.case_mode = CaseMode::Insensitive};
+
+    // Simple (not full) folding: "strasse" matches STRASSE/Strasse, never eszett.
+    {
+      auto m = check(uni, "strasse", icase);
+      assert(m.size() == 2);
+    }
+    // Width-changing fold: "k" matches K and 3-byte Kelvin sign (span width 3).
+    {
+      auto m = check(uni, "k", icase);
+      assert(m.size() == 2);
+      bool wide = false;
+      for (const auto& x : m) if (x.end - x.start == 3) wide = true;
+      assert(wide);
+    }
+    // Scoped insensitive under global sensitive.
+    {
+      auto m = check(uni, "(?i:alpha)");
+      assert(m.size() == 3);
+    }
+    // Scoped sensitive under global insensitive.
+    {
+      auto m = check(uni, "(?-i:ALPHA)", icase);
+      assert(m.size() == 1);
+    }
+    // Scoped insensitive matches ß itself but never SS (full-fold only).
+    {
+      auto m = check(uni, "(?i:\xC3\x9F)"); // ß insensitive
+      assert(m.size() == 1);
+    }
+    // Greek fold pairs (multibyte, width-preserving).
+    {
+      auto m = check(uni, "\xCE\xB2", icase); // β insensitive matches Β too
+      assert(m.size() == 2);
+    }
+    // Unicode mode toggle changes \w on multibyte text; each equals its oracle.
+    {
+      PatternOptions uo; uo.unicode = false;
+      auto m_ascii = check(uni, "\\w+", uo);
+      auto m_uni = check(uni, "\\w+");
+      assert(m_ascii.size() != m_uni.size());
+      assert(!m_ascii.empty() && !m_uni.empty());
+    }
+    // Classes and negations on multibyte + invalid bytes.
+    check(uni, "\\pL+");
+    check(uni, "\\d+");
+    check(uni, "[^\\x00-\\x7F]+");
+    // Word boundaries (unicode) on accented text.
+    check(uni, "\\balpha\\b");
+    check(uni, "\\bCaf\\xC3\\xA9\\b");
+    // Captures with scoped flags and multibyte spans.
+    check(uni, "((?i:alpha)) (beta)");
+    check(uni, "(\xCE\xB2)(eta)");
+    // Scoped insensitive over invalid bytes.
+    check(uni, "(?i:cd)");
+    // Folded-eligibility pins: only global-icase FIXED ASCII takes the filter.
+    {
+      auto idx = Index::from_documents(uni, tiny);
+      Searcher s(idx);
+      const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+      {
+        SearchStats st{};
+        (void)s.find(Pattern::compile("alpha", icase_fx), {}, &st);
+        assert(st.qgram_fallback_reason == "case-insensitive-folded");
+      }
+      {
+        SearchStats st{};
+        (void)s.find(Pattern::compile("(?i:alpha)"), {}, &st);
+        assert(st.qgram_fallback_reason != "case-insensitive-folded");
+      }
+      {
+        SearchStats st{};
+        (void)s.find(Pattern::compile("alpha", {.kind = PatternKind::Fixed}), {}, &st);
+        assert(st.qgram_fallback_reason != "case-insensitive-folded");
+      }
+    }
+    // Raw byte coordinates on a width-changing scoped match.
+    {
+      auto idx = Index::from_documents(uni, tiny);
+      Searcher s(idx);
+      auto m = s.find(Pattern::compile("(?i:k)", icase));
+      bool wide = false;
+      for (const auto& x : m) if (x.end - x.start == 3) wide = true;
+      assert(wide);
+    }
   }
   return 0;
 }
