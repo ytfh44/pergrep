@@ -5809,5 +5809,89 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M5.6: thread-safety contracts — shared immutable Index/Pattern/Searcher
+  // serve concurrent finds; ownership keeps providers alive.
+  {
+    std::cerr << "M5.6 thread safety" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m56_threads";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 32; ++i) {
+      std::string nm = "t" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "alpha beta file " << i << "\nsecond alpha line\n";
+    }
+    auto idx = Index::build(root);
+    auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+    Searcher s(idx);
+    auto serial = s.find(pat);
+    assert(!serial.empty());
+
+    // (a) One shared Searcher serving concurrent finds: all working state is
+    // per-call, so results are identical to serial.
+    {
+      std::vector<std::vector<Match>> outs(8);
+      std::vector<std::thread> th;
+      for (int k = 0; k < 8; ++k)
+        th.emplace_back([&, k] { outs[k] = s.find(pat); });
+      for (auto& t : th) t.join();
+      for (const auto& o : outs) assert(same(o, serial));
+    }
+    // (b) One Searcher per thread over the shared Index (the M5.2 pattern).
+    {
+      std::vector<std::vector<Match>> outs(8);
+      std::vector<std::thread> th;
+      for (int k = 0; k < 8; ++k)
+        th.emplace_back([&, k] { Searcher w(idx); outs[k] = w.find(pat); });
+      for (auto& t : th) t.join();
+      for (const auto& o : outs) assert(same(o, serial));
+    }
+    // (c) Concurrent content() reads agree with serial reads.
+    {
+      std::vector<std::string> snaps(idx.files().size());
+      for (std::size_t f = 0; f < snaps.size(); ++f) snaps[f] = std::string(idx.content(f));
+      std::vector<std::thread> th;
+      std::atomic<bool> ok{true};
+      for (int k = 0; k < 8; ++k)
+        th.emplace_back([&] {
+          for (std::size_t f = 0; f < snaps.size(); ++f)
+            if (idx.content(f) != snaps[f]) ok.store(false, std::memory_order_relaxed);
+        });
+      for (auto& t : th) t.join();
+      assert(ok.load());
+    }
+    // (d) Lifetime: a shared-ownership Searcher keeps provider storage alive
+    // after every Index handle is gone (find reads content internally).
+    {
+      Searcher owned = [&]() -> Searcher {
+        auto tmp = Index::build(root);
+        std::shared_ptr<const Index> hp = std::make_shared<Index>(tmp);
+        return Searcher(hp);
+      }();
+      assert(same(owned.find(pat), serial));
+    }
+    // (e) Race soak: repeated shared-Searcher concurrent finds stay identical.
+    for (int it = 0; it < 20; ++it) {
+      std::vector<std::vector<Match>> outs(4);
+      std::vector<std::thread> th;
+      for (int k = 0; k < 4; ++k)
+        th.emplace_back([&, k] { outs[k] = s.find(pat); });
+      for (auto& t : th) t.join();
+      for (const auto& o : outs) assert(same(o, serial));
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
