@@ -5994,5 +5994,119 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M6.1: raw-byte exact verifier contract — invalid UTF-8, byte offsets,
+  // code-point traversal, ICU simple folding (no normalization), capture spans,
+  // and record separators all equal the reference on adversarial inputs.
+  {
+    std::cerr << "M6.1 verifier contract" << std::flush;
+
+    // Spans are always byte-exact. Captures: regex matches carry full group
+    // captures; fixed-string matches carry none (allocation-free hot path, per
+    // the Match contract), while the raw oracle retains group 0 — so for fixed
+    // patterns we pin emptiness on the indexed side plus span equality.
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (fixed) { if (!a[i].captures.empty()) return false; continue; }
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+    IndexOptions tiny; tiny.chunk_bytes = 64; tiny.chunk_overlap = 32;
+    IndexOptions whole; whole.chunk_bytes = 1 << 20; whole.chunk_overlap = 1 << 19;
+    auto check = [&](std::vector<Document> docs, std::string expr,
+                     PatternOptions popt = {}, SearchOptions sopt = {}) {
+      // Verifier contract is orthogonal to binary policy (M5.5 owns the skip):
+      // force binary inclusion so invalid-byte content reaches the verifier.
+      sopt.include_binary = true;
+      auto indexed = Index::from_documents(docs, tiny);
+      auto reference = Index::from_documents(docs, whole);
+      const bool fixed = popt.kind == PatternKind::Fixed;
+      auto pattern = Pattern::compile(std::move(expr), popt);
+      assert(same(Searcher(indexed).find(pattern, sopt), full_reference(reference, pattern, sopt), fixed));
+    };
+
+    const PatternOptions fx = {.kind = PatternKind::Fixed};
+    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+
+    // Invalid UTF-8 is data: lone continuations, truncated sequences, lone
+    // lead bytes. Byte equality decides matches; nothing is skipped.
+    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "cd", fx);
+    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "c.", {}, {});
+    check({{"a.txt", std::string("\x80\x81\xFE\n")}}, ".", {}, {});
+    check({{"a.txt", std::string("a\xE4\xB8tail\n")}}, "a", fx); // truncated CJK lead
+    check({{"a.txt", std::string("x\xED\xA0\x80y\n")}}, "y", fx); // surrogate bytes
+
+    // Byte offsets on multibyte content: "x" after U+4E16 starts at byte 3.
+    {
+      std::vector<Document> docs = {{"a.txt", std::string("\xE4\xB8\x96x\xE7\x95\x8Cy\n")}};
+      auto indexed = Index::from_documents(docs, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("x", fx));
+      assert(m.size() == 1 && m[0].start == 3 && m[0].end == 4);
+      auto my = Searcher(indexed).find(Pattern::compile("y", fx));
+      assert(my.size() == 1 && my[0].start == 7 && my[0].end == 8);
+    }
+
+    // Code-point traversal: overlapping matches step whole runes, never split.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      check({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\xE4\xB8\x96\n")}},
+            std::string("\xE4\xB8\x96"), fx, ov);
+      auto indexed = Index::from_documents({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\n")}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xE4\xB8\x96"), fx), ov);
+      assert(m.size() == 2 && m[0].start == 0 && m[1].start == 3);
+    }
+
+    // ICU simple folding: K, k, and Kelvin sign fold together (insensitive).
+    check({{"a.txt", "K k \xE2\x84\xAA end\n"}}, "k", icase_fx);
+    {
+      auto indexed = Index::from_documents({{"a.txt", "K k \xE2\x84\xAA end\n"}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("k", icase_fx));
+      assert(m.size() == 3);
+    }
+    // No normalization: precomposed e-acute does not match decomposed e+acute.
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("e\xCC\x81\n")}}, tiny); // e + combining acute
+      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xC3\xA9"), icase_fx)); // U+00E9
+      assert(m.empty());
+      check({{"a.txt", std::string("\xC3\xA9\n")}}, std::string("\xC3\xA9"), icase_fx);
+    }
+
+    // Capture spans are absolute byte spans across multibyte content.
+    check({{"a.txt", std::string("\xE4\xB8\x96(\xE7\x95\x8C)X\n")}}, "(\xE7\x95\x8C)", {}, {});
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("a\xE4\xB8" "\x96" "b\n")}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("(\xE4\xB8\x96)"));
+      assert(m.size() == 1 && m[0].captures.size() == 2);
+      assert(m[0].captures[1].start == 1 && m[0].captures[1].end == 4);
+    }
+
+    // Record separators with multibyte and invalid bytes.
+    {
+      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
+      check({{"a.txt", std::string("\xE4\xB8\x96\0ALPHA\0\xFF\n", 12)}}, "ALPHA", fx, nul);
+    }
+    // Word mode on multibyte boundaries.
+    check({{"a.txt", std::string("\xE4\xB8\x96 alpha \xE7\x95\x8C\n")}}, "alpha",
+          {.kind = PatternKind::Fixed, .word = true});
+
+    // Filter-reject rule under adversarial bytes: tiny-chunk filtered search
+    // equals the whole-file reference (filters never drop true matches).
+    // Oracle scope: the raw oracle expresses patterns as code points, so a pattern
+    // with a truncated UTF-8 sequence is outside oracle parity. The indexed path
+    // matches such patterns byte-wise; pin the exact span (e,f,E4 at bytes 6-8).
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\xE4\xB8" "\x96gh\n")}}, tiny);
+      SearchOptions s2; s2.include_binary = true;
+      auto m = Searcher(indexed).find(Pattern::compile("ef\xE4", fx), s2);
+      assert(m.size() == 1 && m[0].start == 6 && m[0].end == 9);
+    }
+    check({{"a.txt", std::string("\x80" "abc\x80" "abc\x80" "\n")}}, "abc", fx);
+  }
   return 0;
 }
