@@ -5475,5 +5475,135 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M5.3: overlap duplicate suppression — chunk-overlap and segment-boundary
+  // duplicates are suppressed while legitimate overlapping matches survive, and
+  // the parallel merge equals serial under adversarial chunking.
+  {
+    std::cerr << "M5.3 overlap dedup" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    // Small chunks force many chunk cores per file, so matches routinely
+    // straddle chunk boundaries and overlap regions see every match twice.
+    IndexOptions small;
+    small.chunk_bytes = 64; small.chunk_overlap = 16;
+    small.positional_block_bytes = 32;
+
+    const auto base = fs::temp_directory_path() / "pergrep_m53_dedup";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "r" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      // Long repeated run: "abcabc" occurs at every 3-byte offset, crossing
+      // chunk cores; uneven tail varies file sizes.
+      for (int k = 0; k < 40 + (i % 7) * 8; ++k) fo << "abc";
+      fo << "\n";
+      fo << "tail RARE_" << i << " xyz\n";
+    }
+    // Unicode files: multi-byte runes with overlapping matches.
+    for (int i = 0; i < 4; ++i) {
+      std::string nm = "u" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      for (int k = 0; k < 60; ++k) fo << "\xE4\xB8\x96\xE7\x95\x8C"; // 世界 世界 ...
+      fo << "\n";
+    }
+
+    auto idx = Index::build(root, small);
+    Searcher s(idx);
+    const unsigned thread_counts[] = {1, 2, 4};
+
+    // (a) Non-overlapping fixed search across chunk boundaries.
+    {
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (b) Overlapping fixed search: legitimate overlaps preserved, overlap-
+    // region double-reports suppressed — parallel equals serial.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat, ov);
+      assert(serial.size() > s.find(pat).size()); // overlaps add matches
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (c) Captures on boundary-crossing matches.
+    {
+      auto pat = Pattern::compile("(ab)+(c)");
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (d) Zero-width matches: empty positions reported once, never duplicated
+    // across chunk overlap regions.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("z*");
+      auto serial = s.find(pat, ov);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+      // No duplicate keys in the serial oracle itself.
+      for (std::size_t i = 1; i < serial.size(); ++i)
+        assert(serial[i].file_id != serial[i-1].file_id || serial[i].start != serial[i-1].start ||
+               serial[i].end != serial[i-1].end);
+    }
+    // (e) Multi-byte runes with overlapping matches (rune, not byte, progress).
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("\xE4\xB8\x96\xE7\x95\x8C");
+      auto serial = s.find(pat, ov);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (f) Multiple segments: append a generation whose content continues a
+    // repeated run; overlapping parallel search over the merged view is exact.
+    {
+      auto b0 = Index::from_documents({{"a.txt", "abcabcabc\n"}}, small);
+      SegmentManifest m;
+      m.paths = {"b.txt"};
+      m.corpus_files = 2;
+      m.corpus_bytes = std::string("abcabcabc\n").size() + std::string("abcabcabcabc\n").size();
+      auto app = Index::append(b0, {{"b.txt", "abcabcabcabc\n"}}, m, small);
+      Searcher sa(app);
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = sa.find(pat, ov);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(sa.find(pat, so), serial));
+      }
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
