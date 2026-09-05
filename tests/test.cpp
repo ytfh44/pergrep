@@ -5605,5 +5605,75 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M5.4: global max-match and quiet cancellation — budgeted, first-hit, and
+  // cancelled searches with threads>1 return exactly the serial ordered prefix.
+  {
+    std::cerr << "M5.4 max-match cancel" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m54_budget";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "b" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "alpha one\n" << "alpha two\n" << "alpha three\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+
+    // (a) Global budgets: K-prefix identical for threads 1 and 4.
+    for (std::uint64_t k : {1u, 5u, 47u, 48u, 100u}) {
+      SearchOptions so; so.max_matches = k;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == (k < 48u ? static_cast<std::size_t>(k) : 48u));
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (b) Budget composes with overlapping mode.
+    {
+      SearchOptions so; so.max_matches = 7; so.overlapping = true;
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (c) FirstHit (the quiet objective): single first ordered match, any threads.
+    {
+      SearchOptions so; so.objective = SearchObjective::FirstHit;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == 1);
+      SearchOptions sop = so; sop.threads = 4;
+      auto par = s.find(pat, sop);
+      assert(same(par, serial));
+    }
+    // (d) Explicit OrderedPrefix with a budget.
+    {
+      SearchOptions so; so.objective = SearchObjective::OrderedPrefix; so.max_matches = 3;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == 3);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (e) Cooperative cancellation preset: threads>1 equals serial, completes.
+    {
+      std::atomic<bool> flag{true};
+      SearchOptions so; so.should_cancel = [&] { return flag.load(std::memory_order_relaxed); };
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
