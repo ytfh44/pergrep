@@ -176,6 +176,112 @@ static void test_m63_scoped_unicode()
   }
 }
 
+static void test_m64_unicode_fallback() {
+  // M6.4: conservative fallback for Unicode uncertainty — every uncertain query
+  // reaches the exact verifier; reasons and costs are recorded and pinned.
+  // Fixed-string matches carry no captures by design (M6.1); pin indexed-side
+  // emptiness plus span equality for fixed, full capture equality for regex.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (fixed) { if (!a[i].captures.empty()) return false; continue; }
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+    }
+    return true;
+  };
+  std::cerr << "M6.4 unicode fallback" << std::flush;
+
+  // (a) ICU behavior pins: the exact folds M6 relies on, independent of ICU version.
+  assert(u_foldCase(0x00DF, U_FOLD_CASE_DEFAULT) == 0x00DF); // ß stays (not ss)
+  assert(u_foldCase(0x212A, U_FOLD_CASE_DEFAULT) == 0x006B); // Kelvin -> k
+  assert(u_foldCase(0x00E9, U_FOLD_CASE_DEFAULT) == 0x00E9); // é stays
+  assert(u_foldCase(0x0392, U_FOLD_CASE_DEFAULT) == 0x03B2); // Β -> β
+  assert(u_foldCase(0x03B2, U_FOLD_CASE_DEFAULT) == 0x03B2); // β stays
+  assert(u_foldCase(0x0041, U_FOLD_CASE_DEFAULT) == 0x0061); // A -> a
+
+  const auto base = fs::temp_directory_path() / "pergrep_m64_fallback";
+  fs::remove_all(base);
+  const auto root = base / "corpus";
+  fs::create_directories(root);
+  auto put = [&](const char* nm, const std::string& body) {
+    std::ofstream fo(root / nm, std::ios::binary);
+    fo << body;
+  };
+  put("u0.txt", std::string("Caf\xC3\xA9 ") + "\xCE\xB2" + "eta Kelvin \xE2\x84\xAA\n");
+  put("u1.txt", "plain alpha\n");
+  auto idx = Index::build(root);
+  Searcher s(idx);
+  const std::size_t nchunks = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data())->chunks.size();
+  const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+
+  // (b) Non-ASCII -i falls back with full candidate cost, oracle-equal.
+  for (const char* expr : {"\xC3\xA9", "\xE2\x84\xAA", "\xCE\xB2"}) {
+    auto pat = Pattern::compile(expr, icase_fx);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.qgram_fallback_reason == "case-insensitive");
+    assert(st.candidate_chunks == nchunks);
+    assert(same(r, full_reference(idx, pat, sof), true));
+    assert(!r.empty());
+  }
+  // (c) Width-changing fold (Kelvin) resolves through the exact verifier.
+  {
+    auto pat = Pattern::compile("k", icase_fx);
+    SearchOptions sof;
+    auto r = s.find(pat, sof);
+    bool wide = false;
+    for (const auto& x : r) if (x.end - x.start == 3) wide = true;
+    assert(wide);
+    assert(same(r, full_reference(idx, pat, sof), true));
+  }
+  // (d) Unicode property query never takes the folded path; oracle-equal.
+  {
+    auto pat = Pattern::compile("\\pL+");
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.qgram_fallback_reason != "case-insensitive-folded");
+    assert(same(r, full_reference(idx, pat, sof), false));
+    assert(!r.empty());
+  }
+  // (e) Truncated-sequence query: outside oracle parity (M6.1); falls back,
+  // reaches the exact verifier deterministically (threads agree).
+  {
+    auto pat = Pattern::compile(std::string("a\xE9"), icase_fx);
+    SearchOptions s1, s4; s4.threads = 4;
+    auto r1 = s.find(pat, s1);
+    auto r4 = s.find(pat, s4);
+    assert(r1.size() == r4.size());
+    for (std::size_t i = 0; i < r1.size(); ++i) {
+      assert(r1[i].file_id == r4[i].file_id && r1[i].start == r4[i].start && r1[i].end == r4[i].end);
+    }
+  }
+  // (f) Mixed normalization never matches (no normalization, either mode).
+  {
+    std::string decomposed = std::string("e\xCC\x81\n"); // e + combining acute
+    auto ridx = Index::from_documents({{"d.txt", decomposed}});
+    Searcher rs(ridx);
+    auto pre = Pattern::compile(std::string("\xC3\xA9"), icase_fx); // U+00E9
+    assert(rs.find(pre).empty());
+    PatternOptions sens = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Sensitive};
+    auto pre_s = Pattern::compile(std::string("\xC3\xA9"), sens);
+    assert(rs.find(pre_s).empty());
+  }
+  // (g) Eligible ASCII control still filters (matrix completeness).
+  {
+    auto pat = Pattern::compile("alpha", icase_fx);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.qgram_fallback_reason == "case-insensitive-folded");
+    assert(same(r, full_reference(idx, pat, sof), true));
+  }
+
+  fs::remove_all(base);
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6342,6 +6448,8 @@ int main(){
     fs::remove_all(base);
   }
   test_m63_scoped_unicode();
+
+  test_m64_unicode_fallback();
 
   return 0;
 }
