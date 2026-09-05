@@ -576,3 +576,40 @@ out="$($PG --stats -m 1 -e foo "$T/bf3_maxcount.txt" 2>&1)"
 contains "$out" '1 matches' bf3-stats-maxcount
 contains "$out" '1 matched lines' bf3-stats-maxcount-lines
 contains "$out" '1 files contained matches' bf3-stats-maxcount-files
+# M5.7 --threads/-j: deterministic parallel execution behind the safety gate.
+mkdir -p "$T/threads"
+for i in 1 2 3 4 5 6; do printf 'alpha beta %s\nsecond alpha\n' "$i" > "$T/threads/f$i.txt"; done
+out_t1="$($PG alpha "$T/threads")"
+out_t4="$($PG -j4 alpha "$T/threads")"
+eq "$out_t1" "$out_t4" threads-deterministic
+out_t0="$($PG -j0 alpha "$T/threads")"
+eq "$out_t1" "$out_t0" threads-zero-is-serial
+out_tj="$($PG --threads 4 alpha "$T/threads")"
+eq "$out_t1" "$out_tj" threads-long-flag
+out_tm="$($PG -j4 -m1 alpha "$T/threads")"
+out_m1="$($PG -m1 alpha "$T/threads")"
+eq "$out_m1" "$out_tm" threads-maxcount
+out_mp1="$($PG -j4 -e alpha -e beta "$T/threads")"
+out_mp0="$($PG -e alpha -e beta "$T/threads")"
+eq "$out_mp0" "$out_mp1" threads-multipattern
+# JSON summary footer carries wall-clock elapsed (nondeterministic); compare
+# all match/begin/end lines, which must be byte-identical.
+out_j1="$($PG -j4 --json alpha "$T/threads" | grep -v '"type":"summary"')"
+out_j0="$($PG --json alpha "$T/threads" | grep -v '"type":"summary"')"
+eq "$out_j0" "$out_j1" threads-json
+set +e
+$PG -j4 alpha "$T/threads" >/dev/null 2>&1; rc_t4=$?
+$PG alpha "$T/threads" >/dev/null 2>&1; rc_t1=$?
+$PG -j4 nomatch_xyz "$T/threads" >/dev/null 2>&1; rc_n4=$?
+$PG nomatch_xyz "$T/threads" >/dev/null 2>&1; rc_n1=$?
+$PG -j4 -q alpha "$T/threads" >/dev/null 2>&1; rc_q4=$?
+$PG -q alpha "$T/threads" >/dev/null 2>&1; rc_q1=$?
+set -e
+eq "$rc_t1" "$rc_t4" threads-exit-match
+eq "$rc_n1" "$rc_n4" threads-exit-nomatch
+eq "$rc_q1" "$rc_q4" threads-exit-quiet
+dbg_t4="$($PG --debug -j4 alpha "$T/threads" 2>&1 >/dev/null)"
+contains "$dbg_t4" "threads=4" threads-debug-count
+contains "$dbg_t4" "execution=parallel" threads-debug-parallel
+dbg_t1="$($PG --debug alpha "$T/threads" 2>&1 >/dev/null)"
+contains "$dbg_t1" "execution=serial" threads-debug-serial
