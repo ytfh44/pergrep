@@ -2282,6 +2282,7 @@ int main(){
   }
   std::cerr << "M23 QO-2 done\n" << std::flush;
 
+  std::cerr << "DBG-M19\n" << std::flush;
   // M1.9 planned_qgrams contract: the configured value is a shared maximum
   // for chunk and positional probes; zero means auto (all available rows).
   {
@@ -2354,6 +2355,7 @@ int main(){
     assert(short_stats.effective_k == 1 && short_stats.selected_qgram_count == 1);
   }
 
+  std::cerr << "DBG-QO3\n" << std::flush;
   // QO-3 positional — compile positional filter with safe fallback
   {
     // 1. Positional pruning: rare literal in large corpus should prune candidate_blocks << total blocks.
@@ -2421,6 +2423,7 @@ int main(){
     }
   }
 
+  std::cerr << "DBG-BF2\n" << std::flush;
   // BF-2 resource bounds
   {
     // 1. Lookbehind window capped to 8192 — very long prefix must not crash.
@@ -2543,6 +2546,7 @@ int main(){
     }
   }
 
+  std::cerr << "DBG-BF3\n" << std::flush;
   // BF-3 CLI regression — differential invert / max-count / stats multi-pattern
   {
     // BF-3 audit: CLI performs OR-then-invert via `selected = !matched` after
@@ -2644,6 +2648,7 @@ int main(){
       assert(st_bar.matches==m_bar.size());
     }
   }
+  std::cerr << "DBG-QO4\n" << std::flush;
   // QO-4 cost model & scheduler: skewed rarity picks rarest q-gram branch
 #if __has_include("../src/internal.hpp")
   {
