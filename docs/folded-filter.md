@@ -46,6 +46,16 @@ only cause (safe) false positives, never false negatives.
 `M8` owns representation-cost measurement; serialization is intentionally
 untouched — the auxiliary is transient and never persisted.
 
+## Scoped flags (M6.3)
+
+The folded path serves fixed literals with a single global case mode only.
+Scoped inline flags (`(?i:...)`, `(?-i:...)`, `(?u:...)`, ...) live on regex
+nodes and never reach the folded hook: scoped-insensitive patterns take the
+regex verifier paths, and a scoped-sensitive node under a global-insensitive
+fixed literal cannot exist (fixed literals have no nodes). Eligibility is
+pinned by `qgram_fallback_reason` assertions in `pergrep_m63_scoped_unicode`:
+only global-insensitive fixed ASCII reports `case-insensitive-folded`.
+
 ## Non-goals
 
 Full-Unicode folding, normalization (explicitly excluded per M6.1: precomposed
