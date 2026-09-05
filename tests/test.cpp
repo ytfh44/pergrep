@@ -525,6 +525,114 @@ static void test_m66_lazy_dfa() {
   }
 }
 
+static void test_m67_vm_telemetry() {
+  // M6.7: extended-VM resource telemetry — populated, deterministic, and loud on limits.
+  auto same_spans = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+    return true;
+  };
+  std::cerr << "M6.7 VM telemetry" << std::flush;
+  PatternOptions ext; ext.engine = Engine::Pcre2Compat;
+
+  // (a) Non-extended queries never touch eval: all counters stay zero.
+  {
+    auto idx = Index::from_documents({{"a.txt", "alpha beta\n"}});
+    Searcher s(idx);
+    auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(r.size() == 1);
+    assert(st.vm_max_depth == 0 && st.vm_repeat_iterations == 0 && st.vm_repeat_capped == 0);
+    assert(st.vm_lookbehind_evals == 0 && st.vm_max_lookbehind_window == 0 && st.vm_lookbehind_capped == 0);
+    assert(st.vm_state_expansions == 0);
+  }
+  // (b) Lookbehind populates evals/window/states, excludes bounded path, deterministic.
+  {
+    std::string hay(500, 'a');
+    hay += "b\n";
+    auto idx = Index::from_documents({{"h.txt", hay}});
+    Searcher s(idx);
+    auto pat = Pattern::compile("(?<=a)b", ext);
+    SearchOptions sof;
+    SearchStats st1{}, st2{};
+    auto r1 = s.find(pat, sof, &st1);
+    auto r2 = s.find(pat, sof, &st2);
+    assert(r1.size() == 1 && r1[0].start == 500 && r1[0].end == 501);
+    assert(st1.vm_lookbehind_evals > 0 && st1.vm_max_lookbehind_window > 0);
+    assert(st1.vm_lookbehind_capped == 0 && st1.vm_state_expansions > 0);
+    assert(st1.vm_max_depth == st2.vm_max_depth);
+    assert(st1.vm_repeat_iterations == st2.vm_repeat_iterations);
+    assert(st1.vm_lookbehind_evals == st2.vm_lookbehind_evals);
+    assert(st1.vm_max_lookbehind_window == st2.vm_max_lookbehind_window);
+    assert(st1.vm_state_expansions == st2.vm_state_expansions);
+    assert(same_spans(r1, r2));
+  }
+  // (c) Backref populates depth/states, excludes bounded path, oracle-equal.
+  {
+    auto idx = Index::from_documents({{"h.txt", "aa ab\n"}});
+    Searcher s(idx);
+    auto pat = Pattern::compile("(a)\\1", ext);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.vm_max_depth > 0 && st.vm_state_expansions > 0);
+    assert(same_spans(r, full_reference(idx, pat, sof)));
+    assert(r.size() == 1);
+  }
+  // (d) Repeat cap is counted and returns valid prefixes (never silent drops).
+  {
+    std::string hay(20000, 'a');
+    hay += "\n";
+    auto idx = Index::from_documents({{"h.txt", hay}});
+    Searcher s(idx);
+    auto pat = Pattern::compile("(?=a)a{1,100000}", ext);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.vm_repeat_capped > 0 && st.vm_repeat_iterations > 0);
+    assert(!r.empty() && r[0].end - r[0].start <= 10000);
+    assert(same_spans(r, full_reference(idx, pat, sof)));
+  }
+  // (e) Depth-limit failure is deterministic and loud (existing guard hook).
+  {
+    std::string m1, m2;
+    for (int i = 0; i < 2; ++i) {
+      try {
+        pergrep::detail::test_eval_depth_guard(10001);
+        assert(false && "must throw");
+      } catch (const std::runtime_error& e) { m1 = (i == 0 ? std::string(e.what()) : m1); m2 = std::string(e.what()); }
+    }
+    assert(!m1.empty() && m1 == m2);
+    pergrep::detail::test_eval_depth_guard(10000); // boundary holds
+    pergrep::detail::test_eval_depth_guard(0);
+  }
+  // (f) Planner excludes unbounded context from the one-pass path.
+  {
+    auto idx = Index::from_documents({{"h.txt", "xx timeout yy\n"}});
+    Searcher s(idx);
+    for (const char* expr : {".*timeout.*", "(a)(b)xy", "(?<=a)b"}) {
+      auto pat = Pattern::compile(expr, ext);
+      SearchOptions sof;
+      SearchStats st{};
+      (void)s.find(pat, sof, &st);
+      assert(st.physical_operator != "RegexBoundedRegion");
+    }
+  }
+  // (g) Bytes scanned maps to verified_bytes (no duplicate counter).
+  {
+    auto idx = Index::from_documents({{"h.txt", "aa ab\n"}});
+    Searcher s(idx);
+    auto pat = Pattern::compile("(a)\\1", ext);
+    SearchOptions sof;
+    SearchStats st{};
+    (void)s.find(pat, sof, &st);
+    assert(st.verified_bytes > 0);
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6697,6 +6805,8 @@ int main(){
   test_m65_onepass();
 
   test_m66_lazy_dfa();
+
+  test_m67_vm_telemetry();
 
   return 0;
 }
