@@ -282,6 +282,110 @@ static void test_m64_unicode_fallback() {
   fs::remove_all(base);
 }
 
+static void test_m65_onepass() {
+  // M6.5: guarded one-pass NFA fast path — eligible patterns take bounded regions
+  // with identical spans/captures/order; ineligible ones fall back cost-free.
+  // Fixed-string matches carry no captures by design (M6.1); pin indexed-side
+  // emptiness plus span equality for fixed, full capture equality for regex.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (fixed) { if (!a[i].captures.empty()) return false; continue; }
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+      for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+        const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+        if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+      }
+    }
+    return true;
+  };
+  std::cerr << "M6.5 one-pass" << std::flush;
+
+  std::string big(18000, 'x');
+  big += " pre foo12bar post foo7bar\n";
+  IndexOptions small;
+  small.chunk_bytes = 256;
+  small.chunk_overlap = 64;
+  auto idx = Index::from_documents({{"r0.txt", big},
+                                    {"r1.txt", "foo123bar and foo9bar\n"},
+                                    {"r2.txt", "no match here\njust filler text\n"}}, small);
+  Searcher s(idx);
+
+  auto run = [&](const std::string& expr, PatternOptions popt = {}) {
+    auto pat = Pattern::compile(expr, popt);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(same(r, full_reference(idx, pat, sof), popt.kind == PatternKind::Fixed));
+    return std::make_pair(r, st.physical_operator);
+  };
+
+  // Eligible: bounded literal+class pattern takes the one-pass operator with
+  // exact spans (prefix seeking across the 18KB filler works).
+  {
+    auto [r, op] = run("foo([0-9]{1,3})bar");
+    assert(op == "RegexBoundedRegion");
+    assert(r.size() == 4);
+    assert(r[0].file_id == 0 && r[0].start == 18005 && r[0].end == 18013);
+  }
+  // Single-group captures preserved through the one-pass path.
+  {
+    auto [r, op] = run("foo([0-9]{1,3})bar");
+    assert(op == "RegexBoundedRegion");
+    assert(r[0].captures.size() == 2 && r[0].captures[1].matched);
+  }
+  // Greedy and lazy bounded repeats both stay eligible and oracle-exact
+  // (anchored ends coincide; each mode matches its own semantics per oracle).
+  {
+    auto [g, opg] = run("foo([0-9]{1,3})bar");
+    auto [l, opl] = run("foo([0-9]{1,3}?)bar");
+    assert(opg == "RegexBoundedRegion" && opl == "RegexBoundedRegion");
+    assert(!g.empty() && !l.empty());
+  }
+  // Measured win: bounded verification touches strictly fewer bytes than the corpus.
+  {
+    auto pat = Pattern::compile("foo([0-9]{1,3})bar");
+    SearchOptions sof;
+    SearchStats st{};
+    (void)s.find(pat, sof, &st);
+    assert(st.physical_operator == "RegexBoundedRegion");
+    assert(st.verified_bytes < idx.corpus_bytes());
+  }
+  // Ineligible: unbounded, multi-group, insensitive — baseline path, same results.
+  {
+    auto [r, op] = run(".*bar.*");
+    assert(op != "RegexBoundedRegion");
+    assert(!r.empty());
+  }
+  {
+    auto [r, op] = run("(foo)([0-9]+)bar");
+    assert(op != "RegexBoundedRegion");
+    assert(!r.empty());
+  }
+  {
+    PatternOptions icase; icase.kind = PatternKind::Fixed; icase.case_mode = CaseMode::Insensitive;
+    auto [r, op] = run("FOO", icase);
+    assert(op != "RegexBoundedRegion");
+    assert(!r.empty());
+  }
+  // Extended constructs (backref, lookahead) stay on the established verifier.
+  {
+    PatternOptions o; o.engine = Engine::Pcre2Compat;
+    auto [r1, op1] = run("(a)\\1", o);
+    assert(op1 != "RegexBoundedRegion");
+    auto [r2, op2] = run("a(?=b)", o);
+    assert(op2 != "RegexBoundedRegion");
+  }
+  // State limits: repeat-limit-applied patterns fall back.
+  {
+    PatternOptions o; o.engine = Engine::Pcre2Compat;
+    auto [r, op] = run("(?=a)a{1,100000}", o);
+    assert(op != "RegexBoundedRegion");
+  }
+
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6450,6 +6554,8 @@ int main(){
   test_m63_scoped_unicode();
 
   test_m64_unicode_fallback();
+
+  test_m65_onepass();
 
   return 0;
 }
