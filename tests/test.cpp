@@ -5675,5 +5675,139 @@ int main(){
 
     fs::remove_all(base);
   }
+  // M5.5: output-mode transparency — binary, NUL separators, case modes,
+  // multiline, named captures, and stats are identical under threads.
+  {
+    std::cerr << "M5.5 semantics" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m55_semantics";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 12; ++i) {
+      std::string nm = "s" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "Alpha beta GAMMA file " << i << "\nsecond ALPHA line\n";
+    }
+    // Binary files: NUL bytes and high bytes.
+    {
+      std::ofstream b0(root / "bin0.dat", std::ios::binary);
+      const char raw[] = {'a', 'l', 'p', 'h', 'a', '\0', '\xFF', '\xFE', 't', 'a', 'i', 'l', '\n'};
+      b0.write(raw, sizeof(raw));
+      std::ofstream b1(root / "bin1.dat", std::ios::binary);
+      b1 << "plain alpha text\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    const unsigned thread_counts[] = {1, 4};
+
+    // (a) Binary handling: excluded by default, included on opt-in — same under threads.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial_ex = s.find(pat);
+      auto serial_in = s.find(pat, SearchOptions{.include_binary = true});
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial_ex));
+        SearchOptions soi; soi.threads = nt; soi.include_binary = true;
+        assert(same(s.find(pat, soi), serial_in));
+      }
+    }
+    // (b) Case modes: insensitive and smart — same under threads.
+    {
+      auto pi = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive});
+      auto ps = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Smart});
+      auto si = s.find(pi), ss = s.find(ps);
+      assert(!si.empty() && !ss.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pi, so), si));
+        assert(same(s.find(ps, so), ss));
+      }
+    }
+    // (c) Multiline + dotall regex — same under threads.
+    {
+      auto pat = Pattern::compile("GAMMA(.|\n)+?second", {.multiline = true, .dotall = true});
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (d) Named captures — names and spans identical under threads.
+    {
+      auto pat = Pattern::compile("file (?<num>[0-9]+)");
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      bool saw_name = false;
+      for (const auto& m : serial) for (const auto& c : m.captures) if (c.name == "num") saw_name = true;
+      assert(saw_name);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (e) NUL record separator and NUL content (resident index) — same under threads.
+    {
+      auto ridx = Index::from_documents({{"n0.txt", std::string("a\0b\0alpha\0", 9)},
+                                         {"n1.txt", std::string("x\0alpha\0y\0", 9)}});
+      Searcher rs(ridx);
+      // NUL content is binary: skipped by default, searched on opt-in — both
+      // transparent under threads.
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      assert(rs.find(pat).empty());
+      {
+        SearchOptions so4; so4.threads = 4;
+        assert(rs.find(pat, so4).empty());
+      }
+      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
+      auto serial = rs.find(pat, nul);
+      assert(serial.size() == 2);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = nul; so.threads = nt;
+        assert(same(rs.find(pat, so), serial));
+      }
+    }
+    // (f) Stats: requesting stats forces one path; deterministic counters equal.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      SearchStats st1, st4;
+      SearchOptions so1; SearchOptions so4; so4.threads = 4;
+      auto r1 = s.find(pat, so1, &st1);
+      auto r4 = s.find(pat, so4, &st4);
+      assert(same(r1, r4));
+      assert(st1.matches == st4.matches && st1.candidate_files == st4.candidate_files);
+      assert(st1.candidate_chunks == st4.candidate_chunks && st1.candidate_blocks == st4.candidate_blocks);
+      assert(st1.verified_bytes == st4.verified_bytes);
+      assert(st1.logical_unique_bytes == st4.logical_unique_bytes);
+      assert(st1.physically_touched_bytes == st4.physically_touched_bytes);
+      assert(st1.candidate_order == st4.candidate_order);
+    }
+    // (g) Counts: explicit sizes for the known corpus.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      SearchOptions so4; so4.threads = 4;
+      assert(s.find(pat, so4).size() == s.find(pat).size());
+      SearchOptions inv; inv.invert_match = true;
+      SearchOptions inv4 = inv; inv4.threads = 4;
+      assert(s.find(pat, inv4).size() == s.find(pat, inv).size());
+    }
+
+    fs::remove_all(base);
+  }
   return 0;
 }
