@@ -31,6 +31,7 @@
 #if __has_include("../src/worker_queue.hpp")
 #include "../src/worker_queue.hpp"
 #endif
+#include <unicode/uchar.h>
 #if __has_include("../bench/workload_matrix.hpp")
 #include "../bench/workload_matrix.hpp"
 #endif
@@ -6107,6 +6108,115 @@ int main(){
       assert(m.size() == 1 && m[0].start == 6 && m[0].end == 9);
     }
     check({{"a.txt", std::string("\x80" "abc\x80" "abc\x80" "\n")}}, "abc", fx);
+  }
+  // M6.2: ASCII folded auxiliary filter — eligible ASCII -i queries prune via
+  // the folded Bloom; everything else falls back with identical results.
+  {
+    std::cerr << "M6.2 folded filter" << std::flush;
+
+    // Fixed-string matches carry no captures by design (M6.1); the oracle
+    // retains group 0, so pin indexed-side emptiness plus span equality.
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (!a[i].captures.empty()) return false;
+      }
+      return true;
+    };
+
+    // (a) ASCII fold == ICU fold on bytes 0-127 (equivalence proven, not assumed).
+    for (int c = 0; c < 128; ++c) {
+      const UChar32 folded = u_foldCase(static_cast<UChar32>(c), U_FOLD_CASE_DEFAULT);
+      assert(folded == static_cast<UChar32>(detail::ascii_fold_byte(static_cast<unsigned char>(c))));
+    }
+
+    const auto base = fs::temp_directory_path() / "pergrep_m62_folded";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "w" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      if (i % 2 == 0) fo << "Alpha BETA file " << i << "\nsecond ALPHA line\n";
+      else fo << "gamma delta file " << i << "\nno needle here\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    const std::size_t nchunks = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data())->chunks.size();
+    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+
+    // (b) Eligible ASCII -i query: folded filter prunes, results equal the oracle.
+    {
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions sof;
+      SearchStats stf{};
+      auto rf = s.find(pat, sof, &stf);
+      assert(same(rf, full_reference(idx, pat, sof)));
+      assert(stf.candidate_chunks < nchunks); // pruned: alpha-free files dropped
+      assert(!rf.empty());
+    }
+    // (c) Non-ASCII -i query falls back (full candidate set, oracle-equal).
+    {
+      auto pat = Pattern::compile("\xC3\xA9", icase_fx); // U+00E9
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = s.find(pat, sof, &st);
+      assert(st.candidate_chunks == nchunks);
+      assert(same(r, full_reference(idx, pat, sof)));
+    }
+    // (d) Word-scoped -i query falls back.
+    {
+      PatternOptions w = icase_fx; w.word = true;
+      auto pat = Pattern::compile("alpha", w);
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = s.find(pat, sof, &st);
+      assert(st.candidate_chunks == nchunks);
+      assert(same(r, full_reference(idx, pat, sof)));
+      assert(!r.empty());
+    }
+    // (e) Loaded snapshot (no folded groups) falls back with equal results.
+    {
+      const auto snap = base / "snap.pgi";
+      idx.save(snap);
+      auto loaded = Index::load(snap);
+      Searcher sl(loaded);
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = sl.find(pat, sof, &st);
+      assert(st.candidate_chunks ==
+             static_cast<const pergrep::detail::IndexData*>(loaded.debug_index_data())->chunks.size());
+      assert(same(r, full_reference(loaded, pat, sof)));
+      assert(same(r, s.find(pat, sof)));
+    }
+    // (f) Storage budget structural: folded mirrors raw shape; absent on load.
+    {
+      const auto* I = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data());
+      for (int k = 0; k < 8; ++k) {
+        assert(I->folded_groups[k].bits.size() == I->groups[k].bits.size());
+        assert(I->folded_groups[k].gids.size() == I->groups[k].gids.size());
+      }
+      auto loaded2 = Index::load(base / "snap.pgi");
+      const auto* L = static_cast<const pergrep::detail::IndexData*>(loaded2.debug_index_data());
+      for (int k = 0; k < 8; ++k) assert(L->folded_groups[k].gids.empty());
+    }
+    // (g) files_with mode under ASCII -i via the files() API: the 8 even
+    // files match (fallback path, no folded pruning).
+    {
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions fw; fw.files_with_matches = true;
+      auto fws = s.files(pat, fw);
+      assert(fws.size() == 8);
+      for (auto id : fws) {
+        const std::string& p = idx.files()[id].path;
+        const int n = std::stoi(p.substr(1, p.size() - 5));
+        assert(n % 2 == 0);
+      }
+    }
+
+    fs::remove_all(base);
   }
   return 0;
 }

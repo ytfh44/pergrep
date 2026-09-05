@@ -481,6 +481,46 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
+// M6.2: folded auxiliary probe. Lowercased ASCII literal against folded_groups.
+// Every probed window is a necessary condition for a folded match, so the
+// selection (all distinct folded windows) is sound without consulting raw-byte
+// rarity statistics. Verification stays ICU-aware; only candidate pruning changes.
+bool folded_groups_present(const detail::IndexData& I) noexcept {
+    for (auto const& g : I.folded_groups) if (!g.gids.empty()) return true;
+    return false;
+}
+std::vector<uint32_t> folded_chunk_candidates(const detail::IndexData& I, std::string_view lit,
+                                              StatsRecorder* rec = nullptr) {
+    const std::string folded = detail::ascii_fold_string(lit);
+    const std::string_view flit = folded;
+    std::vector<uint32_t> out;
+    if (flit.size() < 4 || flit.size() > I.opt.chunk_overlap) {
+        out.reserve(I.chunks.size());
+        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
+            if (!rec || rec->allows(I.chunks[ci].file_id)) out.push_back(ci);
+        }
+        return out;
+    }
+    std::vector<uint32_t> selected;
+    for (size_t i = 0; i + 4 <= flit.size(); ++i) {
+        const uint32_t h = detail::hash4(reinterpret_cast<const unsigned char*>(flit.data() + i));
+        if (std::find(selected.begin(), selected.end(), h) == selected.end()) selected.push_back(h);
+    }
+    if (rec) rec->note_selection(selected.size());
+    auto q = detail::compile_qgram_query(flit, selected);
+    for (auto const& g : I.folded_groups) {
+        group_candidates(g, q, out, rec);
+    }
+    std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
+        if (I.chunks[a].file_id != I.chunks[b].file_id)
+            return I.chunks[a].file_id < I.chunks[b].file_id;
+        if (I.chunks[a].core_begin != I.chunks[b].core_begin)
+            return I.chunks[a].core_begin < I.chunks[b].core_begin;
+        return a < b;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
 
 
 size_t choose_rare_byte(const detail::IndexData& I, std::string_view q) {
@@ -2041,7 +2081,18 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 stats->selected_qgram_count = 0;
                 stats->selected_qgram_rows = 0;
             }
-            auto cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
+            // M6.2: ASCII-only case-insensitive literals probe the folded auxiliary;
+            // every other case keeps the unfiltered fallback. Verification stays ICU.
+            std::vector<uint32_t> cv;
+            const bool use_folded = icase && !p.impl_->opt.word && !p.impl_->opt.line &&
+                !opt.files_with_matches && !opt.files_without_match &&
+                detail::is_ascii(q) && folded_groups_present(I);
+            if (use_folded) {
+                if (stats) stats->qgram_fallback_reason = "case-insensitive-folded";
+                cv = folded_chunk_candidates(I, q, &accounting);
+            } else {
+                cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
+            }
             accounting.note_candidates(cv);
             std::unordered_set<uint32_t> done_chunks;
             size_t a = choose_rare_byte(I, q);

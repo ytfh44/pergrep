@@ -326,19 +326,32 @@ static void materialize_index_filters(detail::IndexData& I) {
         g.words = (cnt[k] + 63) / 64;
         g.gids.reserve(cnt[k]);
         g.bits.assign((size_t)g.m * g.words, 0);
+        // M6.2: folded twin mirrors the raw shape; same chunk mapping, clear bits.
+        auto& f = I.folded_groups[k];
+        f.lg = g.lg; f.m = g.m; f.words = g.words;
+        f.gids.reserve(cnt[k]);
+        f.bits.assign(g.bits.size(), 0);
     }
     std::array<uint32_t, 8> local{};
     for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
         auto c = I.chunks[ci];
         auto& g = I.groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
+        auto& f = I.folded_groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
         const uint32_t li = local[g.lg - 9]++;
         g.gids.push_back(ci);
+        f.gids.push_back(ci);
         auto v = std::string_view(I.loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
         const uint32_t mask = g.m - 1;
         if (v.size() >= 4) {
             for (size_t j = 0; j + 4 <= v.size(); ++j) {
                 const uint32_t b = detail::hash4((const unsigned char*)v.data() + j) & mask;
                 g.bits[(size_t)b * g.words + (li >> 6)] |= 1ull << (li & 63);
+            }
+            // M6.2: same windows over ASCII-lowercased bytes (same li: identical order).
+            const std::string fv = detail::ascii_fold_string(v);
+            for (size_t j = 0; j + 4 <= fv.size(); ++j) {
+                const uint32_t b = detail::hash4((const unsigned char*)fv.data() + j) & mask;
+                f.bits[(size_t)b * f.words + (li >> 6)] |= 1ull << (li & 63);
             }
         }
     }

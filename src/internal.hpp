@@ -22,6 +22,21 @@
 
 namespace pergrep::detail {
 
+// M6.2: ASCII fold for the folded auxiliary filter. Identity except A-Z -> a-z,
+// exactly matching u_foldCase (U_FOLD_CASE_DEFAULT) on ASCII bytes 0-127 —
+// proven by test, never assumed. Bytes >= 128 pass through untouched.
+inline unsigned char ascii_fold_byte(unsigned char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+}
+inline bool is_ascii(std::string_view s) noexcept {
+    for (unsigned char c : s) if (c >= 128) return false;
+    return true;
+}
+inline std::string ascii_fold_string(std::string_view s) {
+    std::string out(s);
+    for (auto& ch : out) ch = static_cast<char>(ascii_fold_byte(static_cast<unsigned char>(ch)));
+    return out;
+}
 inline std::uint32_t hash4(const unsigned char* p) noexcept {
     std::uint32_t x = std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
                       (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
@@ -386,6 +401,12 @@ using PosDesc = detail::PosDesc;
     std::vector<LoadedFile> loaded;
     std::vector<Chunk> chunks;
     std::array<Group,8> groups;
+    // M6.2: ASCII-folded auxiliary Bloom twin of groups, built from ASCII-lowercased
+    // chunk bytes (A-Z -> a-z, all other bytes untouched). Queried only for fixed,
+    // case-insensitive, all-ASCII literals without word/line/files scoping, using the
+    // lowercased literal. Transient: never serialized; empty on loaded snapshots,
+    // which safely fall back to the unfiltered path.
+    std::array<Group,8> folded_groups;
     std::vector<PosDesc> pos_desc;
     std::vector<std::uint8_t> pos;
     std::array<std::uint64_t,256> byte_freq{};
