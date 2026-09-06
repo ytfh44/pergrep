@@ -62,3 +62,9 @@ stays independent until M7.5+.
 - [`src/aho_corasick.hpp`](../src/aho_corasick.hpp): automaton.
 - [`src/search.cpp`](../src/search.cpp): gate + `find_multi`.
 - [`tests/test.cpp`](../tests/test.cpp): `test_m72_aho_corasick`.
+## M7.6 update: scoped entries share too
+
+The unscoped-only gate is lifted. The scan covers the union of member
+scopes (an unscoped member means all files) and the post-process keeps per
+entry only matches in its own scope; excluded files are never read. See
+[`docs/scoped-sharing.md`](scoped-sharing.md).
