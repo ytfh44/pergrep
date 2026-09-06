@@ -439,18 +439,36 @@ using PosDesc = detail::PosDesc;
     std::size_t segment_count = 0;
     std::uint64_t appended_bytes = 0;
 
-    std::uint64_t bytes() const noexcept {
-        std::uint64_t n = pos.size() + pos_desc.size()*sizeof(PosDesc) + chunks.size()*sizeof(Chunk);
-        for (const auto& g : groups) n += g.bits.size()*sizeof(std::uint64_t) + g.gids.size()*sizeof(std::uint32_t);
-        n += infos.size()*sizeof(FileInfo) + byte_freq.size()*sizeof(std::uint64_t) + qgram_freq.size()*sizeof(std::uint32_t);
-        n += hash_chunk_freq.size() * sizeof(std::uint64_t);
+    // M8.1: single-source ledger assembly. bytes() reconciles with
+    // ledger().index_structures() by construction (see test_m81_memory_ledger).
+    IndexMemoryLedger ledger() const noexcept {
+        IndexMemoryLedger l;
+        l.corpus_bytes = corp_bytes;
+        for (const auto& g : groups) {
+            l.group_bits += g.bits.size() * sizeof(std::uint64_t);
+            l.group_gids += g.gids.size() * sizeof(std::uint32_t);
+        }
+        for (const auto& g : folded_groups) {
+            l.folded_bits += g.bits.size() * sizeof(std::uint64_t);
+            l.folded_gids += g.gids.size() * sizeof(std::uint32_t);
+        }
+        l.positional = pos.size();
+        l.pos_descriptors = pos_desc.size() * sizeof(PosDesc);
+        l.chunks = chunks.size() * sizeof(Chunk);
+        l.file_meta = infos.size() * sizeof(FileInfo);
+        for (const auto& info : infos) l.paths += info.path.size();
+        l.freq_tables = byte_freq.size() * sizeof(std::uint64_t) +
+                        qgram_freq.size() * sizeof(std::uint32_t) +
+                        hash_chunk_freq.size() * sizeof(std::uint64_t);
         for (const auto& [key, q] : exact_qgrams)
-            n += sizeof(key) + sizeof(QgramStats) + q.chunk_ids.size()*sizeof(std::uint32_t) +
-                 q.document_ids.size()*sizeof(std::uint32_t);
+            l.qgram_stats += sizeof(key) + sizeof(QgramStats) +
+                             q.chunk_ids.size() * sizeof(std::uint32_t) +
+                             q.document_ids.size() * sizeof(std::uint32_t);
         for (const auto& ids : hash_chunk_ids)
-            n += ids.size() * sizeof(std::uint32_t);
-        return n;
+            l.hash_postings += ids.size() * sizeof(std::uint32_t);
+        return l;
     }
+    std::uint64_t bytes() const noexcept { return ledger().index_structures(); }
 };
 
 // QO-4/M1.5 cost model & scheduler: estimates selectivity via exact q-gram

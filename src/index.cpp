@@ -588,6 +588,10 @@ uint64_t Index::corpus_bytes() const noexcept {
 uint64_t Index::index_bytes() const noexcept {
     return impl_ ? impl_->bytes() : 0;
 }
+IndexMemoryLedger Index::memory_ledger() const noexcept {
+    return impl_ ? impl_->ledger() : IndexMemoryLedger{};
+}
+
 bool Index::is_snapshot() const noexcept {
     return impl_ ? impl_->opt.persist_corpus : false;
 }
