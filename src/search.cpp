@@ -993,6 +993,119 @@ std::string semantic_mode_key(const PlanKey& key) {
     // workload labels and never imply an observed execution.
     return std::string("plan-key:") + std::to_string(key.hash());
 }
+// M7.1 MultiQueryIR construction and sharing report.
+bool MultiPatternEntry::operator==(const MultiPatternEntry& o) const noexcept {
+    return expression == o.expression && pattern_options.kind == o.pattern_options.kind &&
+        pattern_options.case_mode == o.pattern_options.case_mode &&
+        pattern_options.engine == o.pattern_options.engine && pattern_options.word == o.pattern_options.word &&
+        pattern_options.line == o.pattern_options.line && pattern_options.multiline == o.pattern_options.multiline &&
+        pattern_options.dotall == o.pattern_options.dotall && pattern_options.unicode == o.pattern_options.unicode &&
+        pattern_options.crlf == o.pattern_options.crlf && overlapping == o.overlapping &&
+        invert_match == o.invert_match && files_with_matches == o.files_with_matches &&
+        files_without_match == o.files_without_match && include_binary == o.include_binary &&
+        max_matches == o.max_matches && record_separator == o.record_separator &&
+        objective == o.objective && threads == o.threads && eligible_file_ids == o.eligible_file_ids;
+}
+std::uint64_t MultiPatternEntry::semantic_hash() const noexcept {
+    uint64_t h = 1469598103934665603ull;
+    h = fnv_mix_str(h, expression);
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.kind));
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.case_mode));
+    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.engine));
+    h = fnv_mix(h, pattern_options.word ? 1u : 0u);
+    h = fnv_mix(h, pattern_options.line ? 1u : 0u);
+    h = fnv_mix(h, pattern_options.multiline ? 1u : 0u);
+    h = fnv_mix(h, pattern_options.dotall ? 1u : 0u);
+    h = fnv_mix(h, pattern_options.unicode ? 1u : 0u);
+    h = fnv_mix(h, pattern_options.crlf ? 1u : 0u);
+    h = fnv_mix(h, overlapping ? 1u : 0u);
+    h = fnv_mix(h, invert_match ? 1u : 0u);
+    h = fnv_mix(h, files_with_matches ? 1u : 0u);
+    h = fnv_mix(h, files_without_match ? 1u : 0u);
+    h = fnv_mix(h, include_binary ? 1u : 0u);
+    h = fnv_mix(h, max_matches);
+    h = fnv_mix(h, record_separator);
+    h = fnv_mix(h, static_cast<uint64_t>(objective));
+    h = fnv_mix(h, threads);
+    for (auto id : eligible_file_ids) h = fnv_mix(h, id);
+    return h ? h : 1u;
+}
+MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
+                                 const std::vector<SearchOptions>& options,
+                                 bool needs_replacement) {
+    static const SearchOptions kDefaultOptions{};
+    MultiQueryIR ir;
+    for (std::uint32_t i = 0; i < patterns.size(); ++i) {
+        const auto& pat = patterns[i];
+        const SearchOptions& so = i < options.size() ? options[i] : kDefaultOptions;
+        MultiPatternEntry e;
+        e.source_id = i;
+        e.pattern = pat;
+        e.expression = pat.expression();
+        e.pattern_options = pat.options();
+        e.overlapping = so.overlapping;
+        e.invert_match = so.invert_match;
+        e.files_with_matches = so.files_with_matches;
+        e.files_without_match = so.files_without_match;
+        e.include_binary = so.include_binary;
+        e.max_matches = so.max_matches;
+        e.record_separator = so.record_separator;
+        e.objective = so.objective;
+        e.threads = so.threads;
+        if (so.eligible_file_ids.data() && !so.eligible_file_ids.empty()) {
+            e.eligible_file_ids.assign(so.eligible_file_ids.begin(), so.eligible_file_ids.end());
+            std::sort(e.eligible_file_ids.begin(), e.eligible_file_ids.end());
+            e.eligible_file_ids.erase(std::unique(e.eligible_file_ids.begin(), e.eligible_file_ids.end()),
+                                      e.eligible_file_ids.end());
+        }
+        e.has_captures = detail::parse_regex(e.expression, e.pattern_options).groups > 0;
+        e.needs_replacement = needs_replacement;
+        ir.entries.push_back(std::move(e));
+    }
+    return ir;
+}
+std::vector<std::vector<std::uint32_t>> multi_query_sharing(const MultiQueryIR& ir) {
+    // Conservative scaffold: identical fixed literals share one scan; every
+    // regex (and any differing entry) stays independent. M7.2/M7.3 refine.
+    std::vector<std::vector<std::uint32_t>> groups;
+    std::vector<bool> claimed(ir.entries.size(), false);
+    for (std::size_t i = 0; i < ir.entries.size(); ++i) {
+        if (claimed[i]) continue;
+        const auto& a = ir.entries[i];
+        std::vector<std::uint32_t> g{a.source_id};
+        claimed[i] = true;
+        if (a.pattern_options.kind == PatternKind::Fixed) {
+            for (std::size_t j = i + 1; j < ir.entries.size(); ++j) {
+                if (!claimed[j] && ir.entries[j] == a) {
+                    g.push_back(ir.entries[j].source_id);
+                    claimed[j] = true;
+                }
+            }
+        }
+        groups.push_back(std::move(g));
+    }
+    return groups;
+}
+std::string explain_multi_query_sharing(const MultiQueryIR& ir) {
+    std::string out = "multi-pattern plan: " + std::to_string(ir.entries.size()) + " pattern(s); ";
+    for (const auto& g : multi_query_sharing(ir)) {
+        if (g.size() > 1) {
+            out += "patterns [";
+            for (std::size_t k = 0; k < g.size(); ++k) {
+                if (k) out += ",";
+                out += std::to_string(g[k]);
+            }
+            const auto& e = ir.entries[g[0]];
+            out += "] share one " + std::string(e.pattern_options.kind == PatternKind::Fixed ? "fixed-literal" : "regex") +
+                   " scan for '" + e.expression + "'; ";
+        } else {
+            const auto& e = ir.entries[g[0]];
+            out += "pattern " + std::to_string(g[0]) + " independent (" +
+                   (e.pattern_options.kind == PatternKind::Fixed ? "fixed" : "regex") + "); ";
+        }
+    }
+    return out;
+}
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
     return make_plan_key(pattern, search_options, index.options(), transformed_input_identity);
 }

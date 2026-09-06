@@ -1470,6 +1470,80 @@ static void test_m68_engine_matrix() {
   }
 }
 
+static void test_m71_multi_query_ir() {
+  // M7.1: MultiQueryIR identity, metadata, and sharing explanation.
+  std::cerr << "M7.1 multi-query IR" << std::flush;
+
+  const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+  const PatternOptions word_fx = {.kind = PatternKind::Fixed, .word = true};
+  std::vector<Pattern> patterns = {
+    Pattern::compile("alpha", {.kind = PatternKind::Fixed}),
+    Pattern::compile("a.*"),
+    Pattern::compile("alpha", {.kind = PatternKind::Fixed}),
+    Pattern::compile("ALPHA", icase_fx),
+    Pattern::compile("beta", word_fx),
+    Pattern::compile("(x)(y)"),
+  };
+  std::vector<std::uint32_t> scope{5, 2, 5};
+  std::vector<SearchOptions> options(6);
+  options[1].eligible_file_ids = scope;
+  options[4].max_matches = 7;
+  auto ir = make_multi_query_ir(patterns, options, true);
+  // Ownership proof: the IR owns its scope copy; mutating the source span
+  // afterwards cannot disturb the entry.
+  scope.clear();
+  scope.push_back(99);
+  assert(ir.entries.size() == 6);
+  for (std::uint32_t i = 0; i < 6; ++i) assert(ir.entries[i].source_id == i);
+
+  // Duplicate expressions: distinct identities, equal semantic keys.
+  assert(ir.entries[0] == ir.entries[2]);
+  assert(ir.entries[0].semantic_hash() == ir.entries[2].semantic_hash());
+  assert(ir.entries[0].source_id != ir.entries[2].source_id);
+  // Differing options/scopes/modes change the key.
+  assert(ir.entries[0] != ir.entries[3]); // case mode
+  assert(ir.entries[0] != ir.entries[4]); // word + max_matches
+  assert(ir.entries[0] != ir.entries[1]); // kind
+  assert(ir.entries[0].semantic_hash() != ir.entries[1].semantic_hash());
+
+  // Metadata: captures, replacement, scope normalization.
+  assert(!ir.entries[0].has_captures && ir.entries[5].has_captures);
+  for (const auto& e : ir.entries) assert(e.needs_replacement);
+  {
+    const auto& ids = ir.entries[1].eligible_file_ids; // {5,2,5} -> {2,5}
+    assert(ids.size() == 2 && ids[0] == 2 && ids[1] == 5);
+    assert(ir.entries[4].max_matches == 7);
+  }
+
+  // Sharing: {0,2} share; every regex stays independent; full coverage in order.
+  {
+    auto groups = multi_query_sharing(ir);
+    bool found_pair = false;
+    std::vector<bool> seen(6, false);
+    for (const auto& g : groups) {
+      for (auto id : g) { assert(id < 6 && !seen[id]); seen[id] = true; }
+      if (g.size() == 2 && ((g[0] == 0 && g[1] == 2))) found_pair = true;
+      if (g.size() == 1) assert(g[0] == 1 || g[0] == 3 || g[0] == 4 || g[0] == 5);
+    }
+    assert(found_pair);
+    for (bool b : seen) assert(b);
+    const std::string expl = explain_multi_query_sharing(ir);
+    assert(expl.find("[0,2]") != std::string::npos);
+    assert(expl.find("independent") != std::string::npos);
+    assert(expl.find("alpha") != std::string::npos);
+  }
+
+  // Edge cases: empty input, short options (defaults for the rest).
+  {
+    auto empty = make_multi_query_ir({}, {});
+    assert(empty.entries.empty());
+    assert(multi_query_sharing(empty).empty());
+    auto ir2 = make_multi_query_ir(patterns, {});
+    assert(ir2.entries.size() == 6);
+    assert(ir2.entries[0] == ir2.entries[2]);
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6891,6 +6965,8 @@ int main(){
   test_m67_vm_telemetry();
 
   test_m68_engine_matrix();
+
+  test_m71_multi_query_ir();
 
   return 0;
 }
