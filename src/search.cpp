@@ -1793,6 +1793,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
+    detail::VmTelemetry vm_telemetry{};
     std::vector<std::uint32_t> normalized_scope;
     if (!opt.eligible_file_ids.empty()) {
         normalized_scope.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
@@ -1967,6 +1968,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
                         false, false, opt.record_separator, p.impl_->opt.crlf};
+                    context.tm = stats ? &vm_telemetry : nullptr;
                     if (detail::regex_search(p.impl_->re, context, p.impl_->opt, &m, fid)) {
                         matched = true;
                     }
@@ -2391,6 +2393,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
                             record_begin, record_end, bounded.candidate_begin, bounded.candidate_end,
                             false, false, opt.record_separator, p.impl_->opt.crlf};
+                        context.tm = stats ? &vm_telemetry : nullptr;
                         context.region_begin = bounded.region_begin;
                         context.region_end = bounded.region_end;
                         context.bounded_region = true;
@@ -2483,6 +2486,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
                     0, static_cast<std::uint64_t>(data.size()), 0, static_cast<std::uint64_t>(data.size() + 1),
                     false, false, opt.record_separator, p.impl_->opt.crlf};
+                context.tm = stats ? &vm_telemetry : nullptr;
                 auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                 out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
@@ -2507,6 +2511,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
                         false, false, opt.record_separator, p.impl_->opt.crlf};
+                    context.tm = stats ? &vm_telemetry : nullptr;
                     auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                     out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
@@ -2534,6 +2539,13 @@ done:
     if (stats) {
         accounting.finish();
         stats->matches = out.size();
+        stats->vm_max_depth = vm_telemetry.max_depth;
+        stats->vm_repeat_iterations = vm_telemetry.repeat_iterations;
+        stats->vm_repeat_capped = vm_telemetry.repeat_capped;
+        stats->vm_lookbehind_evals = vm_telemetry.lookbehind_evals;
+        stats->vm_max_lookbehind_window = vm_telemetry.max_lookbehind_window;
+        stats->vm_lookbehind_capped = vm_telemetry.lookbehind_capped;
+        stats->vm_state_expansions = vm_telemetry.state_expansions;
         const auto elapsed = std::clock() - verifier_start;
         if (elapsed > 0) {
             stats->verifier_cpu_ns =

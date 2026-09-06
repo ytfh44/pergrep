@@ -231,6 +231,20 @@ struct QueryIR {
 // bound visible bytes to a proven execution region; otherwise bytes visible to an
 // attempted match are the full source. Source/record bounds, context-availability flags, separator
 // and CRLF policy are authoritative; derived views are convenience helpers.
+// M6.7: extended-VM resource telemetry. Aggregated per search when attached via
+// VerifierContext::tm; untouched otherwise (null default keeps hot paths clean).
+// Counters are monotonic within a search; limit_reason points to a static string
+// set at the throw site (null = no limit hit).
+struct VmTelemetry {
+    std::uint64_t max_depth = 0;
+    std::uint64_t repeat_iterations = 0;
+    std::uint64_t repeat_capped = 0;
+    std::uint64_t lookbehind_evals = 0;
+    std::uint64_t max_lookbehind_window = 0;
+    std::uint64_t lookbehind_capped = 0;
+    std::uint64_t state_expansions = 0;
+    const char* limit_reason = nullptr;
+};
 struct VerifierContext {
     std::string_view source;
     std::uint64_t source_begin = 0;
@@ -249,6 +263,7 @@ struct VerifierContext {
     std::uint64_t region_begin = 0;
     std::uint64_t region_end = 0;
     bool bounded_region = false;
+    VmTelemetry* tm = nullptr;
 
     bool validate() const noexcept {
         if (source_end < source_begin || source_end - source_begin != source.size()) return false;

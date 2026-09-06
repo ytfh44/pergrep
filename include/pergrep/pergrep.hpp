@@ -377,6 +377,17 @@ struct SearchStats {
     std::uint64_t chunk_probe_bytes = 0;
     std::uint64_t chunk_probe_operations = 0;
     std::string qgram_fallback_reason = "none";
+    // M6.7 extended-VM resource telemetry. C++-only; populated when stats are
+    // requested on searches reaching the extended verifier. Zero means the
+    // extended path never ran. Deterministic for fixed input+index.
+    // Failure reasons surface via exceptions (see docs/vm-telemetry.md).
+    std::uint64_t vm_max_depth = 0;
+    std::uint64_t vm_repeat_iterations = 0;
+    std::uint64_t vm_repeat_capped = 0;
+    std::uint64_t vm_lookbehind_evals = 0;
+    std::uint64_t vm_max_lookbehind_window = 0;
+    std::uint64_t vm_lookbehind_capped = 0;
+    std::uint64_t vm_state_expansions = 0;
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
