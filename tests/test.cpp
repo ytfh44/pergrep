@@ -1544,6 +1544,137 @@ static void test_m71_multi_query_ir() {
   }
 }
 
+static void test_m72_aho_corasick() {
+  // M7.2: guarded Aho-Corasick shared scan equals independent searches.
+  // Fallback calls are byte-identical to the reference calls (same function),
+  // and the shared path serves fixed literals only (captures empty both sides),
+  // so full symmetric capture comparison is exact everywhere here.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+      for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+        const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+        if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+      }
+    }
+    return true;
+  };
+  std::cerr << "M7.2 aho-corasick" << std::flush;
+
+  auto idx = Index::from_documents({
+    {"a.txt", "alpha beta gamma\nsecond alpha line\n"},
+    {"b.txt", "delta alpha beta\n"},
+    {"c.txt", "\xE4\xB8\x96\xE7\x95\x8C alpha\n"},
+  });
+  Searcher s(idx);
+  const PatternOptions fx = {.kind = PatternKind::Fixed};
+
+  auto independent = [&](const MultiQueryIR& ir) {
+    std::vector<std::vector<Match>> out;
+    for (const auto& e : ir.entries) {
+      SearchOptions so;
+      so.overlapping = e.overlapping;
+      so.include_binary = e.include_binary;
+      out.push_back(s.find(e.pattern, so));
+    }
+    return out;
+  };
+
+  // (a) At threshold: shared path, byte-identical to independent.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fx), Pattern::compile("beta", fx),
+      Pattern::compile("gamma", fx), Pattern::compile("delta", fx),
+    };
+    std::vector<SearchOptions> os(4);
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto shared = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    assert(shared.size() == ref.size());
+    for (std::size_t i = 0; i < shared.size(); ++i) assert(same(shared[i], ref[i]));
+    assert(st.physical_operator == "AhoCorasickShared");
+    assert(!shared[0].empty());
+  }
+  // (b) Below threshold: independent fallback, still identical.
+  {
+    std::vector<Pattern> ps = {Pattern::compile("alpha", fx), Pattern::compile("beta", fx)};
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "IndependentFallback");
+  }
+  // (c) Duplicates: same literal twice, both entries get every occurrence.
+  {
+    std::vector<Pattern> ps;
+    for (int i = 0; i < 4; ++i) ps.push_back(Pattern::compile("alpha", fx));
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "AhoCorasickShared");
+    for (std::size_t i = 1; i < r.size(); ++i) {
+      assert(r[i].size() == r[0].size());
+      for (std::size_t k = 0; k < r[i].size(); ++k) {
+        assert(r[i][k].file_id == r[0][k].file_id && r[i][k].start == r[0][k].start);
+      }
+    }
+    assert(!r[0].empty());
+  }
+  // (d) Overlapping flags differ per entry: shared scan, per-pattern filtering.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("aa", fx), Pattern::compile("aa", fx),
+      Pattern::compile("bb", fx), Pattern::compile("cc", fx),
+    };
+    std::vector<SearchOptions> os(4);
+    os[1].overlapping = true;
+    auto idx2 = Index::from_documents({{"o.txt", "aaa bbb\n"}});
+    Searcher s2(idx2);
+    auto ir = make_multi_query_ir(ps, os);
+    auto r = s2.find_multi(ir);
+    SearchOptions o0, o1; o1.overlapping = true;
+    auto e0 = s2.find(ps[0], o0);
+    auto e1 = s2.find(ps[1], o1);
+    assert(e0.size() == 1 && e1.size() == 2); // non-overlap 1 vs overlap 2 on "aaa"
+    assert(r[0].size() == e0.size() && r[1].size() == e1.size());
+    for (std::size_t i = 0; i < e0.size(); ++i)
+      assert(r[0][i].start == e0[i].start && r[0][i].end == e0[i].end);
+    for (std::size_t i = 0; i < e1.size(); ++i)
+      assert(r[1][i].start == e1[i].start && r[1][i].end == e1[i].end);
+  }
+  // (e) Mixed fixed+regex falls back wholesale.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fx), Pattern::compile("b.*"),
+      Pattern::compile("gamma", fx), Pattern::compile("delta", fx),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "IndependentFallback");
+  }
+  // (f) Multibyte content equal under shared scan (byte-uniform trie).
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fx), Pattern::compile("beta", fx),
+      Pattern::compile("gamma", fx), Pattern::compile("delta", fx),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    auto r = s.find_multi(ir);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    bool saw_cjk = false; // c.txt CJK-adjacent alpha hit present
+    for (const auto& m : r[0]) if (m.file_id == 2) saw_cjk = true;
+    assert(saw_cjk);
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6967,6 +7098,8 @@ int main(){
   test_m68_engine_matrix();
 
   test_m71_multi_query_ir();
+
+  test_m72_aho_corasick();
 
   return 0;
 }

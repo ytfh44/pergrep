@@ -1,3 +1,4 @@
+#include "aho_corasick.hpp"
 #include "internal.hpp"
 #include "worker_queue.hpp"
 #include <algorithm>
@@ -1104,6 +1105,99 @@ std::string explain_multi_query_sharing(const MultiQueryIR& ir) {
                    (e.pattern_options.kind == PatternKind::Fixed ? "fixed" : "regex") + "); ";
         }
     }
+    return out;
+}
+// M7.2 guarded Aho-Corasick shared scan. Measured crossover below 2 patterns
+// on mixed corpora; the gate requires 4+ for margin against small-corpus
+// variance (see docs/aho-corasick-shared.md). M9 may tune these bounds.
+inline constexpr std::size_t kMinSharedPatterns = 4;
+inline constexpr std::size_t kMaxSharedPatterns = 256;
+inline constexpr std::size_t kMaxSharedBytes = 65536;
+inline constexpr std::size_t kMaxAcNodes = 16384;
+bool aho_eligible_entry(const MultiPatternEntry& e) noexcept {
+    if (e.pattern_options.kind != PatternKind::Fixed) return false;
+    if (e.pattern_options.case_mode != CaseMode::Sensitive) return false;
+    if (e.pattern_options.word || e.pattern_options.line) return false;
+    if (e.invert_match || e.files_with_matches || e.files_without_match) return false;
+    if (e.max_matches != 0 || e.objective != SearchObjective::Exhaustive) return false;
+    if (e.threads != 1 || !e.eligible_file_ids.empty()) return false;
+    if (e.record_separator != '\n') return false;
+    if (e.expression.empty()) return false;
+    return true;
+}
+std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, SearchStats* stats) const {
+    std::vector<std::vector<Match>> out(ir.entries.size());
+    if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
+    if (stats) *stats = {};
+    auto& I = *index_->impl_;
+    std::uint64_t total_matches = 0;
+    auto finish = [&](const char* op) {
+        if (stats) {
+            stats->matches = total_matches;
+            stats->physical_operator = op;
+        }
+    };
+    // Shared path gate.
+    bool shared = ir.entries.size() >= kMinSharedPatterns && ir.entries.size() <= kMaxSharedPatterns;
+    std::size_t total_bytes = 0;
+    if (shared) {
+        for (const auto& e : ir.entries) {
+            if (!aho_eligible_entry(e)) { shared = false; break; }
+            total_bytes += e.expression.size();
+            if (total_bytes > kMaxSharedBytes) { shared = false; break; }
+        }
+    }
+    if (shared) {
+        std::vector<std::string> lits;
+        lits.reserve(ir.entries.size());
+        for (const auto& e : ir.entries) lits.push_back(e.expression);
+        detail::AhoCorasick ac;
+        if (ac.build(lits, kMaxAcNodes, kMaxSharedBytes)) {
+            for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+                // Non-overlap state resets per file: serial verification treats
+                // each file independently, so a late match in one file must not
+                // suppress early matches in the next.
+                std::vector<std::uint64_t> last_end(ir.entries.size(), 0);
+                std::vector<bool> started(ir.entries.size(), false);
+                const bool file_binary = fid < I.infos.size() && I.infos[fid].binary;
+                const std::string_view content = I.loaded[fid].view();
+                for (const auto& [pi, end] : ac.search_all(content)) {
+                    const auto& e = ir.entries[pi];
+                    if (file_binary && !e.include_binary) continue;
+                    const std::uint64_t start = end - e.expression.size();
+                    if (!e.overlapping) {
+                        if (started[pi] && start < last_end[pi]) continue;
+                        started[pi] = true;
+                        last_end[pi] = end;
+                    }
+                    out[e.source_id].push_back(Match{fid, start, end, {}});
+                    ++total_matches;
+                }
+            }
+            finish("AhoCorasickShared");
+            return out;
+        }
+        shared = false;
+    }
+    // Independent fallback: full per-pattern semantics by construction.
+    for (const auto& e : ir.entries) {
+        SearchOptions so;
+        so.overlapping = e.overlapping;
+        so.invert_match = e.invert_match;
+        so.files_with_matches = e.files_with_matches;
+        so.files_without_match = e.files_without_match;
+        so.include_binary = e.include_binary;
+        so.max_matches = e.max_matches;
+        so.record_separator = e.record_separator;
+        so.objective = e.objective;
+        so.threads = e.threads;
+        if (!e.eligible_file_ids.empty())
+            so.eligible_file_ids = std::span<const std::uint32_t>(e.eligible_file_ids);
+        Searcher worker(*index_);
+        out[e.source_id] = worker.find(e.pattern, so, nullptr);
+        total_matches += out[e.source_id].size();
+    }
+    finish("IndependentFallback");
     return out;
 }
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
