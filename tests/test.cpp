@@ -2092,6 +2092,105 @@ static void test_m76_scoped_sharing() {
   }
 }
 
+static void test_m77_shared_threshold() {
+  // M7.7: admission is deterministic and exposes its reason; fallback is
+  // parity with independent execution.
+  std::cerr << "M7.7 shared threshold" << std::flush;
+
+  auto idx = Index::from_documents({
+    {"a.txt", "alpha beta\n"},
+    {"b.txt", "gamma delta\n"},
+  });
+  Searcher s(idx);
+  PatternOptions fo; fo.kind = PatternKind::Fixed;
+
+  auto run = [&](const MultiQueryIR& ir) {
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    return std::pair(std::move(r), std::move(st));
+  };
+
+  // (a) Determinism: same IR twice decides alike.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    auto [r1, s1] = run(ir);
+    auto [r2, s2] = run(ir);
+    assert(s1.physical_operator == s2.physical_operator);
+    assert(s1.qgram_fallback_reason == s2.qgram_fallback_reason);
+    assert(s1.physical_operator == "AhoCorasickShared");
+    assert(s1.qgram_fallback_reason == "none");
+    assert(r1.size() == r2.size() && !r1[0].empty());
+  }
+  // (b) Below count floor: parity + reason.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    auto [r, st] = run(ir);
+    assert(st.physical_operator == "IndependentFallback");
+    assert(st.qgram_fallback_reason == "multi: fewer than 4 patterns");
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      auto ref = s.find(ps[i], SearchOptions{});
+      assert(r[i].size() == ref.size());
+    }
+  }
+  // (c) Above count ceiling.
+  {
+    std::vector<Pattern> ps;
+    for (int i = 0; i < 257; ++i)
+      ps.push_back(Pattern::compile("zzpat" + std::to_string(i), fo));
+    auto ir = make_multi_query_ir(ps, {});
+    auto [r, st] = run(ir);
+    assert(st.physical_operator == "IndependentFallback");
+    assert(st.qgram_fallback_reason == "multi: more than 256 patterns");
+    assert(r.size() == ps.size());
+  }
+  // (d) Literal budget exceeded (4 x 17KB > 64KiB).
+  {
+    std::vector<Pattern> ps;
+    for (int i = 0; i < 4; ++i)
+      ps.push_back(Pattern::compile("lit" + std::to_string(i) + std::string(17400, 'x'), fo));
+    auto ir = make_multi_query_ir(ps, {});
+    auto [r, st] = run(ir);
+    assert(st.physical_operator == "IndependentFallback");
+    assert(st.qgram_fallback_reason == "multi: shared literal budget exceeded");
+    for (auto& v : r) assert(v.empty());
+  }
+  // (e) Regex entry disqualifies AC; grouped reason takes precedence.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+      Pattern::compile(".*here.*"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    auto [r, st] = run(ir);
+    assert(st.physical_operator == "IndependentFallback");
+    assert(st.qgram_fallback_reason == "multi: no literal shared by 2+ patterns");
+    assert(r.size() == ps.size());
+  }
+  // (f) Shared literal, no pruning (single-file index): prune reason.
+  {
+    auto one = Index::from_documents({{"only.txt", "alpha beta\n"}});
+    Searcher so(one);
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha.*"), Pattern::compile(".*alpha.*"),
+      Pattern::compile("beta.*"), Pattern::compile(".*beta.*"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = so.find_multi(ir, &st);
+    assert(st.physical_operator == "IndependentFallback");
+    assert(st.qgram_fallback_reason == "multi: shared literals prune no files");
+    assert(!r[0].empty() && !r[2].empty());
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7525,6 +7624,8 @@ int main(){
   test_m75_union_fanin();
 
   test_m76_scoped_sharing();
+
+  test_m77_shared_threshold();
 
   return 0;
 }
