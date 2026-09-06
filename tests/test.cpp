@@ -2191,6 +2191,63 @@ static void test_m77_shared_threshold() {
   }
 }
 
+static void test_m81_memory_ledger() {
+  // M8.1: ledger reconciles with index_bytes; folded twin is transient;
+  // initial budgets hold on a fixed 1 MB corpus.
+  std::cerr << "M8.1 memory ledger" << std::flush;
+
+  std::cerr << "0" << std::flush; // (a) Reconciliation across scales + corpus reference.
+  {
+    auto tiny = Index::from_documents(
+        {Document{"a.txt", "alpha beta\n"}, Document{"b.txt", "gamma delta\n"}});
+    auto lt = tiny.memory_ledger();
+    assert(lt.index_structures() == tiny.index_bytes());
+    assert(lt.corpus_bytes == tiny.corpus_bytes());
+    assert(lt.freq_tables == 2048 + 262144 + 524288);
+    assert(lt.group_bits > 0 && lt.folded_bits == lt.group_bits);
+    assert(lt.folded_gids == lt.group_gids && lt.folded_gids > 0);
+  }
+  std::cerr << "1" << std::flush; // (b) Transient folded twin: save/load drops it, delta is exact.
+  {
+    const auto base_src = fs::temp_directory_path() / "pergrep_m81_ledger_src";
+    const auto base_snap = fs::temp_directory_path() / "pergrep_m81_ledger_snap";
+    fs::remove_all(base_src); fs::remove_all(base_snap);
+    fs::create_directories(base_src); fs::create_directories(base_snap);
+    { std::ofstream f(base_src / "a.txt", std::ios::binary); f << "alpha beta gamma\n"; }
+    auto idx = Index::build(base_src);
+    auto lb = idx.memory_ledger();
+    const auto snap = base_snap / "ledger.pgi";
+    idx.save(snap);
+    auto loaded = Index::load(snap);
+    auto ll = loaded.memory_ledger();
+    assert(ll.folded_bits == 0 && ll.folded_gids == 0);
+    assert(lb.index_structures() - ll.index_structures() == lb.folded_bits + lb.folded_gids);
+    assert(ll.index_structures() == loaded.index_bytes());
+    fs::remove_all(base_src);
+    fs::remove_all(base_snap);
+  }
+  std::cerr << "2" << std::flush; // (c) Initial budgets on a fixed 1 MB corpus (see docs/index-memory-ledger.md).
+  {
+    std::string big(1 << 20, 'x');
+    for (std::size_t i = 0; i < big.size(); i += 97) big[i] = char('a' + (i % 26));
+    auto idx = Index::from_documents({Document{"big.txt", big}});
+    auto l = idx.memory_ledger();
+    const auto c = l.corpus_bytes;
+    assert(l.group_bits + l.group_gids + l.folded_bits + l.folded_gids <= c * 3 / 2);
+    assert(l.positional <= c);
+    assert(l.qgram_stats + l.hash_postings <= c / 4);
+    assert(l.freq_tables <= 1 << 20);
+    assert(l.index_structures() <= c * 3);
+  }
+  std::cerr << "3" << std::flush; // (d) Monotonicity: more documents never shrink the ledger.
+  {
+    auto one = Index::from_documents({Document{"a.txt", "alpha\n"}});
+    auto two = Index::from_documents(
+        {Document{"a.txt", "alpha\n"}, Document{"b.txt", "beta\n"}});
+    assert(two.memory_ledger().index_structures() >= one.memory_ledger().index_structures());
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7626,6 +7683,8 @@ int main(){
   test_m76_scoped_sharing();
 
   test_m77_shared_threshold();
+
+  test_m81_memory_ledger();
 
   return 0;
 }

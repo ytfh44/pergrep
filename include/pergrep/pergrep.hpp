@@ -84,6 +84,30 @@ struct IndexOptions {
     bool persist_corpus = false;
 };
 
+// M8.1: deterministic per-component memory accounting. All fields count
+// element bytes (sizes, not capacities); map-node and allocator slack are
+// documented estimates, not counted. Field order is the ledger presentation
+// order used by docs/index-memory-ledger.md.
+struct IndexMemoryLedger {
+    std::uint64_t corpus_bytes = 0;   // M3-owned provider bytes (reference)
+    std::uint64_t group_bits = 0;     // q-gram group bitmaps
+    std::uint64_t group_gids = 0;     // q-gram group chunk ids
+    std::uint64_t folded_bits = 0;    // folded twin bitmaps (transient)
+    std::uint64_t folded_gids = 0;    // folded twin chunk ids (transient)
+    std::uint64_t positional = 0;     // positional matrices
+    std::uint64_t pos_descriptors = 0;// per-chunk positional descriptors
+    std::uint64_t chunks = 0;         // chunk table
+    std::uint64_t file_meta = 0;      // FileInfo structs
+    std::uint64_t paths = 0;          // path heap bytes
+    std::uint64_t qgram_stats = 0;    // exact q-gram stats + posting vectors
+    std::uint64_t hash_postings = 0;  // legacy hash-bucket chunk ids
+    std::uint64_t freq_tables = 0;    // byte/qgram/hash frequency tables
+    std::uint64_t index_structures() const noexcept {
+        return group_bits + group_gids + folded_bits + folded_gids + positional +
+               pos_descriptors + chunks + file_meta + paths + qgram_stats +
+               hash_postings + freq_tables;
+    }
+};
 struct FileInfo {
     std::string path;
     std::uint64_t size = 0;
@@ -173,6 +197,10 @@ public:
     std::span<const FileInfo> files() const noexcept;
     std::uint64_t corpus_bytes() const noexcept;
     std::uint64_t index_bytes() const noexcept;
+    // M8.1 memory ledger: per-component byte accounting of the resident
+    // index. index_structures() reconciles with index_bytes(); corpus_bytes
+    // is M3-owned provider memory, reported for reference only.
+    IndexMemoryLedger memory_ledger() const noexcept;
     bool is_snapshot() const noexcept;
     bool fresh() const;
     // The returned view is borrowed from this Index and remains valid while this Index
