@@ -272,6 +272,45 @@ PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_option
                       const Index& index, std::uint64_t transformed_input_identity = 0);
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options,
                       const IndexOptions& index_options, std::uint64_t transformed_input_identity = 0);
+
+// M7.1 MultiQueryIR: shared multi-pattern planner input. Each entry owns its
+// metadata (no borrowed spans or callbacks), so the IR is safe to retain past
+// the caller's option objects. source_id is the pattern's position in the
+// user's list: duplicate expressions keep distinct source identities while
+// sharing one semantic key. Cancellation hooks are execution-only and never
+// part of the IR (same rule as PlanKey).
+struct MultiPatternEntry {
+    std::uint32_t source_id = 0;
+    Pattern pattern;
+    std::string expression;
+    PatternOptions pattern_options;
+    bool overlapping = false;
+    bool invert_match = false;
+    bool files_with_matches = false;
+    bool files_without_match = false;
+    bool include_binary = false;
+    std::uint64_t max_matches = 0;
+    unsigned char record_separator = '\n';
+    SearchObjective objective = SearchObjective::Exhaustive;
+    std::uint32_t threads = 1;
+    std::vector<std::uint32_t> eligible_file_ids; // sorted, deduped; empty = all files
+    bool has_captures = false;      // pattern defines capture groups
+    bool needs_replacement = false; // caller will render replacements
+    bool operator==(const MultiPatternEntry& o) const noexcept;
+    bool operator!=(const MultiPatternEntry& o) const noexcept { return !(*this == o); }
+    std::uint64_t semantic_hash() const noexcept; // deterministic 64-bit FNV-1a
+};
+struct MultiQueryIR {
+    std::vector<MultiPatternEntry> entries; // in source order
+};
+MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
+                                 const std::vector<SearchOptions>& options,
+                                 bool needs_replacement = false);
+// Sharing report: groups of source_ids whose scans may be shared (identical
+// semantic keys over fixed literals today; regex always independent). Groups
+// and singletons cover every entry exactly once, in source order.
+std::vector<std::vector<std::uint32_t>> multi_query_sharing(const MultiQueryIR& ir);
+std::string explain_multi_query_sharing(const MultiQueryIR& ir);
 // Canonical identity used by shadow reports and workload aggregation. It is
 // derived from every PlanKey field (including semantic flags and capabilities)
 // and is independent of pointer addresses or execution order.
