@@ -672,6 +672,10 @@ public:
 
     std::vector<Match> find(const Pattern& pattern, SearchOptions options = {}, SearchStats* stats = nullptr) const;
     std::vector<std::uint32_t> files(const Pattern& pattern, SearchOptions options = {}, SearchStats* stats = nullptr) const;
+    // M7.2 multi-pattern search: one result vector per entry, in source order.
+    // Takes the shared Aho-Corasick scan when the whole IR is eligible, else
+    // independent per-pattern searches. See docs/aho-corasick-shared.md.
+    std::vector<std::vector<Match>> find_multi(const MultiQueryIR& ir, SearchStats* stats = nullptr) const;
 private:
     std::shared_ptr<const Index> owned_;
     const Index* index_ = nullptr;
