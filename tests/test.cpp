@@ -1675,6 +1675,128 @@ static void test_m72_aho_corasick() {
   }
 }
 
+static void test_m73_shared_prefilter() {
+  // M7.3: shared literal prefilters — grouped regex scans equal independent ones.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+      for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+        const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+        if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+      }
+    }
+    return true;
+  };
+  std::cerr << "M7.3 shared prefilter" << std::flush;
+
+  auto idx = Index::from_documents({
+    {"e0.txt", "error one\n"},
+    {"e1.txt", "an error occurred\nerrorx not-a-match-but-literal\n"},
+    {"e2.txt", "nothing yet\nerror two\n"},
+    {"t0.txt", "timeout waiting\n"},
+    {"n0.txt", "plain filler text\n"},
+  });
+  Searcher s(idx);
+
+  auto independent = [&](const MultiQueryIR& ir) {
+    std::vector<std::vector<Match>> out;
+    for (const auto& e : ir.entries) {
+      SearchOptions so;
+      so.overlapping = e.overlapping;
+      so.include_binary = e.include_binary;
+      so.max_matches = e.max_matches;
+      if (!e.eligible_file_ids.empty())
+        so.eligible_file_ids = std::span<const std::uint32_t>(e.eligible_file_ids);
+      out.push_back(s.find(e.pattern, so));
+    }
+    return out;
+  };
+
+  // (a) Shared "error" group prunes t0/n0; spans+captures exact (incl. the
+  // false-positive "errorx" file, which verifies to the same matches).
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("error.*"), Pattern::compile(".*error.*"),
+      Pattern::compile("timeout.*"), Pattern::compile("err(or)+"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    assert(r.size() == ref.size());
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "SharedPrefilterGroups");
+    assert(!r[0].empty() && !r[1].empty() && !r[2].empty());
+  }
+  // (b) No commonality: independent fallback, still identical.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile(".*foo.*"), Pattern::compile(".*bar.*"),
+      Pattern::compile(".*baz.*"), Pattern::compile(".*qux.*"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "IndependentFallback");
+  }
+  // (c) Duplicate regex entries share trivially.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("error.*"), Pattern::compile("error.*"),
+      Pattern::compile("timeout.*"), Pattern::compile("plain.*"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "SharedPrefilterGroups");
+    assert(same(r[0], r[1]));
+  }
+  // (d) Member scope intersects group files; max_matches composes.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("error.*"), Pattern::compile(".*error.*"),
+      Pattern::compile("timeout.*"), Pattern::compile("plain.*"),
+    };
+    std::vector<std::uint32_t> scope_all{0, 1, 2, 3, 4};
+    std::vector<SearchOptions> os(4);
+    os[0].eligible_file_ids = scope_all;
+    os[1].max_matches = 1;
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    // Independent oracle with the same per-entry options:
+    std::vector<std::vector<Match>> ref;
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      SearchOptions so;
+      if (i == 0) so.eligible_file_ids = scope_all;
+      if (i == 1) so.max_matches = 1;
+      ref.push_back(s.find(ps[i], so));
+    }
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(r[1].size() <= 1);
+  }
+  // (e) Case-insensitive regex stays independent (no mandatory literals).
+  {
+    PatternOptions icase; icase.case_mode = CaseMode::Insensitive;
+    std::vector<Pattern> ps = {
+      Pattern::compile("ERROR", icase), Pattern::compile("TIMEOUT", icase),
+      Pattern::compile("foo", icase), Pattern::compile("bar", icase),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    auto ref = independent(ir);
+    for (std::size_t i = 0; i < r.size(); ++i) assert(same(r[i], ref[i]));
+    assert(st.physical_operator == "IndependentFallback");
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7100,6 +7222,8 @@ int main(){
   test_m71_multi_query_ir();
 
   test_m72_aho_corasick();
+
+  test_m73_shared_prefilter();
 
   return 0;
 }
