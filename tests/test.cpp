@@ -633,6 +633,783 @@ static void test_m67_vm_telemetry() {
   }
 }
 
+static void test_m51_worker_queue()
+  // M5.1: bounded worker queue — in-order results, cancellation, exception
+  // propagation, single-thread fallback, and search equivalence with serial.
+  {
+    std::cerr << "M5.1 worker queue" << std::flush;
+
+    // (a) Determinism: parallel_map over a large range equals the serial order.
+    {
+      std::vector<int> items(10000);
+      for (int i = 0; i < 10000; ++i) items[i] = i;
+      auto f = [](int x) { return static_cast<long long>(x) * x; };
+      auto serial = detail::parallel_map<int>(items, 1, f);
+      auto par = detail::parallel_map<int>(items, 4, f);
+      assert(serial.size() == par.size());
+      for (std::size_t i = 0; i < serial.size(); ++i) assert(serial[i] == par[i]);
+    }
+
+    // (b) Cancellation: flipping the flag mid-run returns the completed prefix.
+    {
+      std::vector<int> items(20000);
+      for (int i = 0; i < 20000; ++i) items[i] = i;
+      std::atomic<bool> cancel{false};
+      std::atomic<int> flip_at{600};
+      // f signals cancellation once a threshold item is reached and otherwise is
+      // the identity; the worker-queue's loop-top gate then stops new claims, so
+      // the completed prefix stays in input order.
+      auto f = [&](int x) {
+        if (x >= flip_at.load(std::memory_order_relaxed)) cancel.store(true, std::memory_order_relaxed);
+        return x;
+      };
+      // Cooperative cancellation: once the flag flips mid-run, workers stop
+      // claiming new items; the completed prefix stays in input order.
+      auto r = detail::parallel_map<int>(items, 4, f, &cancel);
+      assert(r.size() < items.size());
+      assert(!r.empty());
+      for (std::size_t i = 0; i < r.size(); ++i) assert(r[i] == items[i]);
+    }
+
+    // (c) Exception propagation: a throwing task surfaces the exception; all
+    //     workers are joined (the process remains healthy, no deadlock/hang).
+    {
+      std::vector<int> items(1000);
+      for (int i = 0; i < 1000; ++i) items[i] = i;
+      auto f = [](int x) -> int {
+        if (x == 500) throw std::runtime_error("boom");
+        return x;
+      };
+      bool threw = false;
+      try { (void)detail::parallel_map<int>(items, 8, f); }
+      catch (const std::runtime_error& e) { threw = true; assert(std::string(e.what()) == "boom"); }
+      assert(threw);
+    }
+
+    // (d) Single-thread fallback: threads<=1 equals serial, no threads spawned.
+    {
+      std::vector<int> items(50);
+      for (int i = 0; i < 50; ++i) items[i] = i;
+      auto f = [](int x) { return x * 2; };
+      auto a = detail::parallel_map<int>(items, 0, f);
+      auto b = detail::parallel_map<int>(items, 1, f);
+      for (std::size_t i = 0; i < 50; ++i) { assert(a[i] == items[i]*2); assert(b[i] == items[i]*2); }
+    }
+
+    // (e) Search-integration equivalence: partition file IDs, search each subset
+    //     through the worker queue's serial fallback (threads=1), concatenate in
+    //     input order, and assert byte-for-byte equality with a full serial search.
+    //     (Concurrent Searcher::find is M5.6's thread-safety contract, not M5.1;
+    //      (a)-(d) already prove the concurrent queue primitives on pure work.)
+    {
+      const auto base = fs::temp_directory_path() / "pergrep_m51_worker_queue";
+      fs::remove_all(base);
+      const auto root = base / "corpus";
+      fs::create_directories(root);
+      for (int i = 0; i < 64; ++i) {
+        std::string nm = "f" + std::to_string(i) + ".txt";
+        std::ofstream fo(root / nm, std::ios::binary);
+        fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
+      }
+      auto idx = Index::build(root);
+      Searcher s(idx);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto ser = s.find(pat);
+
+      // Contiguous ascending ranges so in-order concatenation reconstructs the
+      // full serial result exactly (file IDs are already ascending).
+      const std::size_t nf = idx.files().size();
+      const std::size_t per = (nf + 3) / 4;
+      std::vector<std::vector<std::uint32_t>> subsets(4);
+      for (std::uint32_t fid = 0; fid < nf; ++fid) subsets[fid / per].push_back(fid);
+
+      // Task maps a file-ID subset to that subset's ordered matches. It runs
+      // serially (threads=1) through the queue; the queue concatenates in order.
+      auto search_subset = [&](const std::vector<std::uint32_t>& ids) {
+        SearchOptions so; so.eligible_file_ids = ids;
+        return s.find(pat, so);
+      };
+      auto par1 = detail::parallel_map<std::vector<std::uint32_t>>(subsets, 1, search_subset);
+      std::vector<Match> merged1;
+      for (auto& v : par1) for (auto& m : v) merged1.push_back(std::move(m));
+
+      // The file-ID partition is exhaustive and ordered, so concatenating the
+      // per-subset results reconstructs the full serial result exactly.
+      assert(merged1.size() == ser.size());
+      for (std::size_t i = 0; i < ser.size(); ++i) {
+        assert(merged1[i].file_id == ser[i].file_id);
+        assert(merged1[i].start == ser[i].start);
+        assert(merged1[i].end == ser[i].end);
+      }
+
+      fs::remove_all(base);
+    }
+  }
+
+static void test_m52_deterministic_merge()
+  // M5.2: deterministic file merge — the ordered per-file parallel merge is
+  // byte-identical to serial across thread counts, modes, scopes, generations.
+  {
+    std::cerr << "M5.2 deterministic merge" << std::flush;
+    assert(SearchOptions().threads == 1);
+
+    const auto base = fs::temp_directory_path() / "pergrep_m52_merge";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    // Uneven files: content length and match density vary with i.
+    for (int i = 0; i < 64; ++i) {
+      std::string nm = "f" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
+      for (int k = 0; k < (i % 9); ++k) fo << "padding line " << k << " lorem ipsum dolor\n";
+      if (i % 5 == 0) fo << "extra alpha occurrence " << i << "\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    struct Case { const char* expr; PatternOptions po; SearchOptions so; };
+    SearchOptions ov; ov.overlapping = true;
+    SearchOptions inv; inv.invert_match = true;
+    SearchOptions fw; fw.files_with_matches = true;
+    SearchOptions fwo; fwo.files_without_match = true;
+    const Case cases[] = {
+      {"alpha", {.kind = PatternKind::Fixed}, {}},
+      {"file ([0-9]+) ([a-z]+)", {}, {}},
+      {"alpha", {.kind = PatternKind::Fixed, .word = true}, {}},
+      {"alpha", {.kind = PatternKind::Fixed}, ov},
+      {"alpha", {.kind = PatternKind::Fixed}, inv},
+      {"alpha", {.kind = PatternKind::Fixed}, fw},
+      {"alpha", {.kind = PatternKind::Fixed}, fwo},
+    };
+    const unsigned thread_counts[] = {1, 2, 3, 4, 8};
+    for (const auto& cs : cases) {
+      auto pat = Pattern::compile(cs.expr, cs.po);
+      auto serial = s.find(pat, cs.so); // threads defaults to 1: serial oracle
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = cs.so; so.threads = nt;
+        auto par = s.find(pat, so);
+        assert(same(par, serial));
+      }
+    }
+
+    // Non-contiguous eligible scope with duplicates: prelude sorts+dedupes, so
+    // the parallel partition matches the serial traversal exactly.
+    {
+      std::vector<std::uint32_t> scope = {60, 5, 2, 5, 61, 2, 7, 60, 0, 63};
+      SearchOptions so; so.eligible_file_ids = scope;
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      auto par = s.find(pat, sop);
+      assert(same(par, serial));
+      assert(!serial.empty());
+    }
+
+    // Segment generation (M4 append chain): parallel search over an appended
+    // index equals the serial search over the same generation.
+    {
+      auto b0 = Index::from_documents({{"a.txt", "alpha one\n"}, {"b.txt", "beta one\n"}});
+      SegmentManifest m;
+      m.paths = {"c.txt"};
+      m.corpus_files = 3;
+      m.corpus_bytes = std::string("alpha one\n").size() + std::string("beta one\n").size() +
+                       std::string("gamma alpha\n").size();
+      auto app = Index::append(b0, {{"c.txt", "gamma alpha\n"}}, m);
+      Searcher sa(app);
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial = sa.find(pat);
+      assert(serial.size() == 2);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(sa.find(pat, so), serial));
+      }
+    }
+
+    fs::remove_all(base);
+  }
+
+static void test_m53_overlap_dedup()
+  // M5.3: overlap duplicate suppression — chunk-overlap and segment-boundary
+  // duplicates are suppressed while legitimate overlapping matches survive, and
+  // the parallel merge equals serial under adversarial chunking.
+  {
+    std::cerr << "M5.3 overlap dedup" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    // Small chunks force many chunk cores per file, so matches routinely
+    // straddle chunk boundaries and overlap regions see every match twice.
+    IndexOptions small;
+    small.chunk_bytes = 64; small.chunk_overlap = 16;
+    small.positional_block_bytes = 32;
+
+    const auto base = fs::temp_directory_path() / "pergrep_m53_dedup";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "r" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      // Long repeated run: "abcabc" occurs at every 3-byte offset, crossing
+      // chunk cores; uneven tail varies file sizes.
+      for (int k = 0; k < 40 + (i % 7) * 8; ++k) fo << "abc";
+      fo << "\n";
+      fo << "tail RARE_" << i << " xyz\n";
+    }
+    // Unicode files: multi-byte runes with overlapping matches.
+    for (int i = 0; i < 4; ++i) {
+      std::string nm = "u" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      for (int k = 0; k < 60; ++k) fo << "\xE4\xB8\x96\xE7\x95\x8C"; // 世界 世界 ...
+      fo << "\n";
+    }
+
+    auto idx = Index::build(root, small);
+    Searcher s(idx);
+    const unsigned thread_counts[] = {1, 2, 4};
+
+    // (a) Non-overlapping fixed search across chunk boundaries.
+    {
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (b) Overlapping fixed search: legitimate overlaps preserved, overlap-
+    // region double-reports suppressed — parallel equals serial.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = s.find(pat, ov);
+      assert(serial.size() > s.find(pat).size()); // overlaps add matches
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (c) Captures on boundary-crossing matches.
+    {
+      auto pat = Pattern::compile("(ab)+(c)");
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (d) Zero-width matches: empty positions reported once, never duplicated
+    // across chunk overlap regions.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("z*");
+      auto serial = s.find(pat, ov);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+      // No duplicate keys in the serial oracle itself.
+      for (std::size_t i = 1; i < serial.size(); ++i)
+        assert(serial[i].file_id != serial[i-1].file_id || serial[i].start != serial[i-1].start ||
+               serial[i].end != serial[i-1].end);
+    }
+    // (e) Multi-byte runes with overlapping matches (rune, not byte, progress).
+    {
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("\xE4\xB8\x96\xE7\x95\x8C");
+      auto serial = s.find(pat, ov);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (f) Multiple segments: append a generation whose content continues a
+    // repeated run; overlapping parallel search over the merged view is exact.
+    {
+      auto b0 = Index::from_documents({{"a.txt", "abcabcabc\n"}}, small);
+      SegmentManifest m;
+      m.paths = {"b.txt"};
+      m.corpus_files = 2;
+      m.corpus_bytes = std::string("abcabcabc\n").size() + std::string("abcabcabcabc\n").size();
+      auto app = Index::append(b0, {{"b.txt", "abcabcabcabc\n"}}, m, small);
+      Searcher sa(app);
+      SearchOptions ov; ov.overlapping = true;
+      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
+      auto serial = sa.find(pat, ov);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = ov; so.threads = nt;
+        assert(same(sa.find(pat, so), serial));
+      }
+    }
+
+    fs::remove_all(base);
+  }
+
+static void test_m54_max_match_cancel()
+  // M5.4: global max-match and quiet cancellation — budgeted, first-hit, and
+  // cancelled searches with threads>1 return exactly the serial ordered prefix.
+  {
+    std::cerr << "M5.4 max-match cancel" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m54_budget";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "b" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "alpha one\n" << "alpha two\n" << "alpha three\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+
+    // (a) Global budgets: K-prefix identical for threads 1 and 4.
+    for (std::uint64_t k : {1u, 5u, 47u, 48u, 100u}) {
+      SearchOptions so; so.max_matches = k;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == (k < 48u ? static_cast<std::size_t>(k) : 48u));
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (b) Budget composes with overlapping mode.
+    {
+      SearchOptions so; so.max_matches = 7; so.overlapping = true;
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (c) FirstHit (the quiet objective): single first ordered match, any threads.
+    {
+      SearchOptions so; so.objective = SearchObjective::FirstHit;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == 1);
+      SearchOptions sop = so; sop.threads = 4;
+      auto par = s.find(pat, sop);
+      assert(same(par, serial));
+    }
+    // (d) Explicit OrderedPrefix with a budget.
+    {
+      SearchOptions so; so.objective = SearchObjective::OrderedPrefix; so.max_matches = 3;
+      auto serial = s.find(pat, so);
+      assert(serial.size() == 3);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+    // (e) Cooperative cancellation preset: threads>1 equals serial, completes.
+    {
+      std::atomic<bool> flag{true};
+      SearchOptions so; so.should_cancel = [&] { return flag.load(std::memory_order_relaxed); };
+      auto serial = s.find(pat, so);
+      SearchOptions sop = so; sop.threads = 4;
+      assert(same(s.find(pat, sop), serial));
+    }
+
+    fs::remove_all(base);
+  }
+
+static void test_m55_semantics()
+  // M5.5: output-mode transparency — binary, NUL separators, case modes,
+  // multiline, named captures, and stats are identical under threads.
+  {
+    std::cerr << "M5.5 semantics" << std::flush;
+
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+
+    const auto base = fs::temp_directory_path() / "pergrep_m55_semantics";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 12; ++i) {
+      std::string nm = "s" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      fo << "Alpha beta GAMMA file " << i << "\nsecond ALPHA line\n";
+    }
+    // Binary files: NUL bytes and high bytes.
+    {
+      std::ofstream b0(root / "bin0.dat", std::ios::binary);
+      const char raw[] = {'a', 'l', 'p', 'h', 'a', '\0', '\xFF', '\xFE', 't', 'a', 'i', 'l', '\n'};
+      b0.write(raw, sizeof(raw));
+      std::ofstream b1(root / "bin1.dat", std::ios::binary);
+      b1 << "plain alpha text\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    const unsigned thread_counts[] = {1, 4};
+
+    // (a) Binary handling: excluded by default, included on opt-in — same under threads.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      auto serial_ex = s.find(pat);
+      auto serial_in = s.find(pat, SearchOptions{.include_binary = true});
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial_ex));
+        SearchOptions soi; soi.threads = nt; soi.include_binary = true;
+        assert(same(s.find(pat, soi), serial_in));
+      }
+    }
+    // (b) Case modes: insensitive and smart — same under threads.
+    {
+      auto pi = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive});
+      auto ps = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Smart});
+      auto si = s.find(pi), ss = s.find(ps);
+      assert(!si.empty() && !ss.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pi, so), si));
+        assert(same(s.find(ps, so), ss));
+      }
+    }
+    // (c) Multiline + dotall regex — same under threads.
+    {
+      auto pat = Pattern::compile("GAMMA(.|\n)+?second", {.multiline = true, .dotall = true});
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (d) Named captures — names and spans identical under threads.
+    {
+      auto pat = Pattern::compile("file (?<num>[0-9]+)");
+      auto serial = s.find(pat);
+      assert(!serial.empty());
+      bool saw_name = false;
+      for (const auto& m : serial) for (const auto& c : m.captures) if (c.name == "num") saw_name = true;
+      assert(saw_name);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so; so.threads = nt;
+        assert(same(s.find(pat, so), serial));
+      }
+    }
+    // (e) NUL record separator and NUL content (resident index) — same under threads.
+    {
+      auto ridx = Index::from_documents({{"n0.txt", std::string("a\0b\0alpha\0", 9)},
+                                         {"n1.txt", std::string("x\0alpha\0y\0", 9)}});
+      Searcher rs(ridx);
+      // NUL content is binary: skipped by default, searched on opt-in — both
+      // transparent under threads.
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      assert(rs.find(pat).empty());
+      {
+        SearchOptions so4; so4.threads = 4;
+        assert(rs.find(pat, so4).empty());
+      }
+      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
+      auto serial = rs.find(pat, nul);
+      assert(serial.size() == 2);
+      for (unsigned nt : thread_counts) {
+        SearchOptions so = nul; so.threads = nt;
+        assert(same(rs.find(pat, so), serial));
+      }
+    }
+    // (f) Stats: requesting stats forces one path; deterministic counters equal.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      SearchStats st1, st4;
+      SearchOptions so1; SearchOptions so4; so4.threads = 4;
+      auto r1 = s.find(pat, so1, &st1);
+      auto r4 = s.find(pat, so4, &st4);
+      assert(same(r1, r4));
+      assert(st1.matches == st4.matches && st1.candidate_files == st4.candidate_files);
+      assert(st1.candidate_chunks == st4.candidate_chunks && st1.candidate_blocks == st4.candidate_blocks);
+      assert(st1.verified_bytes == st4.verified_bytes);
+      assert(st1.logical_unique_bytes == st4.logical_unique_bytes);
+      assert(st1.physically_touched_bytes == st4.physically_touched_bytes);
+      assert(st1.candidate_order == st4.candidate_order);
+    }
+    // (g) Counts: explicit sizes for the known corpus.
+    {
+      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
+      SearchOptions so4; so4.threads = 4;
+      assert(s.find(pat, so4).size() == s.find(pat).size());
+      SearchOptions inv; inv.invert_match = true;
+      SearchOptions inv4 = inv; inv4.threads = 4;
+      assert(s.find(pat, inv4).size() == s.find(pat, inv).size());
+    }
+
+    fs::remove_all(base);
+  }
+
+static void test_m61_verifier_contract()
+  // M6.1: raw-byte exact verifier contract — invalid UTF-8, byte offsets,
+  // code-point traversal, ICU simple folding (no normalization), capture spans,
+  // and record separators all equal the reference on adversarial inputs.
+  {
+    std::cerr << "M6.1 verifier contract" << std::flush;
+
+    // Spans are always byte-exact. Captures: regex matches carry full group
+    // captures; fixed-string matches carry none (allocation-free hot path, per
+    // the Match contract), while the raw oracle retains group 0 — so for fixed
+    // patterns we pin emptiness on the indexed side plus span equality.
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (fixed) { if (!a[i].captures.empty()) return false; continue; }
+        if (a[i].captures.size() != b[i].captures.size()) return false;
+        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+        }
+      }
+      return true;
+    };
+    IndexOptions tiny; tiny.chunk_bytes = 64; tiny.chunk_overlap = 32;
+    IndexOptions whole; whole.chunk_bytes = 1 << 20; whole.chunk_overlap = 1 << 19;
+    auto check = [&](std::vector<Document> docs, std::string expr,
+                     PatternOptions popt = {}, SearchOptions sopt = {}) {
+      // Verifier contract is orthogonal to binary policy (M5.5 owns the skip):
+      // force binary inclusion so invalid-byte content reaches the verifier.
+      sopt.include_binary = true;
+      auto indexed = Index::from_documents(docs, tiny);
+      auto reference = Index::from_documents(docs, whole);
+      const bool fixed = popt.kind == PatternKind::Fixed;
+      auto pattern = Pattern::compile(std::move(expr), popt);
+      assert(same(Searcher(indexed).find(pattern, sopt), full_reference(reference, pattern, sopt), fixed));
+    };
+
+    const PatternOptions fx = {.kind = PatternKind::Fixed};
+    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+
+    // Invalid UTF-8 is data: lone continuations, truncated sequences, lone
+    // lead bytes. Byte equality decides matches; nothing is skipped.
+    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "cd", fx);
+    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "c.", {}, {});
+    check({{"a.txt", std::string("\x80\x81\xFE\n")}}, ".", {}, {});
+    check({{"a.txt", std::string("a\xE4\xB8tail\n")}}, "a", fx); // truncated CJK lead
+    check({{"a.txt", std::string("x\xED\xA0\x80y\n")}}, "y", fx); // surrogate bytes
+
+    // Byte offsets on multibyte content: "x" after U+4E16 starts at byte 3.
+    {
+      std::vector<Document> docs = {{"a.txt", std::string("\xE4\xB8\x96x\xE7\x95\x8Cy\n")}};
+      auto indexed = Index::from_documents(docs, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("x", fx));
+      assert(m.size() == 1 && m[0].start == 3 && m[0].end == 4);
+      auto my = Searcher(indexed).find(Pattern::compile("y", fx));
+      assert(my.size() == 1 && my[0].start == 7 && my[0].end == 8);
+    }
+
+    // Code-point traversal: overlapping matches step whole runes, never split.
+    {
+      SearchOptions ov; ov.overlapping = true;
+      check({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\xE4\xB8\x96\n")}},
+            std::string("\xE4\xB8\x96"), fx, ov);
+      auto indexed = Index::from_documents({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\n")}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xE4\xB8\x96"), fx), ov);
+      assert(m.size() == 2 && m[0].start == 0 && m[1].start == 3);
+    }
+
+    // ICU simple folding: K, k, and Kelvin sign fold together (insensitive).
+    check({{"a.txt", "K k \xE2\x84\xAA end\n"}}, "k", icase_fx);
+    {
+      auto indexed = Index::from_documents({{"a.txt", "K k \xE2\x84\xAA end\n"}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("k", icase_fx));
+      assert(m.size() == 3);
+    }
+    // No normalization: precomposed e-acute does not match decomposed e+acute.
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("e\xCC\x81\n")}}, tiny); // e + combining acute
+      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xC3\xA9"), icase_fx)); // U+00E9
+      assert(m.empty());
+      check({{"a.txt", std::string("\xC3\xA9\n")}}, std::string("\xC3\xA9"), icase_fx);
+    }
+
+    // Capture spans are absolute byte spans across multibyte content.
+    check({{"a.txt", std::string("\xE4\xB8\x96(\xE7\x95\x8C)X\n")}}, "(\xE7\x95\x8C)", {}, {});
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("a\xE4\xB8" "\x96" "b\n")}}, tiny);
+      auto m = Searcher(indexed).find(Pattern::compile("(\xE4\xB8\x96)"));
+      assert(m.size() == 1 && m[0].captures.size() == 2);
+      assert(m[0].captures[1].start == 1 && m[0].captures[1].end == 4);
+    }
+
+    // Record separators with multibyte and invalid bytes.
+    {
+      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
+      check({{"a.txt", std::string("\xE4\xB8\x96\0ALPHA\0\xFF\n", 12)}}, "ALPHA", fx, nul);
+    }
+    // Word mode on multibyte boundaries.
+    check({{"a.txt", std::string("\xE4\xB8\x96 alpha \xE7\x95\x8C\n")}}, "alpha",
+          {.kind = PatternKind::Fixed, .word = true});
+
+    // Filter-reject rule under adversarial bytes: tiny-chunk filtered search
+    // equals the whole-file reference (filters never drop true matches).
+    // Oracle scope: the raw oracle expresses patterns as code points, so a pattern
+    // with a truncated UTF-8 sequence is outside oracle parity. The indexed path
+    // matches such patterns byte-wise; pin the exact span (e,f,E4 at bytes 6-8).
+    {
+      auto indexed = Index::from_documents({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\xE4\xB8" "\x96gh\n")}}, tiny);
+      SearchOptions s2; s2.include_binary = true;
+      auto m = Searcher(indexed).find(Pattern::compile("ef\xE4", fx), s2);
+      assert(m.size() == 1 && m[0].start == 6 && m[0].end == 9);
+    }
+    check({{"a.txt", std::string("\x80" "abc\x80" "abc\x80" "\n")}}, "abc", fx);
+  }
+
+static void test_m62_folded_filter()
+  // M6.2: ASCII folded auxiliary filter — eligible ASCII -i queries prune via
+  // the folded Bloom; everything else falls back with identical results.
+  {
+    std::cerr << "M6.2 folded filter" << std::flush;
+
+    // Fixed-string matches carry no captures by design (M6.1); the oracle
+    // retains group 0, so pin indexed-side emptiness plus span equality.
+    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+      if (a.size() != b.size()) return false;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+        if (!a[i].captures.empty()) return false;
+      }
+      return true;
+    };
+
+    // (a) ASCII fold == ICU fold on bytes 0-127 (equivalence proven, not assumed).
+    for (int c = 0; c < 128; ++c) {
+      const UChar32 folded = u_foldCase(static_cast<UChar32>(c), U_FOLD_CASE_DEFAULT);
+      assert(folded == static_cast<UChar32>(detail::ascii_fold_byte(static_cast<unsigned char>(c))));
+    }
+
+    const auto base = fs::temp_directory_path() / "pergrep_m62_folded";
+    fs::remove_all(base);
+    const auto root = base / "corpus";
+    fs::create_directories(root);
+    for (int i = 0; i < 16; ++i) {
+      std::string nm = "w" + std::to_string(i) + ".txt";
+      std::ofstream fo(root / nm, std::ios::binary);
+      if (i % 2 == 0) fo << "Alpha BETA file " << i << "\nsecond ALPHA line\n";
+      else fo << "gamma delta file " << i << "\nno needle here\n";
+    }
+    auto idx = Index::build(root);
+    Searcher s(idx);
+    const std::size_t nchunks = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data())->chunks.size();
+    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
+
+    // (b) Eligible ASCII -i query: folded filter prunes, results equal the oracle.
+    {
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions sof;
+      SearchStats stf{};
+      auto rf = s.find(pat, sof, &stf);
+      assert(same(rf, full_reference(idx, pat, sof)));
+      assert(stf.candidate_chunks < nchunks); // pruned: alpha-free files dropped
+      assert(!rf.empty());
+    }
+    // (c) Non-ASCII -i query falls back (full candidate set, oracle-equal).
+    {
+      auto pat = Pattern::compile("\xC3\xA9", icase_fx); // U+00E9
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = s.find(pat, sof, &st);
+      assert(st.candidate_chunks == nchunks);
+      assert(same(r, full_reference(idx, pat, sof)));
+    }
+    // (d) Word-scoped -i query falls back.
+    {
+      PatternOptions w = icase_fx; w.word = true;
+      auto pat = Pattern::compile("alpha", w);
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = s.find(pat, sof, &st);
+      assert(st.candidate_chunks == nchunks);
+      assert(same(r, full_reference(idx, pat, sof)));
+      assert(!r.empty());
+    }
+    // (e) Loaded snapshot (no folded groups) falls back with equal results.
+    {
+      const auto snap = base / "snap.pgi";
+      idx.save(snap);
+      auto loaded = Index::load(snap);
+      Searcher sl(loaded);
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions sof;
+      SearchStats st{};
+      auto r = sl.find(pat, sof, &st);
+      assert(st.candidate_chunks ==
+             static_cast<const pergrep::detail::IndexData*>(loaded.debug_index_data())->chunks.size());
+      assert(same(r, full_reference(loaded, pat, sof)));
+      assert(same(r, s.find(pat, sof)));
+    }
+    // (f) Storage budget structural: folded mirrors raw shape; absent on load.
+    {
+      const auto* I = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data());
+      for (int k = 0; k < 8; ++k) {
+        assert(I->folded_groups[k].bits.size() == I->groups[k].bits.size());
+        assert(I->folded_groups[k].gids.size() == I->groups[k].gids.size());
+      }
+      auto loaded2 = Index::load(base / "snap.pgi");
+      const auto* L = static_cast<const pergrep::detail::IndexData*>(loaded2.debug_index_data());
+      for (int k = 0; k < 8; ++k) assert(L->folded_groups[k].gids.empty());
+    }
+    // (g) files_with mode under ASCII -i via the files() API: the 8 even
+    // files match (fallback path, no folded pruning).
+    {
+      auto pat = Pattern::compile("alpha", icase_fx);
+      SearchOptions fw; fw.files_with_matches = true;
+      auto fws = s.files(pat, fw);
+      assert(fws.size() == 8);
+      for (auto id : fws) {
+        const std::string& p = idx.files()[id].path;
+        const int n = std::stoi(p.substr(1, p.size() - 5));
+        assert(n % 2 == 0);
+      }
+    }
+
+    fs::remove_all(base);
+  }
+
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -5851,545 +6628,11 @@ int main(){
 
     fs::remove_all(base);
   }
-  // M5.1: bounded worker queue — in-order results, cancellation, exception
-  // propagation, single-thread fallback, and search equivalence with serial.
-  {
-    std::cerr << "M5.1 worker queue" << std::flush;
-
-    // (a) Determinism: parallel_map over a large range equals the serial order.
-    {
-      std::vector<int> items(10000);
-      for (int i = 0; i < 10000; ++i) items[i] = i;
-      auto f = [](int x) { return static_cast<long long>(x) * x; };
-      auto serial = detail::parallel_map<int>(items, 1, f);
-      auto par = detail::parallel_map<int>(items, 4, f);
-      assert(serial.size() == par.size());
-      for (std::size_t i = 0; i < serial.size(); ++i) assert(serial[i] == par[i]);
-    }
-
-    // (b) Cancellation: flipping the flag mid-run returns the completed prefix.
-    {
-      std::vector<int> items(20000);
-      for (int i = 0; i < 20000; ++i) items[i] = i;
-      std::atomic<bool> cancel{false};
-      std::atomic<int> flip_at{600};
-      // f signals cancellation once a threshold item is reached and otherwise is
-      // the identity; the worker-queue's loop-top gate then stops new claims, so
-      // the completed prefix stays in input order.
-      auto f = [&](int x) {
-        if (x >= flip_at.load(std::memory_order_relaxed)) cancel.store(true, std::memory_order_relaxed);
-        return x;
-      };
-      // Cooperative cancellation: once the flag flips mid-run, workers stop
-      // claiming new items; the completed prefix stays in input order.
-      auto r = detail::parallel_map<int>(items, 4, f, &cancel);
-      assert(r.size() < items.size());
-      assert(!r.empty());
-      for (std::size_t i = 0; i < r.size(); ++i) assert(r[i] == items[i]);
-    }
-
-    // (c) Exception propagation: a throwing task surfaces the exception; all
-    //     workers are joined (the process remains healthy, no deadlock/hang).
-    {
-      std::vector<int> items(1000);
-      for (int i = 0; i < 1000; ++i) items[i] = i;
-      auto f = [](int x) -> int {
-        if (x == 500) throw std::runtime_error("boom");
-        return x;
-      };
-      bool threw = false;
-      try { (void)detail::parallel_map<int>(items, 8, f); }
-      catch (const std::runtime_error& e) { threw = true; assert(std::string(e.what()) == "boom"); }
-      assert(threw);
-    }
-
-    // (d) Single-thread fallback: threads<=1 equals serial, no threads spawned.
-    {
-      std::vector<int> items(50);
-      for (int i = 0; i < 50; ++i) items[i] = i;
-      auto f = [](int x) { return x * 2; };
-      auto a = detail::parallel_map<int>(items, 0, f);
-      auto b = detail::parallel_map<int>(items, 1, f);
-      for (std::size_t i = 0; i < 50; ++i) { assert(a[i] == items[i]*2); assert(b[i] == items[i]*2); }
-    }
-
-    // (e) Search-integration equivalence: partition file IDs, search each subset
-    //     through the worker queue's serial fallback (threads=1), concatenate in
-    //     input order, and assert byte-for-byte equality with a full serial search.
-    //     (Concurrent Searcher::find is M5.6's thread-safety contract, not M5.1;
-    //      (a)-(d) already prove the concurrent queue primitives on pure work.)
-    {
-      const auto base = fs::temp_directory_path() / "pergrep_m51_worker_queue";
-      fs::remove_all(base);
-      const auto root = base / "corpus";
-      fs::create_directories(root);
-      for (int i = 0; i < 64; ++i) {
-        std::string nm = "f" + std::to_string(i) + ".txt";
-        std::ofstream fo(root / nm, std::ios::binary);
-        fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
-      }
-      auto idx = Index::build(root);
-      Searcher s(idx);
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      auto ser = s.find(pat);
-
-      // Contiguous ascending ranges so in-order concatenation reconstructs the
-      // full serial result exactly (file IDs are already ascending).
-      const std::size_t nf = idx.files().size();
-      const std::size_t per = (nf + 3) / 4;
-      std::vector<std::vector<std::uint32_t>> subsets(4);
-      for (std::uint32_t fid = 0; fid < nf; ++fid) subsets[fid / per].push_back(fid);
-
-      // Task maps a file-ID subset to that subset's ordered matches. It runs
-      // serially (threads=1) through the queue; the queue concatenates in order.
-      auto search_subset = [&](const std::vector<std::uint32_t>& ids) {
-        SearchOptions so; so.eligible_file_ids = ids;
-        return s.find(pat, so);
-      };
-      auto par1 = detail::parallel_map<std::vector<std::uint32_t>>(subsets, 1, search_subset);
-      std::vector<Match> merged1;
-      for (auto& v : par1) for (auto& m : v) merged1.push_back(std::move(m));
-
-      // The file-ID partition is exhaustive and ordered, so concatenating the
-      // per-subset results reconstructs the full serial result exactly.
-      assert(merged1.size() == ser.size());
-      for (std::size_t i = 0; i < ser.size(); ++i) {
-        assert(merged1[i].file_id == ser[i].file_id);
-        assert(merged1[i].start == ser[i].start);
-        assert(merged1[i].end == ser[i].end);
-      }
-
-      fs::remove_all(base);
-    }
-  }
-  // M5.2: deterministic file merge — the ordered per-file parallel merge is
-  // byte-identical to serial across thread counts, modes, scopes, generations.
-  {
-    std::cerr << "M5.2 deterministic merge" << std::flush;
-    assert(SearchOptions().threads == 1);
-
-    const auto base = fs::temp_directory_path() / "pergrep_m52_merge";
-    fs::remove_all(base);
-    const auto root = base / "corpus";
-    fs::create_directories(root);
-    // Uneven files: content length and match density vary with i.
-    for (int i = 0; i < 64; ++i) {
-      std::string nm = "f" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      fo << "file " << i << " alpha beta RARE_" << i << " gamma\n";
-      for (int k = 0; k < (i % 9); ++k) fo << "padding line " << k << " lorem ipsum dolor\n";
-      if (i % 5 == 0) fo << "extra alpha occurrence " << i << "\n";
-    }
-    auto idx = Index::build(root);
-    Searcher s(idx);
-
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (a[i].captures.size() != b[i].captures.size()) return false;
-        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
-          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
-          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
-        }
-      }
-      return true;
-    };
-
-    struct Case { const char* expr; PatternOptions po; SearchOptions so; };
-    SearchOptions ov; ov.overlapping = true;
-    SearchOptions inv; inv.invert_match = true;
-    SearchOptions fw; fw.files_with_matches = true;
-    SearchOptions fwo; fwo.files_without_match = true;
-    const Case cases[] = {
-      {"alpha", {.kind = PatternKind::Fixed}, {}},
-      {"file ([0-9]+) ([a-z]+)", {}, {}},
-      {"alpha", {.kind = PatternKind::Fixed, .word = true}, {}},
-      {"alpha", {.kind = PatternKind::Fixed}, ov},
-      {"alpha", {.kind = PatternKind::Fixed}, inv},
-      {"alpha", {.kind = PatternKind::Fixed}, fw},
-      {"alpha", {.kind = PatternKind::Fixed}, fwo},
-    };
-    const unsigned thread_counts[] = {1, 2, 3, 4, 8};
-    for (const auto& cs : cases) {
-      auto pat = Pattern::compile(cs.expr, cs.po);
-      auto serial = s.find(pat, cs.so); // threads defaults to 1: serial oracle
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = cs.so; so.threads = nt;
-        auto par = s.find(pat, so);
-        assert(same(par, serial));
-      }
-    }
-
-    // Non-contiguous eligible scope with duplicates: prelude sorts+dedupes, so
-    // the parallel partition matches the serial traversal exactly.
-    {
-      std::vector<std::uint32_t> scope = {60, 5, 2, 5, 61, 2, 7, 60, 0, 63};
-      SearchOptions so; so.eligible_file_ids = scope;
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      auto serial = s.find(pat, so);
-      SearchOptions sop = so; sop.threads = 4;
-      auto par = s.find(pat, sop);
-      assert(same(par, serial));
-      assert(!serial.empty());
-    }
-
-    // Segment generation (M4 append chain): parallel search over an appended
-    // index equals the serial search over the same generation.
-    {
-      auto b0 = Index::from_documents({{"a.txt", "alpha one\n"}, {"b.txt", "beta one\n"}});
-      SegmentManifest m;
-      m.paths = {"c.txt"};
-      m.corpus_files = 3;
-      m.corpus_bytes = std::string("alpha one\n").size() + std::string("beta one\n").size() +
-                       std::string("gamma alpha\n").size();
-      auto app = Index::append(b0, {{"c.txt", "gamma alpha\n"}}, m);
-      Searcher sa(app);
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      auto serial = sa.find(pat);
-      assert(serial.size() == 2);
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(sa.find(pat, so), serial));
-      }
-    }
-
-    fs::remove_all(base);
-  }
-  // M5.3: overlap duplicate suppression — chunk-overlap and segment-boundary
-  // duplicates are suppressed while legitimate overlapping matches survive, and
-  // the parallel merge equals serial under adversarial chunking.
-  {
-    std::cerr << "M5.3 overlap dedup" << std::flush;
-
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (a[i].captures.size() != b[i].captures.size()) return false;
-        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
-          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
-          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
-        }
-      }
-      return true;
-    };
-
-    // Small chunks force many chunk cores per file, so matches routinely
-    // straddle chunk boundaries and overlap regions see every match twice.
-    IndexOptions small;
-    small.chunk_bytes = 64; small.chunk_overlap = 16;
-    small.positional_block_bytes = 32;
-
-    const auto base = fs::temp_directory_path() / "pergrep_m53_dedup";
-    fs::remove_all(base);
-    const auto root = base / "corpus";
-    fs::create_directories(root);
-    for (int i = 0; i < 16; ++i) {
-      std::string nm = "r" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      // Long repeated run: "abcabc" occurs at every 3-byte offset, crossing
-      // chunk cores; uneven tail varies file sizes.
-      for (int k = 0; k < 40 + (i % 7) * 8; ++k) fo << "abc";
-      fo << "\n";
-      fo << "tail RARE_" << i << " xyz\n";
-    }
-    // Unicode files: multi-byte runes with overlapping matches.
-    for (int i = 0; i < 4; ++i) {
-      std::string nm = "u" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      for (int k = 0; k < 60; ++k) fo << "\xE4\xB8\x96\xE7\x95\x8C"; // 世界 世界 ...
-      fo << "\n";
-    }
-
-    auto idx = Index::build(root, small);
-    Searcher s(idx);
-    const unsigned thread_counts[] = {1, 2, 4};
-
-    // (a) Non-overlapping fixed search across chunk boundaries.
-    {
-      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
-      auto serial = s.find(pat);
-      assert(!serial.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (b) Overlapping fixed search: legitimate overlaps preserved, overlap-
-    // region double-reports suppressed — parallel equals serial.
-    {
-      SearchOptions ov; ov.overlapping = true;
-      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
-      auto serial = s.find(pat, ov);
-      assert(serial.size() > s.find(pat).size()); // overlaps add matches
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = ov; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (c) Captures on boundary-crossing matches.
-    {
-      auto pat = Pattern::compile("(ab)+(c)");
-      auto serial = s.find(pat);
-      assert(!serial.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (d) Zero-width matches: empty positions reported once, never duplicated
-    // across chunk overlap regions.
-    {
-      SearchOptions ov; ov.overlapping = true;
-      auto pat = Pattern::compile("z*");
-      auto serial = s.find(pat, ov);
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = ov; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-      // No duplicate keys in the serial oracle itself.
-      for (std::size_t i = 1; i < serial.size(); ++i)
-        assert(serial[i].file_id != serial[i-1].file_id || serial[i].start != serial[i-1].start ||
-               serial[i].end != serial[i-1].end);
-    }
-    // (e) Multi-byte runes with overlapping matches (rune, not byte, progress).
-    {
-      SearchOptions ov; ov.overlapping = true;
-      auto pat = Pattern::compile("\xE4\xB8\x96\xE7\x95\x8C");
-      auto serial = s.find(pat, ov);
-      assert(!serial.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = ov; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (f) Multiple segments: append a generation whose content continues a
-    // repeated run; overlapping parallel search over the merged view is exact.
-    {
-      auto b0 = Index::from_documents({{"a.txt", "abcabcabc\n"}}, small);
-      SegmentManifest m;
-      m.paths = {"b.txt"};
-      m.corpus_files = 2;
-      m.corpus_bytes = std::string("abcabcabc\n").size() + std::string("abcabcabcabc\n").size();
-      auto app = Index::append(b0, {{"b.txt", "abcabcabcabc\n"}}, m, small);
-      Searcher sa(app);
-      SearchOptions ov; ov.overlapping = true;
-      auto pat = Pattern::compile("abcabc", {.kind = PatternKind::Fixed});
-      auto serial = sa.find(pat, ov);
-      assert(!serial.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = ov; so.threads = nt;
-        assert(same(sa.find(pat, so), serial));
-      }
-    }
-
-    fs::remove_all(base);
-  }
-  // M5.4: global max-match and quiet cancellation — budgeted, first-hit, and
-  // cancelled searches with threads>1 return exactly the serial ordered prefix.
-  {
-    std::cerr << "M5.4 max-match cancel" << std::flush;
-
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (a[i].captures.size() != b[i].captures.size()) return false;
-      }
-      return true;
-    };
-
-    const auto base = fs::temp_directory_path() / "pergrep_m54_budget";
-    fs::remove_all(base);
-    const auto root = base / "corpus";
-    fs::create_directories(root);
-    for (int i = 0; i < 16; ++i) {
-      std::string nm = "b" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      fo << "alpha one\n" << "alpha two\n" << "alpha three\n";
-    }
-    auto idx = Index::build(root);
-    Searcher s(idx);
-    auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-
-    // (a) Global budgets: K-prefix identical for threads 1 and 4.
-    for (std::uint64_t k : {1u, 5u, 47u, 48u, 100u}) {
-      SearchOptions so; so.max_matches = k;
-      auto serial = s.find(pat, so);
-      assert(serial.size() == (k < 48u ? static_cast<std::size_t>(k) : 48u));
-      SearchOptions sop = so; sop.threads = 4;
-      assert(same(s.find(pat, sop), serial));
-    }
-    // (b) Budget composes with overlapping mode.
-    {
-      SearchOptions so; so.max_matches = 7; so.overlapping = true;
-      auto serial = s.find(pat, so);
-      SearchOptions sop = so; sop.threads = 4;
-      assert(same(s.find(pat, sop), serial));
-    }
-    // (c) FirstHit (the quiet objective): single first ordered match, any threads.
-    {
-      SearchOptions so; so.objective = SearchObjective::FirstHit;
-      auto serial = s.find(pat, so);
-      assert(serial.size() == 1);
-      SearchOptions sop = so; sop.threads = 4;
-      auto par = s.find(pat, sop);
-      assert(same(par, serial));
-    }
-    // (d) Explicit OrderedPrefix with a budget.
-    {
-      SearchOptions so; so.objective = SearchObjective::OrderedPrefix; so.max_matches = 3;
-      auto serial = s.find(pat, so);
-      assert(serial.size() == 3);
-      SearchOptions sop = so; sop.threads = 4;
-      assert(same(s.find(pat, sop), serial));
-    }
-    // (e) Cooperative cancellation preset: threads>1 equals serial, completes.
-    {
-      std::atomic<bool> flag{true};
-      SearchOptions so; so.should_cancel = [&] { return flag.load(std::memory_order_relaxed); };
-      auto serial = s.find(pat, so);
-      SearchOptions sop = so; sop.threads = 4;
-      assert(same(s.find(pat, sop), serial));
-    }
-
-    fs::remove_all(base);
-  }
-  // M5.5: output-mode transparency — binary, NUL separators, case modes,
-  // multiline, named captures, and stats are identical under threads.
-  {
-    std::cerr << "M5.5 semantics" << std::flush;
-
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (a[i].captures.size() != b[i].captures.size()) return false;
-        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
-          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
-          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
-        }
-      }
-      return true;
-    };
-
-    const auto base = fs::temp_directory_path() / "pergrep_m55_semantics";
-    fs::remove_all(base);
-    const auto root = base / "corpus";
-    fs::create_directories(root);
-    for (int i = 0; i < 12; ++i) {
-      std::string nm = "s" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      fo << "Alpha beta GAMMA file " << i << "\nsecond ALPHA line\n";
-    }
-    // Binary files: NUL bytes and high bytes.
-    {
-      std::ofstream b0(root / "bin0.dat", std::ios::binary);
-      const char raw[] = {'a', 'l', 'p', 'h', 'a', '\0', '\xFF', '\xFE', 't', 'a', 'i', 'l', '\n'};
-      b0.write(raw, sizeof(raw));
-      std::ofstream b1(root / "bin1.dat", std::ios::binary);
-      b1 << "plain alpha text\n";
-    }
-    auto idx = Index::build(root);
-    Searcher s(idx);
-    const unsigned thread_counts[] = {1, 4};
-
-    // (a) Binary handling: excluded by default, included on opt-in — same under threads.
-    {
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      auto serial_ex = s.find(pat);
-      auto serial_in = s.find(pat, SearchOptions{.include_binary = true});
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pat, so), serial_ex));
-        SearchOptions soi; soi.threads = nt; soi.include_binary = true;
-        assert(same(s.find(pat, soi), serial_in));
-      }
-    }
-    // (b) Case modes: insensitive and smart — same under threads.
-    {
-      auto pi = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive});
-      auto ps = Pattern::compile("alpha", {.kind = PatternKind::Fixed, .case_mode = CaseMode::Smart});
-      auto si = s.find(pi), ss = s.find(ps);
-      assert(!si.empty() && !ss.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pi, so), si));
-        assert(same(s.find(ps, so), ss));
-      }
-    }
-    // (c) Multiline + dotall regex — same under threads.
-    {
-      auto pat = Pattern::compile("GAMMA(.|\n)+?second", {.multiline = true, .dotall = true});
-      auto serial = s.find(pat);
-      assert(!serial.empty());
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (d) Named captures — names and spans identical under threads.
-    {
-      auto pat = Pattern::compile("file (?<num>[0-9]+)");
-      auto serial = s.find(pat);
-      assert(!serial.empty());
-      bool saw_name = false;
-      for (const auto& m : serial) for (const auto& c : m.captures) if (c.name == "num") saw_name = true;
-      assert(saw_name);
-      for (unsigned nt : thread_counts) {
-        SearchOptions so; so.threads = nt;
-        assert(same(s.find(pat, so), serial));
-      }
-    }
-    // (e) NUL record separator and NUL content (resident index) — same under threads.
-    {
-      auto ridx = Index::from_documents({{"n0.txt", std::string("a\0b\0alpha\0", 9)},
-                                         {"n1.txt", std::string("x\0alpha\0y\0", 9)}});
-      Searcher rs(ridx);
-      // NUL content is binary: skipped by default, searched on opt-in — both
-      // transparent under threads.
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      assert(rs.find(pat).empty());
-      {
-        SearchOptions so4; so4.threads = 4;
-        assert(rs.find(pat, so4).empty());
-      }
-      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
-      auto serial = rs.find(pat, nul);
-      assert(serial.size() == 2);
-      for (unsigned nt : thread_counts) {
-        SearchOptions so = nul; so.threads = nt;
-        assert(same(rs.find(pat, so), serial));
-      }
-    }
-    // (f) Stats: requesting stats forces one path; deterministic counters equal.
-    {
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      SearchStats st1, st4;
-      SearchOptions so1; SearchOptions so4; so4.threads = 4;
-      auto r1 = s.find(pat, so1, &st1);
-      auto r4 = s.find(pat, so4, &st4);
-      assert(same(r1, r4));
-      assert(st1.matches == st4.matches && st1.candidate_files == st4.candidate_files);
-      assert(st1.candidate_chunks == st4.candidate_chunks && st1.candidate_blocks == st4.candidate_blocks);
-      assert(st1.verified_bytes == st4.verified_bytes);
-      assert(st1.logical_unique_bytes == st4.logical_unique_bytes);
-      assert(st1.physically_touched_bytes == st4.physically_touched_bytes);
-      assert(st1.candidate_order == st4.candidate_order);
-    }
-    // (g) Counts: explicit sizes for the known corpus.
-    {
-      auto pat = Pattern::compile("alpha", {.kind = PatternKind::Fixed});
-      SearchOptions so4; so4.threads = 4;
-      assert(s.find(pat, so4).size() == s.find(pat).size());
-      SearchOptions inv; inv.invert_match = true;
-      SearchOptions inv4 = inv; inv4.threads = 4;
-      assert(s.find(pat, inv4).size() == s.find(pat, inv).size());
-    }
-
-    fs::remove_all(base);
-  }
+  test_m51_worker_queue();
+  test_m52_deterministic_merge();
+  test_m53_overlap_dedup();
+  test_m54_max_match_cancel();
+  test_m55_semantics();
   // M5.6: thread-safety contracts — shared immutable Index/Pattern/Searcher
   // serve concurrent finds; ownership keeps providers alive.
   {
@@ -6575,229 +6818,8 @@ int main(){
 
     fs::remove_all(base);
   }
-  // M6.1: raw-byte exact verifier contract — invalid UTF-8, byte offsets,
-  // code-point traversal, ICU simple folding (no normalization), capture spans,
-  // and record separators all equal the reference on adversarial inputs.
-  {
-    std::cerr << "M6.1 verifier contract" << std::flush;
-
-    // Spans are always byte-exact. Captures: regex matches carry full group
-    // captures; fixed-string matches carry none (allocation-free hot path, per
-    // the Match contract), while the raw oracle retains group 0 — so for fixed
-    // patterns we pin emptiness on the indexed side plus span equality.
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b, bool fixed) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (fixed) { if (!a[i].captures.empty()) return false; continue; }
-        if (a[i].captures.size() != b[i].captures.size()) return false;
-        for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
-          const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
-          if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
-        }
-      }
-      return true;
-    };
-    IndexOptions tiny; tiny.chunk_bytes = 64; tiny.chunk_overlap = 32;
-    IndexOptions whole; whole.chunk_bytes = 1 << 20; whole.chunk_overlap = 1 << 19;
-    auto check = [&](std::vector<Document> docs, std::string expr,
-                     PatternOptions popt = {}, SearchOptions sopt = {}) {
-      // Verifier contract is orthogonal to binary policy (M5.5 owns the skip):
-      // force binary inclusion so invalid-byte content reaches the verifier.
-      sopt.include_binary = true;
-      auto indexed = Index::from_documents(docs, tiny);
-      auto reference = Index::from_documents(docs, whole);
-      const bool fixed = popt.kind == PatternKind::Fixed;
-      auto pattern = Pattern::compile(std::move(expr), popt);
-      assert(same(Searcher(indexed).find(pattern, sopt), full_reference(reference, pattern, sopt), fixed));
-    };
-
-    const PatternOptions fx = {.kind = PatternKind::Fixed};
-    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
-
-    // Invalid UTF-8 is data: lone continuations, truncated sequences, lone
-    // lead bytes. Byte equality decides matches; nothing is skipped.
-    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "cd", fx);
-    check({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\n")}}, "c.", {}, {});
-    check({{"a.txt", std::string("\x80\x81\xFE\n")}}, ".", {}, {});
-    check({{"a.txt", std::string("a\xE4\xB8tail\n")}}, "a", fx); // truncated CJK lead
-    check({{"a.txt", std::string("x\xED\xA0\x80y\n")}}, "y", fx); // surrogate bytes
-
-    // Byte offsets on multibyte content: "x" after U+4E16 starts at byte 3.
-    {
-      std::vector<Document> docs = {{"a.txt", std::string("\xE4\xB8\x96x\xE7\x95\x8Cy\n")}};
-      auto indexed = Index::from_documents(docs, tiny);
-      auto m = Searcher(indexed).find(Pattern::compile("x", fx));
-      assert(m.size() == 1 && m[0].start == 3 && m[0].end == 4);
-      auto my = Searcher(indexed).find(Pattern::compile("y", fx));
-      assert(my.size() == 1 && my[0].start == 7 && my[0].end == 8);
-    }
-
-    // Code-point traversal: overlapping matches step whole runes, never split.
-    {
-      SearchOptions ov; ov.overlapping = true;
-      check({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\xE4\xB8\x96\n")}},
-            std::string("\xE4\xB8\x96"), fx, ov);
-      auto indexed = Index::from_documents({{"a.txt", std::string("\xE4\xB8\x96\xE4\xB8\x96\n")}}, tiny);
-      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xE4\xB8\x96"), fx), ov);
-      assert(m.size() == 2 && m[0].start == 0 && m[1].start == 3);
-    }
-
-    // ICU simple folding: K, k, and Kelvin sign fold together (insensitive).
-    check({{"a.txt", "K k \xE2\x84\xAA end\n"}}, "k", icase_fx);
-    {
-      auto indexed = Index::from_documents({{"a.txt", "K k \xE2\x84\xAA end\n"}}, tiny);
-      auto m = Searcher(indexed).find(Pattern::compile("k", icase_fx));
-      assert(m.size() == 3);
-    }
-    // No normalization: precomposed e-acute does not match decomposed e+acute.
-    {
-      auto indexed = Index::from_documents({{"a.txt", std::string("e\xCC\x81\n")}}, tiny); // e + combining acute
-      auto m = Searcher(indexed).find(Pattern::compile(std::string("\xC3\xA9"), icase_fx)); // U+00E9
-      assert(m.empty());
-      check({{"a.txt", std::string("\xC3\xA9\n")}}, std::string("\xC3\xA9"), icase_fx);
-    }
-
-    // Capture spans are absolute byte spans across multibyte content.
-    check({{"a.txt", std::string("\xE4\xB8\x96(\xE7\x95\x8C)X\n")}}, "(\xE7\x95\x8C)", {}, {});
-    {
-      auto indexed = Index::from_documents({{"a.txt", std::string("a\xE4\xB8" "\x96" "b\n")}}, tiny);
-      auto m = Searcher(indexed).find(Pattern::compile("(\xE4\xB8\x96)"));
-      assert(m.size() == 1 && m[0].captures.size() == 2);
-      assert(m[0].captures[1].start == 1 && m[0].captures[1].end == 4);
-    }
-
-    // Record separators with multibyte and invalid bytes.
-    {
-      SearchOptions nul; nul.record_separator = '\0'; nul.include_binary = true;
-      check({{"a.txt", std::string("\xE4\xB8\x96\0ALPHA\0\xFF\n", 12)}}, "ALPHA", fx, nul);
-    }
-    // Word mode on multibyte boundaries.
-    check({{"a.txt", std::string("\xE4\xB8\x96 alpha \xE7\x95\x8C\n")}}, "alpha",
-          {.kind = PatternKind::Fixed, .word = true});
-
-    // Filter-reject rule under adversarial bytes: tiny-chunk filtered search
-    // equals the whole-file reference (filters never drop true matches).
-    // Oracle scope: the raw oracle expresses patterns as code points, so a pattern
-    // with a truncated UTF-8 sequence is outside oracle parity. The indexed path
-    // matches such patterns byte-wise; pin the exact span (e,f,E4 at bytes 6-8).
-    {
-      auto indexed = Index::from_documents({{"a.txt", std::string("ab\xFF" "cd\xFE" "ef\xE4\xB8" "\x96gh\n")}}, tiny);
-      SearchOptions s2; s2.include_binary = true;
-      auto m = Searcher(indexed).find(Pattern::compile("ef\xE4", fx), s2);
-      assert(m.size() == 1 && m[0].start == 6 && m[0].end == 9);
-    }
-    check({{"a.txt", std::string("\x80" "abc\x80" "abc\x80" "\n")}}, "abc", fx);
-  }
-  // M6.2: ASCII folded auxiliary filter — eligible ASCII -i queries prune via
-  // the folded Bloom; everything else falls back with identical results.
-  {
-    std::cerr << "M6.2 folded filter" << std::flush;
-
-    // Fixed-string matches carry no captures by design (M6.1); the oracle
-    // retains group 0, so pin indexed-side emptiness plus span equality.
-    auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
-      if (a.size() != b.size()) return false;
-      for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
-        if (!a[i].captures.empty()) return false;
-      }
-      return true;
-    };
-
-    // (a) ASCII fold == ICU fold on bytes 0-127 (equivalence proven, not assumed).
-    for (int c = 0; c < 128; ++c) {
-      const UChar32 folded = u_foldCase(static_cast<UChar32>(c), U_FOLD_CASE_DEFAULT);
-      assert(folded == static_cast<UChar32>(detail::ascii_fold_byte(static_cast<unsigned char>(c))));
-    }
-
-    const auto base = fs::temp_directory_path() / "pergrep_m62_folded";
-    fs::remove_all(base);
-    const auto root = base / "corpus";
-    fs::create_directories(root);
-    for (int i = 0; i < 16; ++i) {
-      std::string nm = "w" + std::to_string(i) + ".txt";
-      std::ofstream fo(root / nm, std::ios::binary);
-      if (i % 2 == 0) fo << "Alpha BETA file " << i << "\nsecond ALPHA line\n";
-      else fo << "gamma delta file " << i << "\nno needle here\n";
-    }
-    auto idx = Index::build(root);
-    Searcher s(idx);
-    const std::size_t nchunks = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data())->chunks.size();
-    const PatternOptions icase_fx = {.kind = PatternKind::Fixed, .case_mode = CaseMode::Insensitive};
-
-    // (b) Eligible ASCII -i query: folded filter prunes, results equal the oracle.
-    {
-      auto pat = Pattern::compile("alpha", icase_fx);
-      SearchOptions sof;
-      SearchStats stf{};
-      auto rf = s.find(pat, sof, &stf);
-      assert(same(rf, full_reference(idx, pat, sof)));
-      assert(stf.candidate_chunks < nchunks); // pruned: alpha-free files dropped
-      assert(!rf.empty());
-    }
-    // (c) Non-ASCII -i query falls back (full candidate set, oracle-equal).
-    {
-      auto pat = Pattern::compile("\xC3\xA9", icase_fx); // U+00E9
-      SearchOptions sof;
-      SearchStats st{};
-      auto r = s.find(pat, sof, &st);
-      assert(st.candidate_chunks == nchunks);
-      assert(same(r, full_reference(idx, pat, sof)));
-    }
-    // (d) Word-scoped -i query falls back.
-    {
-      PatternOptions w = icase_fx; w.word = true;
-      auto pat = Pattern::compile("alpha", w);
-      SearchOptions sof;
-      SearchStats st{};
-      auto r = s.find(pat, sof, &st);
-      assert(st.candidate_chunks == nchunks);
-      assert(same(r, full_reference(idx, pat, sof)));
-      assert(!r.empty());
-    }
-    // (e) Loaded snapshot (no folded groups) falls back with equal results.
-    {
-      const auto snap = base / "snap.pgi";
-      idx.save(snap);
-      auto loaded = Index::load(snap);
-      Searcher sl(loaded);
-      auto pat = Pattern::compile("alpha", icase_fx);
-      SearchOptions sof;
-      SearchStats st{};
-      auto r = sl.find(pat, sof, &st);
-      assert(st.candidate_chunks ==
-             static_cast<const pergrep::detail::IndexData*>(loaded.debug_index_data())->chunks.size());
-      assert(same(r, full_reference(loaded, pat, sof)));
-      assert(same(r, s.find(pat, sof)));
-    }
-    // (f) Storage budget structural: folded mirrors raw shape; absent on load.
-    {
-      const auto* I = static_cast<const pergrep::detail::IndexData*>(idx.debug_index_data());
-      for (int k = 0; k < 8; ++k) {
-        assert(I->folded_groups[k].bits.size() == I->groups[k].bits.size());
-        assert(I->folded_groups[k].gids.size() == I->groups[k].gids.size());
-      }
-      auto loaded2 = Index::load(base / "snap.pgi");
-      const auto* L = static_cast<const pergrep::detail::IndexData*>(loaded2.debug_index_data());
-      for (int k = 0; k < 8; ++k) assert(L->folded_groups[k].gids.empty());
-    }
-    // (g) files_with mode under ASCII -i via the files() API: the 8 even
-    // files match (fallback path, no folded pruning).
-    {
-      auto pat = Pattern::compile("alpha", icase_fx);
-      SearchOptions fw; fw.files_with_matches = true;
-      auto fws = s.files(pat, fw);
-      assert(fws.size() == 8);
-      for (auto id : fws) {
-        const std::string& p = idx.files()[id].path;
-        const int n = std::stoi(p.substr(1, p.size() - 5));
-        assert(n % 2 == 0);
-      }
-    }
-
-    fs::remove_all(base);
-  }
+  test_m61_verifier_contract();
+  test_m62_folded_filter();
   test_m63_scoped_unicode();
 
   test_m64_unicode_fallback();
