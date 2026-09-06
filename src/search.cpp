@@ -1135,16 +1135,16 @@ inline constexpr std::size_t kMinSharedPatterns = 4;
 inline constexpr std::size_t kMaxSharedPatterns = 256;
 inline constexpr std::size_t kMaxSharedBytes = 65536;
 inline constexpr std::size_t kMaxAcNodes = 16384;
-bool aho_eligible_entry(const MultiPatternEntry& e) noexcept {
-    if (e.pattern_options.kind != PatternKind::Fixed) return false;
-    if (e.pattern_options.case_mode != CaseMode::Sensitive) return false;
-    if (e.pattern_options.word || e.pattern_options.line) return false;
-    if (e.invert_match || e.files_with_matches || e.files_without_match) return false;
-    if (e.max_matches != 0 || e.objective != SearchObjective::Exhaustive) return false;
-    if (e.threads != 1) return false;
-    if (e.record_separator != '\n') return false;
-    if (e.expression.empty()) return false;
-    return true;
+const char* aho_eligible_entry(const MultiPatternEntry& e) noexcept {
+    if (e.pattern_options.kind != PatternKind::Fixed) return "not fixed";
+    if (e.pattern_options.case_mode != CaseMode::Sensitive) return "not case-sensitive";
+    if (e.pattern_options.word || e.pattern_options.line) return "word/line anchored";
+    if (e.invert_match || e.files_with_matches || e.files_without_match) return "mode flag";
+    if (e.max_matches != 0 || e.objective != SearchObjective::Exhaustive) return "bounded search";
+    if (e.threads != 1) return "parallel entry";
+    if (e.record_separator != '\n') return "record separator";
+    if (e.expression.empty()) return "empty literal";
+    return nullptr;
 }
 std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, SearchStats* stats) const {
     std::vector<std::vector<Match>> out(ir.entries.size());
@@ -1158,14 +1158,30 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
             stats->physical_operator = op;
         }
     };
-    // Shared path gate.
+    // Shared path gate (M7.7 admission: deterministic predicate over the IR
+    // and index sizes; calibration in docs/shared-plan-threshold.md keeps the
+    // count floor at 4 with wide margin and no corpus-size floor).
+    std::string admit_reason = "none";
     bool shared = ir.entries.size() >= kMinSharedPatterns && ir.entries.size() <= kMaxSharedPatterns;
+    if (!shared) {
+        admit_reason = ir.entries.size() < kMinSharedPatterns
+            ? "multi: fewer than 4 patterns"
+            : "multi: more than 256 patterns";
+    }
     std::size_t total_bytes = 0;
     if (shared) {
         for (const auto& e : ir.entries) {
-            if (!aho_eligible_entry(e)) { shared = false; break; }
+            if (const char* cause = aho_eligible_entry(e)) {
+                shared = false;
+                admit_reason = "multi: entry " + std::to_string(e.source_id) + " " + cause;
+                break;
+            }
             total_bytes += e.expression.size();
-            if (total_bytes > kMaxSharedBytes) { shared = false; break; }
+            if (total_bytes > kMaxSharedBytes) {
+                shared = false;
+                admit_reason = "multi: shared literal budget exceeded";
+                break;
+            }
         }
     }
     if (shared) {
@@ -1217,7 +1233,9 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
             finish("AhoCorasickShared");
             return out;
         }
+        // Automaton refused (node/memory budget): grouped sharing may still win.
         shared = false;
+        admit_reason = "multi: automaton budget exceeded";
     }
     // M7.3 grouped fallback: regex entries sharing a mandatory literal reuse one
     // prefilter probe; each member searches the files containing shared chunks
@@ -1227,6 +1245,8 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
     std::vector<std::vector<std::uint32_t>> file_scope(ir.entries.size());
     std::vector<bool> grouped(ir.entries.size(), false);
     bool any_grouped = false;
+    bool any_common = false;
+    bool any_regex_candidate = false;
     {
         // Literal -> member indices (regex entries with mandatory literals only;
         // fixed literals travel the AC path or run independent; icase yields no
@@ -1237,6 +1257,7 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
             if (e.pattern_options.kind == PatternKind::Fixed) continue;
             for (const auto& lit :
                  detail::parse_regex(e.expression, e.pattern_options).query_ir.mandatory) {
+                any_regex_candidate = true;
                 auto it = std::find_if(by_literal.begin(), by_literal.end(),
                     [&](const auto& kv) { return kv.first == lit; });
                 if (it == by_literal.end()) by_literal.push_back({lit, {i}});
@@ -1247,6 +1268,7 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         for (std::uint32_t f = 0; f < all_files.size(); ++f) all_files[f] = f;
         for (const auto& [lit, members] : by_literal) {
             if (members.size() < 2) continue;
+            any_common = true;
             // Skip members already grouped (first longest-shared wins by order).
             std::vector<std::size_t> fresh;
             for (auto i : members) if (!grouped[i]) fresh.push_back(i);
@@ -1306,7 +1328,16 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         out[e.source_id] = worker.find(e.pattern, so, nullptr);
         total_matches += out[e.source_id].size();
     }
-    finish(any_grouped ? "SharedPrefilterGroups" : "IndependentFallback");
+    if (any_grouped) {
+        admit_reason = "none";
+        finish("SharedPrefilterGroups");
+    } else {
+        if (any_regex_candidate)
+            admit_reason = any_common ? "multi: shared literals prune no files"
+                                      : "multi: no literal shared by 2+ patterns";
+        if (stats) stats->qgram_fallback_reason = admit_reason;
+        finish("IndependentFallback");
+    }
     return out;
 }
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
