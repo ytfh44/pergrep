@@ -332,6 +332,19 @@ static void materialize_index_filters(detail::IndexData& I) {
         f.gids.reserve(cnt[k]);
         f.bits.assign(g.bits.size(), 0);
     }
+    // M8.2: sparse groups - initialize with empty postings
+    for (int k = 0; k < 8; ++k) {
+        auto& sg = I.sparse_groups[k];
+        sg.lg = k + 9;
+        sg.m = 1u << sg.lg;
+        sg.postings.assign(sg.m, {});
+        sg.gids.reserve(cnt[k]);
+        // M6.2: folded sparse twin
+        auto& fsg = I.folded_sparse_groups[k];
+        fsg.lg = sg.lg; fsg.m = sg.m;
+        fsg.postings.assign(sg.m, {});
+        fsg.gids.reserve(cnt[k]);
+    }
     std::array<uint32_t, 8> local{};
     for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
         auto c = I.chunks[ci];
