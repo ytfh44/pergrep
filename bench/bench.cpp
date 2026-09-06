@@ -15,6 +15,7 @@ namespace {
 struct QueryTotals {
     std::string name;
     std::string family;
+    double compile_ms = 0.0;
     double search_ms = 0.0;
     double cold_search_ms = 0.0;
     double warm_search_ms = 0.0;
@@ -288,8 +289,13 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
                                const IndexOptions& options) {
     std::vector<Pattern> patterns;
     patterns.reserve(scenario.queries.size());
+    std::vector<double> compile_ms;
+    compile_ms.reserve(scenario.queries.size());
     for (const auto& profile : scenario.queries) {
+        const auto compile_start = std::chrono::steady_clock::now();
         patterns.push_back(Pattern::compile(profile.expression, profile.pattern_options));
+        const auto compile_end = std::chrono::steady_clock::now();
+        compile_ms.push_back(std::chrono::duration<double, std::milli>(compile_end - compile_start).count());
     }
 
     ScenarioTotals totals;
@@ -298,6 +304,7 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
     for (std::size_t q = 0; q < scenario.queries.size(); ++q) {
         totals.per_query[q].name = scenario.queries[q].name;
         totals.per_query[q].family = scenario.queries[q].family;
+        totals.per_query[q].compile_ms = compile_ms[q];
     }
 
     std::vector<double> scenario_latencies;
@@ -827,6 +834,7 @@ int main(int argc, char** argv) {
                       << " warm_search_ms=" << query_totals.warm_search_ms
                       << " search_p50_ms=" << query_totals.search_p50_ms
                       << " search_p95_ms=" << query_totals.search_p95_ms
+                      << " compile_ms=" << query_totals.compile_ms
                       << " logical_unique_kb=" << (double(query_totals.logical_unique_bytes) / 1024.0)
                       << " physically_touched_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
                       << " verified_kb=" << (double(query_totals.physically_touched_bytes) / 1024.0)
