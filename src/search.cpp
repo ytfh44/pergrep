@@ -1141,7 +1141,7 @@ bool aho_eligible_entry(const MultiPatternEntry& e) noexcept {
     if (e.pattern_options.word || e.pattern_options.line) return false;
     if (e.invert_match || e.files_with_matches || e.files_without_match) return false;
     if (e.max_matches != 0 || e.objective != SearchObjective::Exhaustive) return false;
-    if (e.threads != 1 || !e.eligible_file_ids.empty()) return false;
+    if (e.threads != 1) return false;
     if (e.record_separator != '\n') return false;
     if (e.expression.empty()) return false;
     return true;
@@ -1174,7 +1174,22 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         for (const auto& e : ir.entries) lits.push_back(e.expression);
         detail::AhoCorasick ac;
         if (ac.build(lits, kMaxAcNodes, kMaxSharedBytes)) {
+            // M7.6 scope-aware shared scan: cover the union of member scopes
+            // (an unscoped member means all files) so excluded files are never
+            // read; each entry then keeps only its own scope (empty = all).
+            // Union-wide scanning with per-entry filtering is sound: every
+            // member's true matches lie in its scope, which the union covers.
+            std::vector<std::uint8_t> union_scope(I.loaded.size(), 0);
+            for (const auto& e : ir.entries) {
+                if (e.eligible_file_ids.empty()) {
+                    union_scope.assign(union_scope.size(), 1);
+                    break;
+                }
+                for (auto fid : e.eligible_file_ids)
+                    if (fid < union_scope.size()) union_scope[fid] = 1;
+            }
             for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
+                if (!union_scope[fid]) continue;
                 // Non-overlap state resets per file: serial verification treats
                 // each file independently, so a late match in one file must not
                 // suppress early matches in the next.
@@ -1185,6 +1200,10 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
                 for (const auto& [pi, end] : ac.search_all(content)) {
                     const auto& e = ir.entries[pi];
                     if (file_binary && !e.include_binary) continue;
+                    if (!e.eligible_file_ids.empty() &&
+                        !std::binary_search(e.eligible_file_ids.begin(),
+                                            e.eligible_file_ids.end(), fid))
+                        continue;
                     const std::uint64_t start = end - e.expression.size();
                     if (!e.overlapping) {
                         if (started[pi] && start < last_end[pi]) continue;
@@ -1233,9 +1252,20 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
             for (auto i : members) if (!grouped[i]) fresh.push_back(i);
             if (fresh.size() < 2) continue;
             auto cv = chunk_candidates(I, lit, nullptr);
+            std::vector<std::uint8_t> group_union(I.loaded.size(), 0);
+            for (auto i : fresh) {
+                const auto& sc = ir.entries[i].eligible_file_ids;
+                if (sc.empty()) {
+                    group_union.assign(group_union.size(), 1);
+                    break;
+                }
+                for (auto fid : sc)
+                    if (fid < group_union.size()) group_union[fid] = 1;
+            }
             std::vector<std::uint32_t> files;
             for (auto ci : cv) {
                 const auto fid = I.chunks[ci].file_id;
+                if (fid >= group_union.size() || !group_union[fid]) continue;
                 if (files.empty() || files.back() != fid) files.push_back(fid);
             }
             if (files.size() >= all_files.size()) continue; // prunes nothing

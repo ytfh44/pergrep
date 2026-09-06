@@ -1983,6 +1983,115 @@ static void test_m75_union_fanin() {
   }
 }
 
+static void test_m76_scoped_sharing() {
+  // M7.6: shared paths inspect exactly the scoped files; excluded files
+  // affect neither candidacy nor results.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+    }
+    return true;
+  };
+  std::cerr << "M7.6 scoped sharing" << std::flush;
+
+  // Corpus: in-scope files hold matches; file 3 holds the same literals but
+  // is excluded from every scope below.
+  auto idx = Index::from_documents({
+    {"a.txt", "alpha beta\n"},
+    {"b.txt", "gamma delta\n"},
+    {"c.txt", "alpha gamma\n"},
+    {"x.txt", "alpha beta gamma delta\n"},
+  });
+  Searcher s(idx);
+
+  auto scoped_find = [&](const Pattern& p, std::vector<std::uint32_t> scope) {
+    SearchOptions so;
+    so.eligible_file_ids = scope;
+    return s.find(p, so);
+  };
+
+  // (a) Scoped all-fixed IR takes the shared path (no longer falls back) and
+  // matches independent scoped finds; the excluded file contributes nothing.
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+      Pattern::compile("alpha", fo),
+    };
+    std::vector<std::uint32_t> scope{0, 1, 2};
+    std::vector<SearchOptions> os(ps.size());
+    for (auto& o : os) o.eligible_file_ids = scope;
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "AhoCorasickShared");
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], scoped_find(ps[i], scope)));
+    for (const auto& v : r) for (const auto& m : v) assert(m.file_id != 3);
+    assert(!r[0].empty());
+  }
+  // (b) Differing per-entry scopes: union scan + per-entry filter equals
+  // independent scoped finds.
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+    };
+    std::vector<std::vector<std::uint32_t>> scopes{{0, 1}, {1, 2}, {0, 2}, {0, 1, 2}};
+    std::vector<SearchOptions> os(ps.size());
+    for (std::size_t i = 0; i < ps.size(); ++i) os[i].eligible_file_ids = scopes[i];
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "AhoCorasickShared");
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], scoped_find(ps[i], scopes[i])));
+    // Scopes bite: "beta" lives only in excluded files for entry 1.
+    assert(r[0].size() == 1); // alpha in a.txt
+    assert(r[1].empty());     // beta only in a.txt/x.txt, both out of {1,2}
+    assert(r[2].size() == 1); // gamma in c.txt
+    assert(r[3].size() == 1); // delta in b.txt
+  }
+  // (c) Grouped regex with scopes: shared probe honors the group union.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha.*"), Pattern::compile(".*alpha.*"),
+      Pattern::compile(".*gamma.*"), Pattern::compile(".*delta.*"),
+    };
+    std::vector<std::uint32_t> scope{0, 1, 2};
+    std::vector<SearchOptions> os(ps.size());
+    for (auto& o : os) o.eligible_file_ids = scope;
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "SharedPrefilterGroups");
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], scoped_find(ps[i], scope)));
+    for (const auto& v : r) for (const auto& m : v) assert(m.file_id != 3);
+  }
+  // (d) Fully unscoped IR still shares exactly as before.
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "AhoCorasickShared");
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], s.find(ps[i], SearchOptions{})));
+    bool seen_excluded = false;
+    for (const auto& v : r) for (const auto& m : v) if (m.file_id == 3) seen_excluded = true;
+    assert(seen_excluded); // file 3 participates when nothing excludes it
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7414,6 +7523,8 @@ int main(){
   test_m74_pattern_metadata();
 
   test_m75_union_fanin();
+
+  test_m76_scoped_sharing();
 
   return 0;
 }
