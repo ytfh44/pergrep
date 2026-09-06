@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -304,6 +305,22 @@ struct MultiQueryIR {
     std::vector<MultiPatternEntry> entries; // in source order
 };
 MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
+                                 const std::vector<SearchOptions>& options,
+                                 bool needs_replacement = false);
+// M7.4: fallible batch compiler. Compiles each expression with its options
+// (pattern_options broadcasts like make_multi_query_ir's options: empty or
+// single entry applies to all, else per-source_id) and builds the IR in one
+// step. The first failure throws MultiPatternCompileError carrying the failing
+// source_id and the underlying message, so one bad pattern among many keeps
+// its identity (independent execution surfaces the same message from that
+// pattern's own compile).
+struct MultiPatternCompileError : std::runtime_error {
+    std::uint32_t source_id = 0;
+    explicit MultiPatternCompileError(std::uint32_t id, const std::string& msg)
+        : std::runtime_error(msg), source_id(id) {}
+};
+MultiQueryIR compile_multi_query(const std::vector<std::string>& expressions,
+                                 const std::vector<PatternOptions>& pattern_options,
                                  const std::vector<SearchOptions>& options,
                                  bool needs_replacement = false);
 // Sharing report: groups of source_ids whose scans may be shared (identical

@@ -1797,6 +1797,107 @@ static void test_m73_shared_prefilter() {
   }
 }
 
+static void test_m74_pattern_metadata() {
+  // M7.4: multi-pattern path preserves per-pattern match data and error identity.
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+      for (std::size_t c = 0; c < a[i].captures.size(); ++c) {
+        const auto& ca = a[i].captures[c]; const auto& cb = b[i].captures[c];
+        if (ca.start != cb.start || ca.end != cb.end || ca.matched != cb.matched || ca.name != cb.name) return false;
+      }
+    }
+    return true;
+  };
+  std::cerr << "M7.4 pattern metadata" << std::flush;
+
+  auto idx = Index::from_documents({
+    {"a.txt", "error one\n"},
+    {"b.txt", "nothing here\n"},
+    {"c.txt", "error two (x)\n"},
+  });
+  Searcher s(idx);
+
+  // (a) Named + numbered captures identical through the grouped path.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("(?P<w>error\\w*)"), Pattern::compile("(err)(or)"),
+      Pattern::compile("error.*"), Pattern::compile(".*here.*"),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(r.size() == ps.size());
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], s.find(ps[i], SearchOptions{})));
+    // Named group survived with its name on pattern 0 (captures[0] is the
+    // unnamed whole-match group; the named group follows it).
+    assert(!r[0].empty() && r[0][0].captures.size() >= 2);
+    assert(r[0][0].captures[1].name == "w" && r[0][0].captures[1].matched);
+    // Numbered groups survived on pattern 1.
+    assert(!r[1].empty() && r[1][0].captures.size() >= 2);
+  }
+  // (b) Fixed literals carry no captures on any path (incl. group-like text).
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("error", fo), Pattern::compile("(x)", fo),
+      Pattern::compile("nothing", fo), Pattern::compile("here", fo),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    for (const auto& e : ir.entries) assert(!e.has_captures);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      auto ref = s.find(ps[i], SearchOptions{});
+      assert(same(r[i], ref));
+      for (const auto& m : r[i]) assert(m.captures.empty());
+    }
+  }
+  // (c) Regex group-syntax text DOES carry captures.
+  {
+    auto ir = make_multi_query_ir({Pattern::compile("(x)")}, {});
+    assert(ir.entries[0].has_captures);
+  }
+  // (d) Batch compiler equals piece-wise IR; flags propagate.
+  {
+    std::vector<std::string> exprs = {"error.*", "(err)(or)", ".*here.*", "nothing"};
+    auto a = compile_multi_query(exprs, {}, {}, true);
+    std::vector<Pattern> ps;
+    for (const auto& e : exprs) ps.push_back(Pattern::compile(e));
+    auto b = make_multi_query_ir(ps, {}, true);
+    assert(a.entries.size() == b.entries.size());
+    for (std::size_t i = 0; i < a.entries.size(); ++i) assert(a.entries[i] == b.entries[i]);
+    for (const auto& e : a.entries) assert(e.needs_replacement);
+    assert(a.entries[1].has_captures && !a.entries[0].has_captures);
+  }
+  // (e) One bad pattern reports its source_id with the underlying message.
+  {
+    std::string underlying;
+    try { Pattern::compile("("); } catch (const std::exception& ex) { underlying = ex.what(); }
+    assert(!underlying.empty());
+    try {
+      compile_multi_query({"ok.*", "(", "also.*"}, {}, {});
+      assert(false && "expected MultiPatternCompileError");
+    } catch (const MultiPatternCompileError& ex) {
+      assert(ex.source_id == 1);
+      assert(std::string(ex.what()).find("pattern 1") != std::string::npos);
+      assert(std::string(ex.what()).find(underlying) != std::string::npos);
+    }
+  }
+  // (f) Single PatternOptions broadcasts to all entries.
+  {
+    PatternOptions icase; icase.case_mode = CaseMode::Insensitive;
+    auto ir = compile_multi_query({"ERROR", "NOTHING", "MISSING", "ABSENT"}, {icase}, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(!r[0].empty() && !r[1].empty());
+    assert(r[2].empty() && r[3].empty());
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7224,6 +7325,8 @@ int main(){
   test_m72_aho_corasick();
 
   test_m73_shared_prefilter();
+
+  test_m74_pattern_metadata();
 
   return 0;
 }

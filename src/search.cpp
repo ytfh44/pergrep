@@ -1059,7 +1059,8 @@ MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
             e.eligible_file_ids.erase(std::unique(e.eligible_file_ids.begin(), e.eligible_file_ids.end()),
                                       e.eligible_file_ids.end());
         }
-        e.has_captures = detail::parse_regex(e.expression, e.pattern_options).groups > 0;
+        e.has_captures = e.pattern_options.kind != PatternKind::Fixed &&
+            detail::parse_regex(e.expression, e.pattern_options).groups > 0;
         e.needs_replacement = needs_replacement;
         ir.entries.push_back(std::move(e));
     }
@@ -1087,6 +1088,26 @@ std::vector<std::vector<std::uint32_t>> multi_query_sharing(const MultiQueryIR& 
     }
     return groups;
 }
+MultiQueryIR compile_multi_query(const std::vector<std::string>& expressions,
+                                 const std::vector<PatternOptions>& pattern_options,
+                                 const std::vector<SearchOptions>& options,
+                                 bool needs_replacement) {
+    static const PatternOptions kDefaultPatternOptions{};
+    std::vector<Pattern> patterns;
+    patterns.reserve(expressions.size());
+    for (std::uint32_t i = 0; i < expressions.size(); ++i) {
+        const PatternOptions& po = pattern_options.empty() ? kDefaultPatternOptions
+            : pattern_options.size() == 1 ? pattern_options[0] : pattern_options[i];
+        try {
+            patterns.push_back(Pattern::compile(expressions[i], po));
+        } catch (const std::exception& ex) {
+            throw MultiPatternCompileError(
+                i, "pattern " + std::to_string(i) + ": " + ex.what());
+        }
+    }
+    return make_multi_query_ir(patterns, options, needs_replacement);
+}
+
 std::string explain_multi_query_sharing(const MultiQueryIR& ir) {
     std::string out = "multi-pattern plan: " + std::to_string(ir.entries.size()) + " pattern(s); ";
     for (const auto& g : multi_query_sharing(ir)) {
