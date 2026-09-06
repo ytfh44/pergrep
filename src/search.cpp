@@ -1179,8 +1179,56 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         }
         shared = false;
     }
-    // Independent fallback: full per-pattern semantics by construction.
-    for (const auto& e : ir.entries) {
+    // M7.3 grouped fallback: regex entries sharing a mandatory literal reuse one
+    // prefilter probe; each member searches the files containing shared chunks
+    // (intersected with its own scope). Mandatory literals are necessary per
+    // pattern, so scoping preserves exact results; groups that prune nothing
+    // run unscoped (setup cost never paid without benefit).
+    std::vector<std::vector<std::uint32_t>> file_scope(ir.entries.size());
+    std::vector<bool> grouped(ir.entries.size(), false);
+    bool any_grouped = false;
+    {
+        // Literal -> member indices (regex entries with mandatory literals only;
+        // fixed literals travel the AC path or run independent; icase yields no
+        // mandatory literals and stays independent automatically).
+        std::vector<std::pair<std::string, std::vector<std::size_t>>> by_literal;
+        for (std::size_t i = 0; i < ir.entries.size(); ++i) {
+            const auto& e = ir.entries[i];
+            if (e.pattern_options.kind == PatternKind::Fixed) continue;
+            for (const auto& lit :
+                 detail::parse_regex(e.expression, e.pattern_options).query_ir.mandatory) {
+                auto it = std::find_if(by_literal.begin(), by_literal.end(),
+                    [&](const auto& kv) { return kv.first == lit; });
+                if (it == by_literal.end()) by_literal.push_back({lit, {i}});
+                else it->second.push_back(i);
+            }
+        }
+        std::vector<std::uint32_t> all_files(I.loaded.size());
+        for (std::uint32_t f = 0; f < all_files.size(); ++f) all_files[f] = f;
+        for (const auto& [lit, members] : by_literal) {
+            if (members.size() < 2) continue;
+            // Skip members already grouped (first longest-shared wins by order).
+            std::vector<std::size_t> fresh;
+            for (auto i : members) if (!grouped[i]) fresh.push_back(i);
+            if (fresh.size() < 2) continue;
+            auto cv = chunk_candidates(I, lit, nullptr);
+            std::vector<std::uint32_t> files;
+            for (auto ci : cv) {
+                const auto fid = I.chunks[ci].file_id;
+                if (files.empty() || files.back() != fid) files.push_back(fid);
+            }
+            if (files.size() >= all_files.size()) continue; // prunes nothing
+            for (auto i : fresh) {
+                file_scope[i] = files;
+                grouped[i] = true;
+            }
+            any_grouped = true;
+        }
+    }
+    // Independent execution with optional shared scopes: full per-pattern
+    // semantics by construction (scope narrowing is sound by literal necessity).
+    for (std::size_t i = 0; i < ir.entries.size(); ++i) {
+        const auto& e = ir.entries[i];
         SearchOptions so;
         so.overlapping = e.overlapping;
         so.invert_match = e.invert_match;
@@ -1191,13 +1239,23 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         so.record_separator = e.record_separator;
         so.objective = e.objective;
         so.threads = e.threads;
-        if (!e.eligible_file_ids.empty())
+        std::vector<std::uint32_t> scoped;
+        if (grouped[i]) {
+            if (e.eligible_file_ids.empty()) {
+                scoped = file_scope[i];
+            } else {
+                std::set_intersection(e.eligible_file_ids.begin(), e.eligible_file_ids.end(),
+                    file_scope[i].begin(), file_scope[i].end(), std::back_inserter(scoped));
+            }
+            so.eligible_file_ids = std::span<const std::uint32_t>(scoped);
+        } else if (!e.eligible_file_ids.empty()) {
             so.eligible_file_ids = std::span<const std::uint32_t>(e.eligible_file_ids);
+        }
         Searcher worker(*index_);
         out[e.source_id] = worker.find(e.pattern, so, nullptr);
         total_matches += out[e.source_id].size();
     }
-    finish("IndependentFallback");
+    finish(any_grouped ? "SharedPrefilterGroups" : "IndependentFallback");
     return out;
 }
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
