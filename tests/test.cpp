@@ -1898,6 +1898,91 @@ static void test_m74_pattern_metadata() {
   }
 }
 
+static void test_m75_union_fanin() {
+  // M7.5: find_multi feeds the CLI union byte-identical fan-in (per-entry
+  // vectors equal independent finds across AC, grouped, and fallback paths,
+  // including duplicates, identical spans, and per-entry overlap divergence).
+  auto same = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+      if (a[i].captures.size() != b[i].captures.size()) return false;
+    }
+    return true;
+  };
+  std::cerr << "M7.5 union fan-in" << std::flush;
+
+  auto idx = Index::from_documents({
+    {"m.txt", "alpha beta\ngamma delta\nalpha gamma\n"},
+    {"n.txt", "nothing here\n"},
+  });
+  Searcher s(idx);
+
+  // (a) Mixed IR: fixed duplicates (AC path needs 4+; here fallback/grouped
+  // mix) with identical spans across patterns and per-entry overlap split.
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("alpha", fo),
+      Pattern::compile("alpha"), Pattern::compile("a.*a"),
+    };
+    std::vector<SearchOptions> os(4);
+    os[3].overlapping = true;
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(r.size() == ps.size());
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      SearchOptions so;
+      if (i == 3) so.overlapping = true;
+      assert(same(r[i], s.find(ps[i], so)));
+    }
+    assert(same(r[0], r[1])); // duplicates fan in identically
+    assert(!r[0].empty() && !r[2].empty());
+    // Identical spans across fixed "alpha" and regex "alpha" both present
+    // (the CLI union dedups them to one survivor).
+    bool shared_span = false;
+    for (const auto& a : r[0]) for (const auto& b : r[2])
+      if (a.file_id == b.file_id && a.start == b.start && a.end == b.end) shared_span = true;
+    assert(shared_span);
+  }
+  // (b) Five fixed patterns take the AC path; fan-in still identical.
+  {
+    PatternOptions fo; fo.kind = PatternKind::Fixed;
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha", fo), Pattern::compile("beta", fo),
+      Pattern::compile("gamma", fo), Pattern::compile("delta", fo),
+      Pattern::compile("alpha", fo),
+    };
+    auto ir = make_multi_query_ir(ps, {});
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    assert(st.physical_operator == "AhoCorasickShared");
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      assert(same(r[i], s.find(ps[i], SearchOptions{})));
+    assert(same(r[0], r[4]));
+  }
+  // (c) Grouped regex pair with different overlap flags fans in identically.
+  {
+    std::vector<Pattern> ps = {
+      Pattern::compile("alpha.*"), Pattern::compile(".*alpha.*"),
+      Pattern::compile(".*gamma.*"), Pattern::compile(".*here.*"),
+    };
+    std::vector<SearchOptions> os(4);
+    os[0].overlapping = true;
+    auto ir = make_multi_query_ir(ps, os);
+    SearchStats st{};
+    auto r = s.find_multi(ir, &st);
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      SearchOptions so;
+      if (i == 0) so.overlapping = true;
+      assert(same(r[i], s.find(ps[i], so)));
+    }
+    assert(st.physical_operator == "SharedPrefilterGroups");
+    assert(!r[0].empty() && !r[1].empty() && !r[2].empty() && !r[3].empty());
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7327,6 +7412,8 @@ int main(){
   test_m73_shared_prefilter();
 
   test_m74_pattern_metadata();
+
+  test_m75_union_fanin();
 
   return 0;
 }

@@ -770,23 +770,31 @@ int main(int argc, char** argv) {
                           << ")\n";
         }
         if (!eligible_file_ids.empty() && !(a.max_count_set && a.max_count == 0)) {
-            for (auto& ps : a.patterns) {
-                auto p = Pattern::compile(ps, a.popt);
-                SearchStats st;
-                // M5.7: stats force the serial path (M5.4); collect them only on
-                // the serial default so -j can take the parallel merge. `total`
-                // has no downstream reader, so skipping it under -j changes
-                // nothing observable.
-                const bool collect_stats = core_opt.threads <= 1;
-                auto ms = search.find(p, core_opt, collect_stats ? &st : nullptr);
-                if (collect_stats) {
-                    total.candidate_chunks += st.candidate_chunks;
-                    total.candidate_blocks += st.candidate_blocks;
-                    total.verified_bytes += st.verified_bytes;
-                    total.matches += st.matches;
-                }
-                perpat.push_back(std::move(ms));
+            // M7.5: one multi-pattern search feeds the same per-pattern union
+            // below. Patterns compile up front so a bad -e errors exactly as
+            // before (before any search runs, as with the old loop); every
+            // entry carries core_opt, so per-pattern semantics are unchanged
+            // and the shared AC/grouped paths only change how matches are
+            // found, never what is found (M7.2-M7.4).
+            std::vector<Pattern> pats;
+            pats.reserve(a.patterns.size());
+            for (auto& ps : a.patterns) pats.push_back(Pattern::compile(ps, a.popt));
+            std::vector<SearchOptions> entry_opts(pats.size(), core_opt);
+            auto ir = make_multi_query_ir(pats, entry_opts, !a.replacement.empty());
+            SearchStats st;
+            // M5.7: stats force the serial path (M5.4); collect them only on
+            // the serial default so -j can take the parallel merge. `total`
+            // has no downstream reader, so skipping it under -j changes
+            // nothing observable.
+            const bool collect_stats = core_opt.threads <= 1;
+            auto results = search.find_multi(ir, collect_stats ? &st : nullptr);
+            if (collect_stats) {
+                total.candidate_chunks += st.candidate_chunks;
+                total.candidate_blocks += st.candidate_blocks;
+                total.verified_bytes += st.verified_bytes;
+                total.matches += st.matches;
             }
+            for (auto& ms : results) perpat.push_back(std::move(ms));
         }
 
         std::vector<std::vector<Match>> byfile(idx->files().size());

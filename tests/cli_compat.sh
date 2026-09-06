@@ -613,3 +613,47 @@ contains "$dbg_t4" "threads=4" threads-debug-count
 contains "$dbg_t4" "execution=parallel" threads-debug-parallel
 dbg_t1="$($PG --debug alpha "$T/threads" 2>&1 >/dev/null)"
 contains "$dbg_t1" "execution=serial" threads-debug-serial
+# M7.5 multi-pattern union via shared scanning (AC + grouped paths feed the
+# same per-file byte-ordered dedup union as independent -e).
+mkdir -p "$T/m75"
+printf 'alpha beta\ngamma delta\nalpha gamma\n' > "$T/m75/m.txt"
+printf 'nothing here\n' > "$T/m75/n.txt"
+# 5 fixed patterns (one duplicate) take the shared AC path.
+out="$($PG -F -n -e alpha -e beta -e gamma -e delta -e alpha "$T/m75/m.txt")"
+eq "$out" $'1:alpha beta\n2:gamma delta\n3:alpha gamma' m75-ac-fixed
+# Grouped regex pair sharing a mandatory literal.
+printf 'error one\nall clear\nerror two\n' > "$T/m75/e.txt"
+out="$($PG -n -e 'error.*' -e '.*two.*' "$T/m75/e.txt")"
+eq "$out" $'1:error one\n3:error two' m75-grouped-regex
+# Identical spans from different patterns dedup to one line.
+printf 'foo\n' > "$T/m75/d.txt"
+out="$($PG -n -e foo -e 'f.o' "$T/m75/d.txt")"
+eq "$out" '1:foo' m75-identical-spans-dedup
+# Mixed fixed + regex union.
+out="$($PG -n -e alpha -e 'g.mma' "$T/m75/m.txt")"
+eq "$out" $'1:alpha beta\n2:gamma delta\n3:alpha gamma' m75-mixed
+# Quiet multi-pattern exit status.
+set +e
+$PG -q -e alpha -e missing "$T/m75/m.txt" >/dev/null 2>&1; code=$?
+$PG -q -e missing1 -e missing2 "$T/m75/m.txt" >/dev/null 2>&1; code2=$?
+set -e
+eq "$code" '0' m75-quiet-hit
+eq "$code2" '1' m75-quiet-miss
+# Files-with, count, only-matching over the union.
+out="$($PG -l -e alpha -e gamma "$T/m75")"
+contains "$out" 'm.txt' m75-files-with
+not_contains "$out" 'n.txt' m75-files-without-miss
+out="$($PG -c -e alpha -e gamma "$T/m75/m.txt")"
+eq "$out" '3' m75-count
+out="$($PG -o -e alpha -e gamma "$T/m75/m.txt")"
+eq "$out" $'alpha\ngamma\nalpha\ngamma' m75-only-matching
+# Bounded prefix: max-count truncates the merged union per file.
+out="$($PG -m 1 -e alpha -e gamma "$T/m75/m.txt")"
+eq "$out" 'alpha beta' m75-maxcount
+# JSON union: one match record per selected line; the shared line carries
+# both patterns' submatches.
+out="$($PG --json -e alpha -e gamma "$T/m75/m.txt")"
+eq "$(printf '%s' "$out" | grep -c '"type":"match"')" '3' m75-json
+line3="$(printf '%s' "$out" | grep '"line_number":3')"
+contains "$line3" '{"text":"alpha"}' m75-json-alpha
+contains "$line3" '{"text":"gamma"}' m75-json-gamma
