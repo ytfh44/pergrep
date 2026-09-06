@@ -142,6 +142,9 @@ inline std::vector<WorkloadScenario> scenarios() {
     PatternOptions icase;
     icase.case_mode = CaseMode::Insensitive;
 
+    PatternOptions extended;
+    extended.engine = Engine::Pcre2Compat;
+
     PatternOptions multiline_crlf;
     multiline_crlf.multiline = true;
     multiline_crlf.crlf = true;
@@ -178,6 +181,18 @@ inline std::vector<WorkloadScenario> scenarios() {
     overlap_options.max_matches = 4;
     const auto overlap = query("overlap-with-max", "aba", "overlap-max", fixed, overlap_options);
     const auto prefix = query("interactive-prefix", "connection_[a-z_]+", "prefix");
+    // M6.8 engine portfolio: extended constructs, capture pairing, long and
+    // resource-limit shapes. All match generated-corpus vocabulary (or verify
+    // empty identically); the correctness gate compares indexed vs reference.
+    const auto ext_lookahead = query("extended-lookahead", "er(?=ror)", "extended-lookahead", extended);
+    const auto ext_lookbehind = query("extended-lookbehind", "(?<=timeout=)connection", "extended-lookbehind", extended);
+    const auto ext_backref = query("extended-backref", "([a-z])\\1", "extended-backref", extended);
+    const auto capture_group = query("capture-group", "connection_([a-z_]+)", "capture-group");
+    const auto nocapture_twin = query("nocapture-twin", "connection_[a-z_]+", "nocapture-twin");
+    const auto long_alt = query("long-alternation",
+        "connection|payload|status|timeout|success|failure|retry|abort|exception|handler",
+        "long-alternation");
+    const auto repeat_cap = query("resource-repeat-cap", "a{1,100000}", "resource-repeat-cap", extended);
 
     return {
         {"oneshot.cold.rare-short", WorkloadClass::OneShot, ScenarioPhase::Cold, small,
@@ -197,6 +212,10 @@ inline std::vector<WorkloadScenario> scenarios() {
          ScopeSelector::CppFiles, StorageBackend::InMemory},
         {"batch.multi-pattern.mixed", WorkloadClass::BatchMultiPattern, ScenarioPhase::Repeated,
          medium, {common_short, rare_short, alternation, bounded, overlap, unbounded}, 2, false,
+         ScopeSelector::AllFiles, StorageBackend::InMemory},
+        {"engine.portfolio.mixed", WorkloadClass::BatchMultiPattern, ScenarioPhase::Repeated,
+         small, {ext_lookahead, ext_lookbehind, ext_backref, capture_group, nocapture_twin,
+                 long_alt, repeat_cap}, 2, false,
          ScopeSelector::AllFiles, StorageBackend::InMemory},
         {"filesystem.cold.roundtrip", WorkloadClass::OneShot, ScenarioPhase::Cold, small,
          {rare_short, common_short}, 1, true, ScopeSelector::AllFiles, StorageBackend::Filesystem},

@@ -1410,6 +1410,66 @@ static void test_m62_folded_filter()
   }
 
 
+static void test_m68_engine_matrix() {
+  // M6.8: engine portfolio pins — operators, capture parity, pruning, caps.
+  auto same_spans = [](const std::vector<Match>& a, const std::vector<Match>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      if (a[i].file_id != b[i].file_id || a[i].start != b[i].start || a[i].end != b[i].end) return false;
+    return true;
+  };
+  std::cerr << "M6.8 engine matrix" << std::flush;
+  PatternOptions ext; ext.engine = Engine::Pcre2Compat;
+
+  auto idx = Index::from_documents({
+    {"e.txt", "error: timeout=connection_reset ok\nwarning: all good\n"},
+    {"f.txt", "connection_reset_by_peer failed twice\n"},
+  });
+  Searcher s(idx);
+
+  // Extended constructs take the brute-force exact path, oracle-equal.
+  for (const char* expr : {"er(?=ror)", "(?<=timeout=)connection", "([a-z])\\1"}) {
+    auto pat = Pattern::compile(expr, ext);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.physical_operator == "RegexBruteForce");
+    assert(same_spans(r, full_reference(idx, pat, sof)));
+  }
+  // Capture twin spans equal nocapture twin spans.
+  {
+    auto pg = Pattern::compile("connection_([a-z_]+)");
+    auto pn = Pattern::compile("connection_[a-z_]+");
+    SearchOptions sof;
+    auto rg = s.find(pg, sof);
+    auto rn = s.find(pn, sof);
+    assert(same_spans(rg, rn));
+    assert(!rg.empty());
+    assert(rg[0].captures.size() > rn[0].captures.size()); // explicit group present
+  }
+  // Long alternation prunes via chunk filtering, oracle-equal.
+  {
+    auto pat = Pattern::compile("connection|payload|status|timeout|success|failure|retry|abort|exception|handler");
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.physical_operator == "RegexChunk");
+    assert(same_spans(r, full_reference(idx, pat, sof)));
+    assert(!r.empty());
+  }
+  // Repeat-cap pattern compiles, matches, and records the cap. The lookahead
+  // guard forces the extended VM (plain repeats run the NFA path instead).
+  {
+    auto pat = Pattern::compile("(?=a)a{1,100000}", ext);
+    SearchOptions sof;
+    SearchStats st{};
+    auto r = s.find(pat, sof, &st);
+    assert(st.vm_repeat_capped > 0);
+    assert(same_spans(r, full_reference(idx, pat, sof)));
+    assert(!r.empty());
+  }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -6829,6 +6889,8 @@ int main(){
   test_m66_lazy_dfa();
 
   test_m67_vm_telemetry();
+
+  test_m68_engine_matrix();
 
   return 0;
 }
