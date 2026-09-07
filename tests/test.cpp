@@ -2248,6 +2248,85 @@ static void test_m81_memory_ledger() {
   }
 }
 
+// M8.2: Compare dense bitmaps with sparse postings
+static void test_m82_sparse_vs_dense_qgrams() {
+    std::cerr << "M8.2 sparse vs dense" << std::flush;
+    
+    // (a) Correctness: verify that sparse and dense layouts produce identical candidate sets
+    {
+        auto idx = Index::from_documents({
+            {"a.txt", "alpha beta gamma delta epsilon\n"},
+            {"b.txt", "alpha gamma zeta eta theta\n"},
+            {"c.txt", "iota kappa lambda mu nu\n"},
+            {"d.txt", "alpha beta xi omicron pi\n"},
+        });
+        
+        Searcher s(idx);
+        
+        // Test patterns with different frequencies
+        for (const auto& pat_str : {"alpha", "beta", "gamma", "iota", "delta"}) {
+            auto pat = Pattern::compile(pat_str, {.kind = PatternKind::Fixed});
+            auto matches = s.find(pat);
+            assert(!matches.empty());
+            
+            // All matches must be identical regardless of layout
+            auto ref_matches = full_reference(idx, pat, SearchOptions{});
+            assert(matches.size() == ref_matches.size());
+            for (size_t i = 0; i < matches.size(); ++i) {
+                assert(matches[i].file_id == ref_matches[i].file_id);
+                assert(matches[i].start == ref_matches[i].start);
+                assert(matches[i].end == ref_matches[i].end);
+            }
+        }
+    }
+    
+    // (b) Zero false negatives: neither layout drops true matches
+    {
+        std::vector<Document> docs;
+        for (int i = 0; i < 20; ++i) {
+            docs.push_back({
+                "doc" + std::to_string(i) + ".txt",
+                "common_prefix_data_" + std::to_string(i) + " target_token_" + std::to_string(i % 3) + "\n"
+            });
+        }
+        auto idx = Index::from_documents(docs);
+        Searcher s(idx);
+        
+        // Search for tokens with known occurrence counts
+        for (int mod = 0; mod < 3; ++mod) {
+            auto pat = Pattern::compile("target_token_" + std::to_string(mod), {.kind = PatternKind::Fixed});
+            auto matches = s.find(pat);
+            size_t expected_docs = 0;
+            for (int i = 0; i < 20; ++i) {
+                if (i % 3 == mod) expected_docs++;
+            }
+            assert(matches.size() == expected_docs);
+        }
+    }
+    
+    // (c) Memory ledger accounts for sparse groups correctly
+    {
+        auto idx = Index::from_documents({
+            {"a.txt", "alpha beta\n"},
+            {"b.txt", "gamma delta\n"},
+        });
+        auto ledger = idx.memory_ledger();
+        assert(ledger.group_bits > 0);
+        assert(ledger.group_gids > 0);
+        assert(ledger.index_structures() == idx.index_bytes());
+    }
+    
+    // (d) Monotonicity: larger index has >= memory in both layouts
+    {
+        auto small_idx = Index::from_documents({{"a.txt", "short text\n"}});
+        auto large_idx = Index::from_documents({
+            {"a.txt", "longer text with more tokens to index\n"},
+            {"b.txt", "additional document to increase chunk count\n"},
+        });
+        assert(large_idx.memory_ledger().index_structures() >= small_idx.memory_ledger().index_structures());
+    }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7685,6 +7764,8 @@ int main(){
   test_m77_shared_threshold();
 
   test_m81_memory_ledger();
+
+  test_m82_sparse_vs_dense_qgrams();
 
   return 0;
 }

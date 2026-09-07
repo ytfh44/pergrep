@@ -390,6 +390,18 @@ struct IndexData {
         std::vector<std::uint32_t> gids;
         std::vector<std::uint64_t> bits;
     };
+
+    // M8.2: sparse q-gram postings for high-frequency hash rows.
+    // When a row's chunk count exceeds ~64, bitmap is wasteful; postings
+    // store only present chunk indices. Probing intersects sorted lists.
+    struct SparseGroup {
+        std::uint8_t lg = 9;
+        std::uint32_t m = 512;
+        // postings[row] = sorted chunk indices (li) for that hash row.
+        std::vector<std::vector<std::uint32_t>> postings;
+        // gids mirrors dense layout for fallback compatibility.
+        std::vector<std::uint32_t> gids;
+    };
 using PosDesc = detail::PosDesc;
 
     // Planner statistics are deliberately separate from qgram_freq. qgram_freq
@@ -422,6 +434,9 @@ using PosDesc = detail::PosDesc;
     // lowercased literal. Transient: never serialized; empty on loaded snapshots,
     // which safely fall back to the unfiltered path.
     std::array<Group,8> folded_groups;
+    // M8.2: sparse variant for high-frequency groups (transient, rebuilt on load).
+    std::array<SparseGroup,8> sparse_groups;
+    std::array<SparseGroup,8> folded_sparse_groups;
     std::vector<PosDesc> pos_desc;
     std::vector<std::uint8_t> pos;
     std::array<std::uint64_t,256> byte_freq{};
