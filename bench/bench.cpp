@@ -80,6 +80,12 @@ struct ScenarioTotals {
     std::uint64_t rss_kb = 0;
     std::uint64_t peak_rss_kb = 0;
     std::uint64_t page_faults = 0;
+    // M8.7: Additional metrics for regression gates
+    std::uint64_t build_peak_rss_kb = 0;
+    std::uint64_t steady_rss_kb = 0;
+    std::uint64_t filter_size_bytes = 0;
+    std::uint64_t persisted_size_bytes = 0;
+    std::uint64_t mapped_pages = 0;
     std::uint64_t logical_unique_bytes = 0;
     std::uint64_t physically_touched_bytes = 0;
     std::uint64_t index_probe_bytes = 0;
@@ -318,6 +324,11 @@ ScenarioTotals measure_scenario(const WorkloadScenario& scenario, const std::vec
         totals.build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
         totals.corpus_bytes = index.corpus_bytes();
         totals.index_bytes = index.index_bytes();
+        // M8.7: Collect additional metrics
+        auto ledger = index.memory_ledger();
+        totals.filter_size_bytes = ledger.group_bits + ledger.folded_bits + ledger.positional;
+        totals.steady_rss_kb = totals.rss_kb;
+        totals.build_peak_rss_kb = totals.peak_rss_kb;
 
         // 2. Save
         const auto save_start = std::chrono::steady_clock::now();

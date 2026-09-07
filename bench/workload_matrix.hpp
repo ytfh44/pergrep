@@ -419,19 +419,26 @@ struct ScenarioBaseline {
     double search_p95_ms = 0.0;
     double throughput_mb_s = 0.0;
     std::uint64_t rss_kb = 0;
+    // M8.7: Regression gates for additional metrics
+    std::uint64_t build_peak_rss_kb = 0;
+    std::uint64_t steady_rss_kb = 0;
+    std::uint64_t filter_size_bytes = 0;
+    std::uint64_t persisted_size_bytes = 0;
+    std::uint64_t mapped_pages = 0;
+    double build_time_ms = 0.0;
 };
 
 inline std::vector<ScenarioBaseline> default_workload_baselines() {
     return {
-        {"oneshot.cold.rare-short", 15.0, 1.0, 3.0, 20.0, 16384},
-        {"oneshot.filtered-scope.common-and-alternation", 20.0, 2.0, 5.0, 15.0, 16384},
-        {"oneshot.transformed.crlf", 18.0, 1.5, 4.0, 18.0, 16384},
-        {"oneshot.transformed.nul", 18.0, 1.5, 4.0, 18.0, 16384},
-        {"warm-repeated.medium.rare-long-unicode", 30.0, 0.8, 2.5, 40.0, 32768},
-        {"interactive.large-repository.filtered", 60.0, 1.5, 4.5, 50.0, 65536},
-        {"batch.multi-pattern.mixed", 45.0, 1.2, 3.8, 35.0, 32768},
-        {"filesystem.cold.roundtrip", 25.0, 1.8, 4.5, 12.0, 20480},
-        {"filesystem.warm-repeated.medium", 35.0, 1.0, 3.0, 35.0, 32768},
+        {"oneshot.cold.rare-short", 15.0, 1.0, 3.0, 20.0, 16384, 32768, 8192, 1024*1024, 50*1024*1024, 262144, 500.0},
+        {"oneshot.filtered-scope.common-and-alternation", 20.0, 2.0, 5.0, 15.0, 16384, 32768, 8192, 2*1024*1024, 100*1024*1024, 524288, 800.0},
+        {"oneshot.transformed.crlf", 18.0, 1.5, 4.0, 18.0, 16384, 32768, 8192, 512*1024, 25*1024*1024, 131072, 600.0},
+        {"oneshot.transformed.nul", 18.0, 1.5, 4.0, 18.0, 16384, 32768, 8192, 256*1024, 10*1024*1024, 65536, 500.0},
+        {"warm-repeated.medium.rare-long-unicode", 30.0, 0.8, 2.5, 40.0, 32768, 49152, 16384, 4*1024*1024, 200*1024*1024, 1048576, 1200.0},
+        {"interactive.large-repository.filtered", 60.0, 1.5, 4.5, 50.0, 65536, 98304, 32768, 8*1024*1024, 500*1024*1024, 2097152, 2000.0},
+        {"batch.multi-pattern.mixed", 45.0, 1.2, 3.8, 35.0, 32768, 49152, 24576, 16*1024*1024, 1024*1024*1024, 8388608, 1500.0},
+        {"filesystem.cold.roundtrip", 25.0, 1.8, 4.5, 12.0, 20480, 32768, 8192, 2*1024*1024, 100*1024*1024, 524288, 1000.0},
+        {"filesystem.warm-repeated.medium", 35.0, 1.0, 3.0, 35.0, 32768, 49152, 24576, 4*1024*1024, 200*1024*1024, 1048576, 1500.0},
     };
 }
 
