@@ -2502,6 +2502,99 @@ static void test_m84_simd_bitmap_intersection() {
     detail::set_simd_override(-1);
 }
 
+// M8.5: Profile and optimize anchor scanning
+static void test_m85_anchor_scanning_optimization() {
+    std::cerr << "M8.5 anchor scanning optimization" << std::flush;
+
+    // (a) Single-byte query specialization (1-byte exact match, zero memcmp)
+    {
+        auto idx = Index::from_documents({
+            {"d1.txt", "abc x def x ghi\n"},
+            {"d2.txt", "no matches here\n"},
+            {"d3.txt", "xxx multiple single bytes\n"},
+        });
+        Searcher s(idx);
+        auto p = Pattern::compile("x", {.kind = PatternKind::Fixed});
+        auto actual = s.find(p);
+        auto expected = full_reference(idx, p, SearchOptions{});
+        assert(actual.size() == expected.size());
+        assert(actual.size() == 5);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            assert(actual[i].file_id == expected[i].file_id);
+            assert(actual[i].start == expected[i].start);
+            assert(actual[i].end == expected[i].end);
+        }
+    }
+
+    // (b) Two-byte query specialization (register pair check)
+    {
+        auto idx = Index::from_documents({
+            {"d1.txt", "in the begin in inside into\n"},
+            {"d2.txt", "inn innit within\n"},
+        });
+        Searcher s(idx);
+        auto p = Pattern::compile("in", {.kind = PatternKind::Fixed});
+        auto actual = s.find(p);
+        auto expected = full_reference(idx, p, SearchOptions{});
+        assert(actual.size() == expected.size());
+        assert(actual.size() == 8);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            assert(actual[i].file_id == expected[i].file_id);
+            assert(actual[i].start == expected[i].start);
+            assert(actual[i].end == expected[i].end);
+        }
+    }
+
+    // (c) Rare-pair boundary filter on dense false anchors (length >= 3)
+    {
+        std::string haystack;
+        for (int i = 0; i < 200; ++i) {
+            haystack += "exact extra execute exit explain index context text next expert ";
+        }
+        haystack += "exceptional target here\n";
+        auto idx = Index::from_documents({{"big.txt", haystack}});
+        Searcher s(idx);
+        auto p = Pattern::compile("exceptional", {.kind = PatternKind::Fixed});
+        auto actual = s.find(p);
+        auto expected = full_reference(idx, p, SearchOptions{});
+        assert(actual.size() == expected.size());
+        assert(actual.size() == 1);
+        assert(actual[0].start == 200 * 64);
+    }
+
+    // (d) Varied anchor positions (first, middle, last) and long literals
+    {
+        auto idx = Index::from_documents({
+            {"d.txt", "prefix_abcdefghijklmnopqrstuvwxyz_suffix\n"},
+        });
+        Searcher s(idx);
+        for (const auto& expr : {"prefix_a", "abcdefghijklmnopqrstuvwxyz", "z_suffix"}) {
+            auto p = Pattern::compile(expr, {.kind = PatternKind::Fixed});
+            auto actual = s.find(p);
+            auto expected = full_reference(idx, p, SearchOptions{});
+            assert(actual.size() == expected.size());
+            assert(actual.size() == 1);
+            for (size_t i = 0; i < actual.size(); ++i) {
+                assert(actual[i].start == expected[i].start);
+                assert(actual[i].end == expected[i].end);
+            }
+        }
+    }
+
+    // (e) Overlapping and boundary limits
+    {
+        auto idx = Index::from_documents({{"overlap.txt", "aaaaa\n"}});
+        Searcher s(idx);
+        SearchOptions so;
+        so.overlapping = true;
+        auto p = Pattern::compile("aa", {.kind = PatternKind::Fixed});
+        auto actual = s.find(p, so);
+        auto expected = full_reference(idx, p, so);
+        assert(actual.size() == expected.size());
+        assert(actual.size() == 4);
+    }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7943,6 +8036,7 @@ int main(){
   test_m82_sparse_vs_dense_qgrams();
   test_m83_roaring_container_decision();
   test_m84_simd_bitmap_intersection();
+  test_m85_anchor_scanning_optimization();
 
   return 0;
 }
