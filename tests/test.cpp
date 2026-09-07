@@ -1,4 +1,6 @@
 #include <pergrep/pergrep.hpp>
+#include <pergrep/autotune.hpp>
+using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -49,6 +51,139 @@ static std::vector<Match> full_reference(const Index& index, const Pattern& patt
   return out;
 }
 
+static void test_m91_bounded_offline_search() {
+    // M9.1: bounded offline parameter search returns deterministic results
+    std::cerr << "M9.1 bounded offline parameter search" << std::flush;
+
+    auto run = [](const ParameterBounds& bounds) {
+        auto corpus = std::vector<Document>{
+            {"a.txt", "alpha beta gamma\n"},
+            {"b.txt", "delta epsilon zeta\n"},
+            {"c.txt", "eta theta iota\n"},
+        };
+        std::vector<Pattern> patterns = {
+            Pattern::compile("alpha"),
+            Pattern::compile("delta"),
+            Pattern::compile("eta"),
+            Pattern::compile("theta"),
+        };
+        return explore_parameter_space(corpus, patterns, bounds, "default");
+    };
+
+    // (a) Determinism: same inputs explore same configurations in same order
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192, 16384};
+        bounds.chunk_overlap_candidates = {64, 128};
+        bounds.positional_block_bytes_candidates = {128, 256};
+        bounds.positional_budget_ratio_candidates = {0.25, 0.50};
+        bounds.planned_qgrams_candidates = {0, 1, 2};
+        bounds.max_evaluations = 100;
+        bounds.max_search_time_budget_ms = 10000.0;
+
+        auto r1 = run(bounds);
+        auto r2 = run(bounds);
+        assert(r1.budget_exhausted == r2.budget_exhausted);
+        assert(r1.total_configurations_explored == r2.total_configurations_explored);
+        assert(r1.invalid_configurations_skipped == r2.invalid_configurations_skipped);
+        // The same configurations should be explored in the same order
+        assert(r1.evaluated.size() == r2.evaluated.size());
+        for (size_t i = 0; i < r1.evaluated.size(); ++i) {
+            assert(r1.evaluated[i].options.chunk_bytes == r2.evaluated[i].options.chunk_bytes);
+            assert(r1.evaluated[i].options.chunk_overlap == r2.evaluated[i].options.chunk_overlap);
+            assert(r1.evaluated[i].options.positional_block_bytes == r2.evaluated[i].options.positional_block_bytes);
+            assert(r1.evaluated[i].options.positional_budget_ratio == r2.evaluated[i].options.positional_budget_ratio);
+            assert(r1.evaluated[i].options.planned_qgrams == r2.evaluated[i].options.planned_qgrams);
+            assert(r1.evaluated[i].valid == r2.evaluated[i].valid);
+        }
+        // Both should have a best candidate
+        assert(r1.best.has_value());
+        assert(r2.best.has_value());
+        assert(r1.best->valid);
+        assert(r2.best->valid);
+    }
+
+    // (b) Budget exhaustion: max_evaluations limits exploration
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192, 16384, 32768, 65536};
+        bounds.chunk_overlap_candidates = {64, 128, 256};
+        bounds.positional_block_bytes_candidates = {128, 256};
+        bounds.positional_budget_ratio_candidates = {0.25, 0.50, 0.75};
+        bounds.planned_qgrams_candidates = {0, 1, 2, 4};
+        bounds.max_evaluations = 2; // Very low limit
+        bounds.max_search_time_budget_ms = 10000.0;
+
+        auto r = run(bounds);
+        assert(r.budget_exhausted == true);
+        assert(r.total_configurations_explored <= 2);
+    }
+
+    // (c) Time budget limits exploration
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192, 16384, 32768};
+        bounds.chunk_overlap_candidates = {64, 128, 256};
+        bounds.positional_block_bytes_candidates = {128, 256, 512};
+        bounds.positional_budget_ratio_candidates = {0.25, 0.50, 0.75};
+        bounds.planned_qgrams_candidates = {0, 1, 2, 4};
+        bounds.max_evaluations = 1000; // High limit
+        bounds.max_search_time_budget_ms = 0.1; // Very short time budget
+
+        auto r = run(bounds);
+        assert(r.budget_exhausted == true);
+    }
+
+    // (d) Invalid configs skipped (overlap >= chunk_bytes)
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192};
+        bounds.chunk_overlap_candidates = {8192, 16384}; // overlap >= chunk_bytes
+        bounds.positional_block_bytes_candidates = {128};
+        bounds.positional_budget_ratio_candidates = {0.25};
+        bounds.planned_qgrams_candidates = {0};
+        bounds.max_evaluations = 10;
+        bounds.max_search_time_budget_ms = 10000.0;
+
+        auto r = run(bounds);
+        assert(r.invalid_configurations_skipped > 0);
+    }
+
+    // (e) Invalid configs skipped (block_bytes > chunk_bytes)
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192};
+        bounds.chunk_overlap_candidates = {64};
+        bounds.positional_block_bytes_candidates = {16384}; // block_bytes > chunk_bytes
+        bounds.positional_budget_ratio_candidates = {0.25};
+        bounds.planned_qgrams_candidates = {0};
+        bounds.max_evaluations = 10;
+        bounds.max_search_time_budget_ms = 10000.0;
+
+        auto r = run(bounds);
+        assert(r.invalid_configurations_skipped > 0);
+    }
+
+    // (f) Result structure validation
+    {
+        ParameterBounds bounds;
+        bounds.chunk_bytes_candidates = {8192, 16384};
+        bounds.chunk_overlap_candidates = {64, 128};
+        bounds.positional_block_bytes_candidates = {128, 256};
+        bounds.positional_budget_ratio_candidates = {0.25, 0.50};
+        bounds.planned_qgrams_candidates = {0, 1};
+        bounds.max_evaluations = 100;
+        bounds.max_search_time_budget_ms = 10000.0;
+
+        auto r = run(bounds);
+        assert(r.total_configurations_explored > 0);
+        assert(r.best.has_value());
+        assert(r.best->valid);
+        assert(r.best->score > 0);
+        assert(!r.toolchain_info.empty());
+        assert(r.evaluated.size() == r.total_configurations_explored + r.invalid_configurations_skipped);
+    }
+}
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -5267,5 +5402,6 @@ int main(){
 
     fs::remove_all(base);
   }
+  test_m91_bounded_offline_search();
   return 0;
 }
