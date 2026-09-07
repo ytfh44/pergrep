@@ -1,6 +1,7 @@
 #include <pergrep/pergrep.hpp>
 #include <pergrep/autotune.hpp>
 #include <pergrep/profile.hpp>
+#include <pergrep/tuned_cache.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -306,6 +307,158 @@ static void test_m92_corpus_profiles() {
         auto c_2x = generate_profile_corpus(spec_2x);
         assert(c_1x.size() == spec_1x.file_count);
         assert(c_2x.size() == spec_2x.file_count);
+    }
+}
+
+
+static void test_m93_tuned_cache_identity() {
+    std::cerr << "M9.3 tuned configuration cache identity" << std::flush;
+    using namespace pergrep::cache;
+
+    // (a) Base identity and deterministic key generation
+    TunedCacheIdentity base;
+    base.schema_version = "pergrep-tuned-cache-v1";
+    base.engine_version = "0.1.0";
+    base.source_fingerprint = 0xFEEDFACECAFEULL;
+    base.source_root = "D:/PROJECTS/repo";
+    base.selector_scope = "**/*.cpp";
+    base.transform_identity = 0x55AA;
+    base.toolchain = "clang-19.1-x86_64-windows";
+    base.required_features = FeaturePositionalEncoding;
+    base.index_options.chunk_bytes = 16384;
+    base.index_options.chunk_overlap = 128;
+    base.index_options.positional_block_bytes = 256;
+    base.index_options.positional_budget_ratio = 0.50;
+    base.index_options.planned_qgrams = 2;
+    base.operator_policy = "default";
+    base.corpus_bytes = 1048576;
+    base.corpus_files = 32;
+
+    uint64_t base_key = base.compute_cache_key();
+    assert(base_key != 0);
+    // Deterministic: recomputation yields identical key
+    assert(base.compute_cache_key() == base_key);
+
+    // (b) Cache key sensitivity: altering any field changes the key
+    {
+        auto mod = base; mod.schema_version = "pergrep-tuned-cache-v2";
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.engine_version = "0.2.0";
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.source_fingerprint = 0x99999999ULL;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.source_root = "D:/OTHER/repo";
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.selector_scope = "**/*.hpp";
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.transform_identity = 0x66BB;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.toolchain = "gcc-14.2-x86_64-linux";
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.required_features = FeatureNeon;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.index_options.chunk_bytes = 32768;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.index_options.chunk_overlap = 256;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.index_options.positional_block_bytes = 512;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.index_options.positional_budget_ratio = 0.75;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.index_options.planned_qgrams = 4;
+        assert(mod.compute_cache_key() != base_key);
+
+        mod = base; mod.operator_policy = "scalar";
+        assert(mod.compute_cache_key() != base_key);
+    }
+
+    // (c) Compatibility validation
+    {
+        uint32_t host_features = FeaturePositionalEncoding | FeatureDenseBitmap;
+        assert(base.check_compatibility(base, host_features) == InvalidationReason::None);
+
+        auto cand = base; cand.schema_version = "v2";
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::SchemaMismatch);
+
+        cand = base; cand.engine_version = "0.9.0";
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::EngineVersionMismatch);
+
+        cand = base; cand.source_fingerprint = 0x1111ULL;
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::SourceFingerprintMismatch);
+
+        cand = base; cand.selector_scope = "*.txt";
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::SelectorScopeMismatch);
+
+        cand = base; cand.transform_identity = 0x2222ULL;
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::TransformMismatch);
+
+        cand = base; cand.required_features = 0x80000000; // impossible feature bit
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::HardwareIncompatible);
+
+        cand = base; cand.toolchain = "msvc-1940-arm64-windows";
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::ToolchainMismatch);
+
+        cand = base; cand.index_options.chunk_bytes = 8192;
+        assert(cand.check_compatibility(base, host_features) == InvalidationReason::OptionsMismatch);
+
+        cand = base; cand.operator_policy = "avx2";
+        auto target = base; target.operator_policy = "scalar";
+        assert(cand.check_compatibility(target, host_features) == InvalidationReason::PolicyMismatch);
+    }
+
+    // (d) Serialization round-trip
+    {
+        std::string serialized = base.serialize();
+        assert(!serialized.empty());
+        assert(serialized.find("schema_version=pergrep-tuned-cache-v1") != std::string::npos);
+        assert(serialized.find("chunk_bytes=16384") != std::string::npos);
+
+        TunedCacheIdentity restored = TunedCacheIdentity::deserialize(serialized);
+        assert(restored.schema_version == base.schema_version);
+        assert(restored.engine_version == base.engine_version);
+        assert(restored.source_fingerprint == base.source_fingerprint);
+        assert(restored.source_root == base.source_root);
+        assert(restored.selector_scope == base.selector_scope);
+        assert(restored.transform_identity == base.transform_identity);
+        assert(restored.toolchain == base.toolchain);
+        assert(restored.required_features == base.required_features);
+        assert(restored.index_options.chunk_bytes == base.index_options.chunk_bytes);
+        assert(restored.index_options.chunk_overlap == base.index_options.chunk_overlap);
+        assert(restored.index_options.positional_block_bytes == base.index_options.positional_block_bytes);
+        assert(std::abs(restored.index_options.positional_budget_ratio - base.index_options.positional_budget_ratio) < 1e-6);
+        assert(restored.index_options.planned_qgrams == base.index_options.planned_qgrams);
+        assert(restored.operator_policy == base.operator_policy);
+        assert(restored.compute_cache_key() == base.compute_cache_key());
+    }
+
+    // (e) Explanation helper
+    {
+        uint32_t host_features = detect_runtime_features();
+        assert(host_features != 0);
+
+        auto hit_identity = base;
+        hit_identity.required_features = host_features & (FeaturePositionalEncoding | FeatureDenseBitmap);
+        std::string report_hit = explain_selection(hit_identity, hit_identity, host_features);
+        assert(report_hit.find("COMPATIBLE") != std::string::npos);
+        assert(report_hit.find("Reason Code: compatible") != std::string::npos);
+
+        auto cand_miss = base;
+        cand_miss.required_features = 0x80000000;
+        std::string report_miss = explain_selection(cand_miss, base, host_features);
+        assert(report_miss.find("INCOMPATIBLE") != std::string::npos);
+        assert(report_miss.find("hardware_incompatible") != std::string::npos);
     }
 }
 
@@ -5529,5 +5682,6 @@ int main(){
   }
   test_m91_bounded_offline_search();
   test_m92_corpus_profiles();
+  test_m93_tuned_cache_identity();
   return 0;
 }
