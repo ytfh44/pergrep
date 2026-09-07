@@ -2,6 +2,7 @@
 #include <pergrep/autotune.hpp>
 #include <pergrep/profile.hpp>
 #include <pergrep/tuned_cache.hpp>
+#include <pergrep/pareto.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -459,6 +460,131 @@ static void test_m93_tuned_cache_identity() {
         std::string report_miss = explain_selection(cand_miss, base, host_features);
         assert(report_miss.find("INCOMPATIBLE") != std::string::npos);
         assert(report_miss.find("hardware_incompatible") != std::string::npos);
+    }
+}
+
+
+static void test_m94_pareto_selection() {
+    std::cerr << "M9.4 Pareto selection and workload weights" << std::flush;
+    using namespace pergrep::pareto;
+
+    // (a) Hard constraint bounds enforcement
+    {
+        HardConstraintBounds bounds;
+        bounds.max_build_time_ms = 5000.0;
+        bounds.max_index_size_bytes = 100 * 1024 * 1024;
+        bounds.max_peak_rss_bytes = 200 * 1024 * 1024;
+        bounds.max_cold_p50_ms = 50.0;
+        bounds.max_warm_p50_ms = 10.0;
+        bounds.max_p95_ms = 25.0;
+        bounds.max_fallback_rate = 0.10;
+
+        WorkloadMetrics valid_m;
+        valid_m.build_time_ms = 1000.0;
+        valid_m.index_size_bytes = 50 * 1024 * 1024;
+        valid_m.peak_rss_bytes = 100 * 1024 * 1024;
+        valid_m.cold_p50_ms = 20.0;
+        valid_m.warm_p50_ms = 5.0;
+        valid_m.p95_ms = 12.0;
+        valid_m.fallback_rate = 0.02;
+        assert(bounds.check_satisfaction(valid_m));
+
+        // Violation: fallback rate exceeded
+        std::string msg;
+        auto inv = valid_m;
+        inv.fallback_rate = 0.25;
+        assert(!bounds.check_satisfaction(inv, &msg));
+        assert(msg.find("fallback_rate") != std::string::npos);
+
+        // Violation: index size exceeded
+        inv = valid_m;
+        inv.index_size_bytes = 150 * 1024 * 1024;
+        assert(!bounds.check_satisfaction(inv, &msg));
+        assert(msg.find("index_size_bytes") != std::string::npos);
+    }
+
+    // (b) Pareto dominance logic
+    {
+        WorkloadMetrics a, b;
+        a.warm_p50_ms = 2.0; a.index_size_bytes = 1000;
+        b.warm_p50_ms = 3.0; b.index_size_bytes = 1000;
+        // A is strictly faster than B, equal in size -> A dominates B
+        assert(pareto_dominates(a, b));
+        assert(!pareto_dominates(b, a));
+
+        // Trade-off: C is faster but larger than D -> neither dominates
+        WorkloadMetrics c, d;
+        c.warm_p50_ms = 1.0; c.index_size_bytes = 2000;
+        d.warm_p50_ms = 2.0; d.index_size_bytes = 1000;
+        assert(!pareto_dominates(c, d));
+        assert(!pareto_dominates(d, c));
+    }
+
+    // (c) Multi-candidate Pareto frontier computation
+    {
+        HardConstraintBounds bounds;
+        bounds.max_warm_p50_ms = 10.0;
+        bounds.max_index_size_bytes = 10000;
+
+        std::vector<CandidateEvaluation> cands;
+        // Candidate 1: fast & large
+        CandidateEvaluation c1; c1.candidate_id = "C1";
+        c1.metrics.warm_p50_ms = 1.0; c1.metrics.index_size_bytes = 8000;
+
+        // Candidate 2: slow & compact
+        CandidateEvaluation c2; c2.candidate_id = "C2";
+        c2.metrics.warm_p50_ms = 5.0; c2.metrics.index_size_bytes = 2000;
+
+        // Candidate 3: dominated by C1 (slower, same size)
+        CandidateEvaluation c3; c3.candidate_id = "C3";
+        c3.metrics.warm_p50_ms = 2.0; c3.metrics.index_size_bytes = 8000;
+
+        // Candidate 4: violates hard limits (too large)
+        CandidateEvaluation c4; c4.candidate_id = "C4";
+        c4.metrics.warm_p50_ms = 0.5; c4.metrics.index_size_bytes = 20000;
+
+        cands = {c1, c2, c3, c4};
+        auto frontier = compute_pareto_frontier(cands, bounds);
+        assert(frontier.size() == 2);
+        std::vector<std::string> ids = {frontier[0].candidate_id, frontier[1].candidate_id};
+        assert((ids[0] == "C1" && ids[1] == "C2") || (ids[0] == "C2" && ids[1] == "C1"));
+    }
+
+    // (d) Product profile selection & trade-offs
+    {
+        std::vector<CandidateEvaluation> cands;
+        CandidateEvaluation fast;
+        fast.candidate_id = "fast";
+        fast.metrics.warm_p50_ms = 1.0;
+        fast.metrics.index_size_bytes = 50 * 1024 * 1024;
+        fast.metrics.peak_rss_bytes = 100 * 1024 * 1024;
+        fast.metrics.build_time_ms = 2000.0;
+
+        CandidateEvaluation compact;
+        compact.candidate_id = "compact";
+        compact.metrics.warm_p50_ms = 8.0;
+        compact.metrics.index_size_bytes = 15 * 1024 * 1024;
+        compact.metrics.peak_rss_bytes = 30 * 1024 * 1024;
+        compact.metrics.build_time_ms = 1500.0;
+
+        cands = {fast, compact};
+
+        // Interactive profile (prioritizes latency) selects "fast"
+        auto prof_interactive = profile_interactive_low_latency();
+        auto res_interactive = select_optimal_configuration(cands, prof_interactive);
+        assert(res_interactive.selected.has_value());
+        assert(res_interactive.chosen_candidate_id == "fast");
+        assert(!res_interactive.rationale_report.empty());
+        assert(res_interactive.rationale_report.find("SELECTED OPTIMAL CANDIDATE: fast") != std::string::npos);
+
+        // Embedded profile (strict index cap 32MB) rejects "fast" and selects "compact"
+        auto prof_embedded = profile_embedded_low_memory();
+        auto res_embedded = select_optimal_configuration(cands, prof_embedded);
+        assert(res_embedded.selected.has_value());
+        assert(res_embedded.chosen_candidate_id == "compact");
+        assert(res_embedded.rejected_hard_limits.size() == 1);
+        assert(res_embedded.rejected_hard_limits[0].candidate_id == "fast");
+        assert(res_embedded.rationale_report.find("REJECTED: index_size_bytes") != std::string::npos);
     }
 }
 
@@ -5683,5 +5809,6 @@ int main(){
   test_m91_bounded_offline_search();
   test_m92_corpus_profiles();
   test_m93_tuned_cache_identity();
+  test_m94_pareto_selection();
   return 0;
 }
