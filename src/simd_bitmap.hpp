@@ -78,9 +78,12 @@ inline SimdLevel detect_cpu_simd() noexcept {
 #endif
 
     // Check AVX-512F: EBX bit 16 and XCR0 bits 5, 6, 7 (opmask, ZMM_Hi256, Hi16_ZMM)
+    // Disable AVX-512 on MSVC due to incomplete support in MSVC toolchain / runtime.
+#if !defined(_MSC_VER)
     if (((xcr0 & 0xE6) == 0xE6) && (info[1] & (1 << 16)) != 0) {
         return SimdLevel::Avx512;
     }
+#endif
 
     // Check AVX2: EBX bit 5
     if ((info[1] & (1 << 5)) != 0) {
