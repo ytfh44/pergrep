@@ -1,5 +1,6 @@
 #pragma once
 #include "pergrep/pergrep.hpp"
+#include "simd_bitmap.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>

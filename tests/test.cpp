@@ -2380,6 +2380,128 @@ static void test_m83_roaring_container_decision() {
     }
 }
 
+// M8.4: SIMD bitmap intersection with scalar fallback
+static void test_m84_simd_bitmap_intersection() {
+    std::cerr << "M8.4 simd bitmap intersection" << std::flush;
+
+    const auto detected = detail::detect_cpu_simd();
+
+    // (a) Differential verification across word sizes & bit patterns:
+    // Available hardware kernels must produce identical mutated destination
+    // vectors and identical return flags to the scalar reference.
+    {
+        std::mt19937_64 rng(1337);
+        for (std::size_t words : {1, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17, 31, 32, 64, 128}) {
+            std::vector<std::uint64_t> d_scal(words), d_avx2(words), d_avx512(words), src(words);
+            for (std::size_t i = 0; i < words; ++i) {
+                d_scal[i] = rng();
+                src[i] = rng();
+            }
+            d_avx2 = d_scal;
+            d_avx512 = d_scal;
+
+            bool r_scal = detail::bitmap_intersect_scalar(d_scal.data(), src.data(), words);
+#if defined(__x86_64__) || defined(_M_X64)
+            if (detected >= detail::SimdLevel::Avx2) {
+                bool r_avx2 = detail::bitmap_intersect_avx2(d_avx2.data(), src.data(), words);
+                assert(r_scal == r_avx2);
+                assert(d_scal == d_avx2);
+            }
+            if (detected == detail::SimdLevel::Avx512) {
+                bool r_avx512 = detail::bitmap_intersect_avx512(d_avx512.data(), src.data(), words);
+                assert(r_scal == r_avx512);
+                assert(d_scal == d_avx512);
+            }
+#endif
+        }
+    }
+
+    // (b) Early exit & empty intersection:
+    // When intersection produces all zero bits, function must return false.
+    {
+        for (std::size_t words : {1, 4, 8, 16, 32}) {
+            std::vector<std::uint64_t> dst(words, 0x5555555555555555ULL);
+            std::vector<std::uint64_t> src(words, 0xAAAAAAAAAAAAAAAAULL);
+            bool non_empty = detail::bitmap_intersect_scalar(dst.data(), src.data(), words);
+            assert(!non_empty);
+            for (auto v : dst) assert(v == 0);
+
+#if defined(__x86_64__) || defined(_M_X64)
+            if (detected >= detail::SimdLevel::Avx2) {
+                dst.assign(words, 0x5555555555555555ULL);
+                bool non_empty_avx2 = detail::bitmap_intersect_avx2(dst.data(), src.data(), words);
+                assert(!non_empty_avx2);
+                for (auto v : dst) assert(v == 0);
+            }
+
+            if (detected == detail::SimdLevel::Avx512) {
+                dst.assign(words, 0x5555555555555555ULL);
+                bool non_empty_avx512 = detail::bitmap_intersect_avx512(dst.data(), src.data(), words);
+                assert(!non_empty_avx512);
+                for (auto v : dst) assert(v == 0);
+            }
+#endif
+        }
+    }
+
+    // (c) End-to-end Searcher integration:
+    // Compare search results under forced scalar vs detected hardware SIMD.
+    // Must produce 100% identical matches and candidate sets (zero false negatives).
+    {
+        auto idx = Index::from_documents({
+            {"s1.txt", "needle_alpha common_word filler_one\n"},
+            {"s2.txt", "needle_beta common_word filler_two\n"},
+            {"s3.txt", "needle_alpha common_word needle_beta\n"},
+            {"s4.txt", "disjoint_content nothing_matching\n"},
+        });
+        Searcher s(idx);
+        auto p1 = Pattern::compile("needle_alpha.*common_word");
+        auto p2 = Pattern::compile("common_word.*needle_beta");
+
+        // Force scalar mode
+        detail::set_simd_override(0);
+        SearchStats st_scal{};
+        auto r_scal1 = s.find(p1, {}, &st_scal);
+        assert(st_scal.simd_backend == "scalar");
+
+        // Force AVX2 mode if hardware supports it
+        if (detected >= detail::SimdLevel::Avx2) {
+            detail::set_simd_override(2);
+            SearchStats st_avx2{};
+            auto r_avx2_1 = s.find(p1, {}, &st_avx2);
+            assert(r_scal1.size() == r_avx2_1.size());
+            for (size_t i = 0; i < r_scal1.size(); ++i) {
+                assert(r_scal1[i].file_id == r_avx2_1[i].file_id);
+                assert(r_scal1[i].start == r_avx2_1[i].start);
+                assert(r_scal1[i].end == r_avx2_1[i].end);
+            }
+        }
+
+        // Reset to auto
+        detail::set_simd_override(-1);
+        SearchStats st_auto{};
+        auto r_auto1 = s.find(p1, {}, &st_auto);
+
+        assert(r_scal1.size() == r_auto1.size());
+        for (size_t i = 0; i < r_scal1.size(); ++i) {
+            assert(r_scal1[i].file_id == r_auto1[i].file_id);
+            assert(r_scal1[i].start == r_auto1[i].start);
+            assert(r_scal1[i].end == r_auto1[i].end);
+        }
+
+        // Multi-pattern search under auto
+        std::vector<Pattern> mp = {p1, p2};
+        auto ir = make_multi_query_ir(mp, {});
+        SearchStats st_multi{};
+        auto r_multi = s.find_multi(ir, &st_multi);
+        assert(r_multi.size() == 2);
+        assert(!st_multi.simd_backend.empty());
+    }
+
+    // Reset override cleanly
+    detail::set_simd_override(-1);
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7820,6 +7942,7 @@ int main(){
 
   test_m82_sparse_vs_dense_qgrams();
   test_m83_roaring_container_decision();
+  test_m84_simd_bitmap_intersection();
 
   return 0;
 }
