@@ -1,5 +1,6 @@
 #include <pergrep/pergrep.hpp>
 #include <pergrep/autotune.hpp>
+#include <pergrep/profile.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -184,6 +185,130 @@ static void test_m91_bounded_offline_search() {
         assert(r.evaluated.size() == r.total_configurations_explored + r.invalid_configurations_skipped);
     }
 }
+
+static void test_m92_corpus_profiles() {
+    std::cerr << "M9.2 reproducible corpus profiles" << std::flush;
+    using namespace pergrep::profile;
+
+    // (a) Shannon entropy validation
+    {
+        // Zero entropy for uniform single character
+        std::string uniform(1000, 'A');
+        double h_byte = calculate_byte_entropy(uniform);
+        assert(std::abs(h_byte) < 1e-6);
+
+        // Maximum byte entropy (~8 bits) for all 256 byte values uniformly distributed
+        std::string all_bytes;
+        all_bytes.reserve(256 * 10);
+        for (int rep = 0; rep < 10; ++rep) {
+            for (int b = 0; b < 256; ++b) {
+                all_bytes.push_back(static_cast<char>(b));
+            }
+        }
+        double h_max = calculate_byte_entropy(all_bytes);
+        assert(std::abs(h_max - 8.0) < 0.01);
+
+        // Q-gram entropy on repeating pattern
+        std::string rep_qgram = "ABCDABCDABCDABCD";
+        double h_qgram = calculate_qgram_entropy(rep_qgram, 4);
+        assert(h_qgram > 0.0 && h_qgram < 3.0);
+    }
+
+    // (b) Determinism: same spec and seed generates identical documents
+    {
+        auto spec1 = canonical_code_profile(1);
+        auto spec2 = canonical_code_profile(1);
+
+        auto c1 = generate_profile_corpus(spec1);
+        auto c2 = generate_profile_corpus(spec2);
+
+        assert(!c1.empty());
+        assert(c1.size() == c2.size());
+        for (std::size_t i = 0; i < c1.size(); ++i) {
+            assert(c1[i].path == c2[i].path);
+            assert(c1[i].content == c2[i].content);
+        }
+    }
+
+    // (c) Profile catalog coverage: all 7 categories
+    {
+        auto profiles = all_canonical_profiles(1);
+        assert(profiles.size() == 7);
+
+        std::unordered_set<std::string> categories_seen;
+        for (const auto& spec : profiles) {
+            categories_seen.insert(to_string(spec.category));
+            auto corpus = generate_profile_corpus(spec);
+            assert(corpus.size() == spec.file_count);
+
+            auto summary = analyze_corpus(corpus, spec.profile_id, spec.version);
+            assert(summary.file_count == spec.file_count);
+            assert(summary.total_bytes > 0);
+            assert(summary.byte_entropy > 0.0);
+            assert(summary.avg_file_bytes > 0.0);
+
+            // Verify specific category characteristics
+            if (spec.category == CorpusCategory::BinaryHeavy) {
+                assert(summary.binary_file_count > 0);
+            } else if (spec.category == CorpusCategory::HighDuplication) {
+                assert(summary.duplicate_document_pairs > 0);
+            } else if (spec.category == CorpusCategory::UnicodeText) {
+                bool has_multibyte = false;
+                for (const auto& doc : corpus) {
+                    for (unsigned char ch : doc.content) {
+                        if (ch >= 0x80) { has_multibyte = true; break; }
+                    }
+                    if (has_multibyte) break;
+                }
+                assert(has_multibyte);
+            } else if (spec.category == CorpusCategory::GeneratedMinified) {
+                assert(summary.byte_entropy > 3.0);
+            }
+        }
+
+        assert(categories_seen.count("code") == 1);
+        assert(categories_seen.count("logs") == 1);
+        assert(categories_seen.count("generated-minified") == 1);
+        assert(categories_seen.count("unicode-text") == 1);
+        assert(categories_seen.count("binary-heavy") == 1);
+        assert(categories_seen.count("large-files") == 1);
+        assert(categories_seen.count("high-duplication") == 1);
+    }
+
+    // (d) Searcher query execution over generated profiles
+    {
+        auto spec = canonical_code_profile(1);
+        auto corpus = generate_profile_corpus(spec);
+        auto index = Index::from_documents(corpus);
+        Searcher s(index);
+
+        for (const auto& q_tmpl : spec.query_distribution) {
+            auto pat = Pattern::compile(q_tmpl.pattern);
+            auto matches = s.find(pat);
+            // Matches must execute cleanly without exceptions
+            for (const auto& m : matches) {
+                assert(m.file_id < index.files().size());
+                assert(m.start <= m.end);
+                assert(m.end <= index.files()[m.file_id].size);
+            }
+        }
+    }
+
+    // (e) Scaling parameter
+    {
+        auto spec_1x = canonical_logs_profile(1);
+        auto spec_2x = canonical_logs_profile(2);
+
+        assert(spec_2x.file_count == spec_1x.file_count * 2);
+        assert(spec_2x.total_target_bytes == spec_1x.total_target_bytes * 2);
+
+        auto c_1x = generate_profile_corpus(spec_1x);
+        auto c_2x = generate_profile_corpus(spec_2x);
+        assert(c_1x.size() == spec_1x.file_count);
+        assert(c_2x.size() == spec_2x.file_count);
+    }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -5403,5 +5528,6 @@ int main(){
     fs::remove_all(base);
   }
   test_m91_bounded_offline_search();
+  test_m92_corpus_profiles();
   return 0;
 }
