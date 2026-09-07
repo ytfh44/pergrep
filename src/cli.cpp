@@ -203,9 +203,7 @@ Core options: -e/--regexp, -f/--file, -F/--fixed-strings, -i/--ignore-case,
 -A/-B/-C context, -n/--line-number, --column, -b/--byte-offset,
 -o/--only-matching, -c/--count, --count-matches, -l/--files-with-matches,
 --files-without-match, --files, --json, --vimgrep, --stats, --sort/--sortr,
--a/--text, --binary, --hidden, -L/--follow, -u/--unrestricted,
--j/--threads N (default 1, serial; higher enables the ordered parallel merge
-with byte-identical results; quiet/max-count fall back to serial).
+-a/--text, --binary, --hidden, -L/--follow, -u/--unrestricted.
 
 Compression is decoded internally with libarchive; matching is never delegated.
 --pre executes only the user-specified transformer and searches its stdout.
@@ -743,58 +741,23 @@ int main(int argc, char** argv) {
         core_opt.files_with_matches = false;
         core_opt.files_without_match = false;
         core_opt.max_matches = 0;
-        // M5.7: --threads/-j safety gate. 0/negative keeps the historical serial
-        // default (1); positive values enable the ordered parallel merge, bounded
-        // so worker creation stays within environment limits. Results are
-        // identical either way (M5.2 deterministic merge); omit -j to roll back.
-        std::uint32_t eff_threads = 1;
-        if (a.threads > 0) {
-            constexpr int kMaxThreads = 1024;
-            eff_threads = static_cast<std::uint32_t>(a.threads > kMaxThreads ? kMaxThreads : a.threads);
-        }
-        core_opt.threads = eff_threads;
         // Quiet positive searches need existence; invert mode must retain all matches
         // so the line-level non-match decision remains exact.
         core_opt.objective = a.quiet && !a.sopt.invert_match ? SearchObjective::FirstHit : SearchObjective::Exhaustive;
         core_opt.include_binary = true;
         core_opt.record_separator = a.null_data ? '\0' : '\n';
         core_opt.eligible_file_ids = eligible_file_ids;
-        // M5.7: expose the selected execution mode in debug output.
-        if (a.debug) {
-            std::cerr << "pergrep: threads=" << eff_threads;
-            if (eff_threads > 1 && core_opt.objective == SearchObjective::Exhaustive)
-                std::cerr << " execution=parallel\n";
-            else
-                std::cerr << " execution=serial ("
-                          << (eff_threads <= 1 ? "single-threaded default" : "first-hit objective for quiet")
-                          << ")\n";
-        }
         if (!eligible_file_ids.empty() && !(a.max_count_set && a.max_count == 0)) {
-            // M7.5: one multi-pattern search feeds the same per-pattern union
-            // below. Patterns compile up front so a bad -e errors exactly as
-            // before (before any search runs, as with the old loop); every
-            // entry carries core_opt, so per-pattern semantics are unchanged
-            // and the shared AC/grouped paths only change how matches are
-            // found, never what is found (M7.2-M7.4).
-            std::vector<Pattern> pats;
-            pats.reserve(a.patterns.size());
-            for (auto& ps : a.patterns) pats.push_back(Pattern::compile(ps, a.popt));
-            std::vector<SearchOptions> entry_opts(pats.size(), core_opt);
-            auto ir = make_multi_query_ir(pats, entry_opts, !a.replacement.empty());
-            SearchStats st;
-            // M5.7: stats force the serial path (M5.4); collect them only on
-            // the serial default so -j can take the parallel merge. `total`
-            // has no downstream reader, so skipping it under -j changes
-            // nothing observable.
-            const bool collect_stats = core_opt.threads <= 1;
-            auto results = search.find_multi(ir, collect_stats ? &st : nullptr);
-            if (collect_stats) {
+            for (auto& ps : a.patterns) {
+                auto p = Pattern::compile(ps, a.popt);
+                SearchStats st;
+                auto ms = search.find(p, core_opt, &st);
                 total.candidate_chunks += st.candidate_chunks;
                 total.candidate_blocks += st.candidate_blocks;
                 total.verified_bytes += st.verified_bytes;
                 total.matches += st.matches;
+                perpat.push_back(std::move(ms));
             }
-            for (auto& ms : results) perpat.push_back(std::move(ms));
         }
 
         std::vector<std::vector<Match>> byfile(idx->files().size());

@@ -7,7 +7,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -84,30 +83,6 @@ struct IndexOptions {
     bool persist_corpus = false;
 };
 
-// M8.1: deterministic per-component memory accounting. All fields count
-// element bytes (sizes, not capacities); map-node and allocator slack are
-// documented estimates, not counted. Field order is the ledger presentation
-// order used by docs/index-memory-ledger.md.
-struct IndexMemoryLedger {
-    std::uint64_t corpus_bytes = 0;   // M3-owned provider bytes (reference)
-    std::uint64_t group_bits = 0;     // q-gram group bitmaps
-    std::uint64_t group_gids = 0;     // q-gram group chunk ids
-    std::uint64_t folded_bits = 0;    // folded twin bitmaps (transient)
-    std::uint64_t folded_gids = 0;    // folded twin chunk ids (transient)
-    std::uint64_t positional = 0;     // positional matrices
-    std::uint64_t pos_descriptors = 0;// per-chunk positional descriptors
-    std::uint64_t chunks = 0;         // chunk table
-    std::uint64_t file_meta = 0;      // FileInfo structs
-    std::uint64_t paths = 0;          // path heap bytes
-    std::uint64_t qgram_stats = 0;    // exact q-gram stats + posting vectors
-    std::uint64_t hash_postings = 0;  // legacy hash-bucket chunk ids
-    std::uint64_t freq_tables = 0;    // byte/qgram/hash frequency tables
-    std::uint64_t index_structures() const noexcept {
-        return group_bits + group_gids + folded_bits + folded_gids + positional +
-               pos_descriptors + chunks + file_meta + paths + qgram_stats +
-               hash_postings + freq_tables;
-    }
-};
 struct FileInfo {
     std::string path;
     std::uint64_t size = 0;
@@ -197,10 +172,6 @@ public:
     std::span<const FileInfo> files() const noexcept;
     std::uint64_t corpus_bytes() const noexcept;
     std::uint64_t index_bytes() const noexcept;
-    // M8.1 memory ledger: per-component byte accounting of the resident
-    // index. index_structures() reconciles with index_bytes(); corpus_bytes
-    // is M3-owned provider memory, reported for reference only.
-    IndexMemoryLedger memory_ledger() const noexcept;
     bool is_snapshot() const noexcept;
     bool fresh() const;
     // The returned view is borrowed from this Index and remains valid while this Index
@@ -256,13 +227,6 @@ struct SearchOptions {
     // candidate/record boundaries; absent means no cancellation is possible.
     std::function<bool()> should_cancel = {};
     SearchObjective objective = SearchObjective::Exhaustive;
-    // M5.2: worker count for the ordered per-file parallel merge. 1 (default)
-    // means serial, identical to the pre-M5.2 path. Values above 1 enable the
-    // parallel merge only for exhaustive, unlimited, unobserved searches; all
-    // other semantics (max_matches, non-exhaustive objectives, cancellation,
-    // stats collection) fall back to serial. Execution-only; never part of a
-    // PlanKey and never serialized.
-    std::uint32_t threads = 1;
 };
 
 // M1.3 PlanKey: explicit, deterministic plan input. Captures all semantic
@@ -301,61 +265,6 @@ PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_option
                       const Index& index, std::uint64_t transformed_input_identity = 0);
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options,
                       const IndexOptions& index_options, std::uint64_t transformed_input_identity = 0);
-
-// M7.1 MultiQueryIR: shared multi-pattern planner input. Each entry owns its
-// metadata (no borrowed spans or callbacks), so the IR is safe to retain past
-// the caller's option objects. source_id is the pattern's position in the
-// user's list: duplicate expressions keep distinct source identities while
-// sharing one semantic key. Cancellation hooks are execution-only and never
-// part of the IR (same rule as PlanKey).
-struct MultiPatternEntry {
-    std::uint32_t source_id = 0;
-    Pattern pattern;
-    std::string expression;
-    PatternOptions pattern_options;
-    bool overlapping = false;
-    bool invert_match = false;
-    bool files_with_matches = false;
-    bool files_without_match = false;
-    bool include_binary = false;
-    std::uint64_t max_matches = 0;
-    unsigned char record_separator = '\n';
-    SearchObjective objective = SearchObjective::Exhaustive;
-    std::uint32_t threads = 1;
-    std::vector<std::uint32_t> eligible_file_ids; // sorted, deduped; empty = all files
-    bool has_captures = false;      // pattern defines capture groups
-    bool needs_replacement = false; // caller will render replacements
-    bool operator==(const MultiPatternEntry& o) const noexcept;
-    bool operator!=(const MultiPatternEntry& o) const noexcept { return !(*this == o); }
-    std::uint64_t semantic_hash() const noexcept; // deterministic 64-bit FNV-1a
-};
-struct MultiQueryIR {
-    std::vector<MultiPatternEntry> entries; // in source order
-};
-MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
-                                 const std::vector<SearchOptions>& options,
-                                 bool needs_replacement = false);
-// M7.4: fallible batch compiler. Compiles each expression with its options
-// (pattern_options broadcasts like make_multi_query_ir's options: empty or
-// single entry applies to all, else per-source_id) and builds the IR in one
-// step. The first failure throws MultiPatternCompileError carrying the failing
-// source_id and the underlying message, so one bad pattern among many keeps
-// its identity (independent execution surfaces the same message from that
-// pattern's own compile).
-struct MultiPatternCompileError : std::runtime_error {
-    std::uint32_t source_id = 0;
-    explicit MultiPatternCompileError(std::uint32_t id, const std::string& msg)
-        : std::runtime_error(msg), source_id(id) {}
-};
-MultiQueryIR compile_multi_query(const std::vector<std::string>& expressions,
-                                 const std::vector<PatternOptions>& pattern_options,
-                                 const std::vector<SearchOptions>& options,
-                                 bool needs_replacement = false);
-// Sharing report: groups of source_ids whose scans may be shared (identical
-// semantic keys over fixed literals today; regex always independent). Groups
-// and singletons cover every entry exactly once, in source order.
-std::vector<std::vector<std::uint32_t>> multi_query_sharing(const MultiQueryIR& ir);
-std::string explain_multi_query_sharing(const MultiQueryIR& ir);
 // Canonical identity used by shadow reports and workload aggregation. It is
 // derived from every PlanKey field (including semantic flags and capabilities)
 // and is independent of pointer addresses or execution order.
@@ -461,19 +370,6 @@ struct SearchStats {
     std::uint64_t chunk_probe_bytes = 0;
     std::uint64_t chunk_probe_operations = 0;
     std::string qgram_fallback_reason = "none";
-    // M6.7 extended-VM resource telemetry. C++-only; populated when stats are
-    // requested on searches reaching the extended verifier. Zero means the
-    // extended path never ran. Deterministic for fixed input+index.
-    // Failure reasons surface via exceptions (see docs/vm-telemetry.md).
-    std::uint64_t vm_max_depth = 0;
-    std::uint64_t vm_repeat_iterations = 0;
-    std::uint64_t vm_repeat_capped = 0;
-    std::uint64_t vm_lookbehind_evals = 0;
-    std::uint64_t vm_max_lookbehind_window = 0;
-    std::uint64_t vm_lookbehind_capped = 0;
-    std::uint64_t vm_state_expansions = 0;
-    // M8.4 bitmap SIMD dispatch telemetry. C++ only.
-    std::string simd_backend = "scalar";
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
@@ -719,10 +615,6 @@ public:
 
     std::vector<Match> find(const Pattern& pattern, SearchOptions options = {}, SearchStats* stats = nullptr) const;
     std::vector<std::uint32_t> files(const Pattern& pattern, SearchOptions options = {}, SearchStats* stats = nullptr) const;
-    // M7.2 multi-pattern search: one result vector per entry, in source order.
-    // Takes the shared Aho-Corasick scan when the whole IR is eligible, else
-    // independent per-pattern searches. See docs/aho-corasick-shared.md.
-    std::vector<std::vector<Match>> find_multi(const MultiQueryIR& ir, SearchStats* stats = nullptr) const;
 private:
     std::shared_ptr<const Index> owned_;
     const Index* index_ = nullptr;

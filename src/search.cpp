@@ -1,7 +1,4 @@
-#include "aho_corasick.hpp"
 #include "internal.hpp"
-#include "simd_bitmap.hpp"
-#include "worker_queue.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -434,10 +431,12 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
             uint32_t row = uint32_t(ww) * 64 + bit;
             auto p = g.bits.data() + (size_t)row * g.words;
             if (rec) rec->note_probe(static_cast<std::size_t>(g.words) * sizeof(std::uint64_t), ProbeKind::Chunk);
-            // M8.4: SIMD bitmap intersection with fused non-zero check & early exit
-            if (!detail::bitmap_intersect(c.data(), p, g.words)) return;
+            for (uint32_t j = 0; j < g.words; ++j) c[j] &= p[j];
             mask64 &= mask64 - 1;
         }
+        bool any = false;
+        for (auto v : c) any |= v != 0;
+        if (!any) return;
     }
     for (uint32_t w = 0; w < g.words; ++w) {
         uint64_t z = c[w];
@@ -469,46 +468,6 @@ std::vector<uint32_t> chunk_candidates(const detail::IndexData& I, std::string_v
     if (rec) rec->note_selection(selected.size());
     auto q = detail::compile_qgram_query(lit, selected);
     for (auto const& g : I.groups) {
-        group_candidates(g, q, out, rec);
-    }
-    std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
-        if (I.chunks[a].file_id != I.chunks[b].file_id)
-            return I.chunks[a].file_id < I.chunks[b].file_id;
-        if (I.chunks[a].core_begin != I.chunks[b].core_begin)
-            return I.chunks[a].core_begin < I.chunks[b].core_begin;
-        return a < b;
-    });
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-// M6.2: folded auxiliary probe. Lowercased ASCII literal against folded_groups.
-// Every probed window is a necessary condition for a folded match, so the
-// selection (all distinct folded windows) is sound without consulting raw-byte
-// rarity statistics. Verification stays ICU-aware; only candidate pruning changes.
-bool folded_groups_present(const detail::IndexData& I) noexcept {
-    for (auto const& g : I.folded_groups) if (!g.gids.empty()) return true;
-    return false;
-}
-std::vector<uint32_t> folded_chunk_candidates(const detail::IndexData& I, std::string_view lit,
-                                              StatsRecorder* rec = nullptr) {
-    const std::string folded = detail::ascii_fold_string(lit);
-    const std::string_view flit = folded;
-    std::vector<uint32_t> out;
-    if (flit.size() < 4 || flit.size() > I.opt.chunk_overlap) {
-        out.reserve(I.chunks.size());
-        for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
-            if (!rec || rec->allows(I.chunks[ci].file_id)) out.push_back(ci);
-        }
-        return out;
-    }
-    std::vector<uint32_t> selected;
-    for (size_t i = 0; i + 4 <= flit.size(); ++i) {
-        const uint32_t h = detail::hash4(reinterpret_cast<const unsigned char*>(flit.data() + i));
-        if (std::find(selected.begin(), selected.end(), h) == selected.end()) selected.push_back(h);
-    }
-    if (rec) rec->note_selection(selected.size());
-    auto q = detail::compile_qgram_query(flit, selected);
-    for (auto const& g : I.folded_groups) {
         group_candidates(g, q, out, rec);
     }
     std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
@@ -564,50 +523,13 @@ size_t anchor_find(std::string_view s, std::string_view q, size_t anchor, size_t
     const unsigned char* base = (const unsigned char*)s.data();
     unsigned char needle = (unsigned char)q[anchor];
     size_t lo = start + anchor, hi = max_start + anchor;
-    const size_t qlen = q.size();
-
-    // M8.5: length-specialized anchor scanning with rare-pair boundary confirmation.
-    // 1-byte queries: memchr hit is already an exact match; skip memcmp entirely.
-    if (qlen == 1) {
-        auto p = (const unsigned char*)std::memchr(base + lo, needle, hi - lo);
-        if (!p) return std::string_view::npos;
-        size_t st = (size_t)(p - base);
-        if (match_end) *match_end = st + 1;
-        return st;
-    }
-
-    const unsigned char first = (unsigned char)q[0];
-    const unsigned char last = (unsigned char)q[qlen - 1];
-
-    // 2-byte queries: direct register comparison of both bytes.
-    if (qlen == 2) {
-        while (lo < hi) {
-            auto p = (const unsigned char*)std::memchr(base + lo, needle, hi - lo);
-            if (!p) return std::string_view::npos;
-            size_t apos = (size_t)(p - base);
-            size_t st = apos - anchor;
-            if (base[st] == first && base[st + 1] == last) {
-                if (match_end) *match_end = st + 2;
-                return st;
-            }
-            lo = apos + 1;
-        }
-        return std::string_view::npos;
-    }
-
-    // Length >= 3 queries: rare-pair boundary confirmation.
-    // Check first and last bytes before calling memcmp, eliminating >95% of false-anchor
-    // memcmp calls without branch-misprediction penalties.
     while (lo < hi) {
         auto p = (const unsigned char*)std::memchr(base + lo, needle, hi - lo);
         if (!p) return std::string_view::npos;
-        size_t apos = (size_t)(p - base);
-        size_t st = apos - anchor;
-        if (base[st] == first && base[st + qlen - 1] == last) {
-            if (std::memcmp(base + st, q.data(), qlen) == 0) {
-                if (match_end) *match_end = st + qlen;
-                return st;
-            }
+        size_t apos = p - base, st = apos - anchor;
+        if (std::memcmp(base + st, q.data(), q.size()) == 0) {
+            if (match_end) *match_end = st + q.size();
+            return st;
         }
         lo = apos + 1;
     }
@@ -1029,353 +951,6 @@ std::string semantic_mode_key(const PlanKey& key) {
     // the prefix explicit so serialized reports distinguish this key from
     // workload labels and never imply an observed execution.
     return std::string("plan-key:") + std::to_string(key.hash());
-}
-// M7.1 MultiQueryIR construction and sharing report.
-bool MultiPatternEntry::operator==(const MultiPatternEntry& o) const noexcept {
-    return expression == o.expression && pattern_options.kind == o.pattern_options.kind &&
-        pattern_options.case_mode == o.pattern_options.case_mode &&
-        pattern_options.engine == o.pattern_options.engine && pattern_options.word == o.pattern_options.word &&
-        pattern_options.line == o.pattern_options.line && pattern_options.multiline == o.pattern_options.multiline &&
-        pattern_options.dotall == o.pattern_options.dotall && pattern_options.unicode == o.pattern_options.unicode &&
-        pattern_options.crlf == o.pattern_options.crlf && overlapping == o.overlapping &&
-        invert_match == o.invert_match && files_with_matches == o.files_with_matches &&
-        files_without_match == o.files_without_match && include_binary == o.include_binary &&
-        max_matches == o.max_matches && record_separator == o.record_separator &&
-        objective == o.objective && threads == o.threads && eligible_file_ids == o.eligible_file_ids;
-}
-std::uint64_t MultiPatternEntry::semantic_hash() const noexcept {
-    uint64_t h = 1469598103934665603ull;
-    h = fnv_mix_str(h, expression);
-    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.kind));
-    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.case_mode));
-    h = fnv_mix(h, static_cast<uint64_t>(pattern_options.engine));
-    h = fnv_mix(h, pattern_options.word ? 1u : 0u);
-    h = fnv_mix(h, pattern_options.line ? 1u : 0u);
-    h = fnv_mix(h, pattern_options.multiline ? 1u : 0u);
-    h = fnv_mix(h, pattern_options.dotall ? 1u : 0u);
-    h = fnv_mix(h, pattern_options.unicode ? 1u : 0u);
-    h = fnv_mix(h, pattern_options.crlf ? 1u : 0u);
-    h = fnv_mix(h, overlapping ? 1u : 0u);
-    h = fnv_mix(h, invert_match ? 1u : 0u);
-    h = fnv_mix(h, files_with_matches ? 1u : 0u);
-    h = fnv_mix(h, files_without_match ? 1u : 0u);
-    h = fnv_mix(h, include_binary ? 1u : 0u);
-    h = fnv_mix(h, max_matches);
-    h = fnv_mix(h, record_separator);
-    h = fnv_mix(h, static_cast<uint64_t>(objective));
-    h = fnv_mix(h, threads);
-    for (auto id : eligible_file_ids) h = fnv_mix(h, id);
-    return h ? h : 1u;
-}
-MultiQueryIR make_multi_query_ir(const std::vector<Pattern>& patterns,
-                                 const std::vector<SearchOptions>& options,
-                                 bool needs_replacement) {
-    static const SearchOptions kDefaultOptions{};
-    MultiQueryIR ir;
-    for (std::uint32_t i = 0; i < patterns.size(); ++i) {
-        const auto& pat = patterns[i];
-        const SearchOptions& so = i < options.size() ? options[i] : kDefaultOptions;
-        MultiPatternEntry e;
-        e.source_id = i;
-        e.pattern = pat;
-        e.expression = pat.expression();
-        e.pattern_options = pat.options();
-        e.overlapping = so.overlapping;
-        e.invert_match = so.invert_match;
-        e.files_with_matches = so.files_with_matches;
-        e.files_without_match = so.files_without_match;
-        e.include_binary = so.include_binary;
-        e.max_matches = so.max_matches;
-        e.record_separator = so.record_separator;
-        e.objective = so.objective;
-        e.threads = so.threads;
-        if (so.eligible_file_ids.data() && !so.eligible_file_ids.empty()) {
-            e.eligible_file_ids.assign(so.eligible_file_ids.begin(), so.eligible_file_ids.end());
-            std::sort(e.eligible_file_ids.begin(), e.eligible_file_ids.end());
-            e.eligible_file_ids.erase(std::unique(e.eligible_file_ids.begin(), e.eligible_file_ids.end()),
-                                      e.eligible_file_ids.end());
-        }
-        e.has_captures = e.pattern_options.kind != PatternKind::Fixed &&
-            detail::parse_regex(e.expression, e.pattern_options).groups > 0;
-        e.needs_replacement = needs_replacement;
-        ir.entries.push_back(std::move(e));
-    }
-    return ir;
-}
-std::vector<std::vector<std::uint32_t>> multi_query_sharing(const MultiQueryIR& ir) {
-    // Conservative scaffold: identical fixed literals share one scan; every
-    // regex (and any differing entry) stays independent. M7.2/M7.3 refine.
-    std::vector<std::vector<std::uint32_t>> groups;
-    std::vector<bool> claimed(ir.entries.size(), false);
-    for (std::size_t i = 0; i < ir.entries.size(); ++i) {
-        if (claimed[i]) continue;
-        const auto& a = ir.entries[i];
-        std::vector<std::uint32_t> g{a.source_id};
-        claimed[i] = true;
-        if (a.pattern_options.kind == PatternKind::Fixed) {
-            for (std::size_t j = i + 1; j < ir.entries.size(); ++j) {
-                if (!claimed[j] && ir.entries[j] == a) {
-                    g.push_back(ir.entries[j].source_id);
-                    claimed[j] = true;
-                }
-            }
-        }
-        groups.push_back(std::move(g));
-    }
-    return groups;
-}
-MultiQueryIR compile_multi_query(const std::vector<std::string>& expressions,
-                                 const std::vector<PatternOptions>& pattern_options,
-                                 const std::vector<SearchOptions>& options,
-                                 bool needs_replacement) {
-    static const PatternOptions kDefaultPatternOptions{};
-    std::vector<Pattern> patterns;
-    patterns.reserve(expressions.size());
-    for (std::uint32_t i = 0; i < expressions.size(); ++i) {
-        const PatternOptions& po = pattern_options.empty() ? kDefaultPatternOptions
-            : pattern_options.size() == 1 ? pattern_options[0] : pattern_options[i];
-        try {
-            patterns.push_back(Pattern::compile(expressions[i], po));
-        } catch (const std::exception& ex) {
-            throw MultiPatternCompileError(
-                i, "pattern " + std::to_string(i) + ": " + ex.what());
-        }
-    }
-    return make_multi_query_ir(patterns, options, needs_replacement);
-}
-
-std::string explain_multi_query_sharing(const MultiQueryIR& ir) {
-    std::string out = "multi-pattern plan: " + std::to_string(ir.entries.size()) + " pattern(s); ";
-    for (const auto& g : multi_query_sharing(ir)) {
-        if (g.size() > 1) {
-            out += "patterns [";
-            for (std::size_t k = 0; k < g.size(); ++k) {
-                if (k) out += ",";
-                out += std::to_string(g[k]);
-            }
-            const auto& e = ir.entries[g[0]];
-            out += "] share one " + std::string(e.pattern_options.kind == PatternKind::Fixed ? "fixed-literal" : "regex") +
-                   " scan for '" + e.expression + "'; ";
-        } else {
-            const auto& e = ir.entries[g[0]];
-            out += "pattern " + std::to_string(g[0]) + " independent (" +
-                   (e.pattern_options.kind == PatternKind::Fixed ? "fixed" : "regex") + "); ";
-        }
-    }
-    return out;
-}
-// M7.2 guarded Aho-Corasick shared scan. Measured crossover below 2 patterns
-// on mixed corpora; the gate requires 4+ for margin against small-corpus
-// variance (see docs/aho-corasick-shared.md). M9 may tune these bounds.
-inline constexpr std::size_t kMinSharedPatterns = 4;
-inline constexpr std::size_t kMaxSharedPatterns = 256;
-inline constexpr std::size_t kMaxSharedBytes = 65536;
-inline constexpr std::size_t kMaxAcNodes = 16384;
-const char* aho_eligible_entry(const MultiPatternEntry& e) noexcept {
-    if (e.pattern_options.kind != PatternKind::Fixed) return "not fixed";
-    if (e.pattern_options.case_mode != CaseMode::Sensitive) return "not case-sensitive";
-    if (e.pattern_options.word || e.pattern_options.line) return "word/line anchored";
-    if (e.invert_match || e.files_with_matches || e.files_without_match) return "mode flag";
-    if (e.max_matches != 0 || e.objective != SearchObjective::Exhaustive) return "bounded search";
-    if (e.threads != 1) return "parallel entry";
-    if (e.record_separator != '\n') return "record separator";
-    if (e.expression.empty()) return "empty literal";
-    return nullptr;
-}
-std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, SearchStats* stats) const {
-    std::vector<std::vector<Match>> out(ir.entries.size());
-    if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
-    if (stats) *stats = {};
-    auto& I = *index_->impl_;
-    std::uint64_t total_matches = 0;
-    auto finish = [&](const char* op) {
-        if (stats) {
-            stats->matches = total_matches;
-            stats->physical_operator = op;
-            stats->simd_backend = std::string(detail::simd_level_name(detail::get_active_simd_level()));
-        }
-    };
-    // Shared path gate (M7.7 admission: deterministic predicate over the IR
-    // and index sizes; calibration in docs/shared-plan-threshold.md keeps the
-    // count floor at 4 with wide margin and no corpus-size floor).
-    std::string admit_reason = "none";
-    bool shared = ir.entries.size() >= kMinSharedPatterns && ir.entries.size() <= kMaxSharedPatterns;
-    if (!shared) {
-        admit_reason = ir.entries.size() < kMinSharedPatterns
-            ? "multi: fewer than 4 patterns"
-            : "multi: more than 256 patterns";
-    }
-    std::size_t total_bytes = 0;
-    if (shared) {
-        for (const auto& e : ir.entries) {
-            if (const char* cause = aho_eligible_entry(e)) {
-                shared = false;
-                admit_reason = "multi: entry " + std::to_string(e.source_id) + " " + cause;
-                break;
-            }
-            total_bytes += e.expression.size();
-            if (total_bytes > kMaxSharedBytes) {
-                shared = false;
-                admit_reason = "multi: shared literal budget exceeded";
-                break;
-            }
-        }
-    }
-    if (shared) {
-        std::vector<std::string> lits;
-        lits.reserve(ir.entries.size());
-        for (const auto& e : ir.entries) lits.push_back(e.expression);
-        detail::AhoCorasick ac;
-        if (ac.build(lits, kMaxAcNodes, kMaxSharedBytes)) {
-            // M7.6 scope-aware shared scan: cover the union of member scopes
-            // (an unscoped member means all files) so excluded files are never
-            // read; each entry then keeps only its own scope (empty = all).
-            // Union-wide scanning with per-entry filtering is sound: every
-            // member's true matches lie in its scope, which the union covers.
-            std::vector<std::uint8_t> union_scope(I.loaded.size(), 0);
-            for (const auto& e : ir.entries) {
-                if (e.eligible_file_ids.empty()) {
-                    union_scope.assign(union_scope.size(), 1);
-                    break;
-                }
-                for (auto fid : e.eligible_file_ids)
-                    if (fid < union_scope.size()) union_scope[fid] = 1;
-            }
-            for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) {
-                if (!union_scope[fid]) continue;
-                // Non-overlap state resets per file: serial verification treats
-                // each file independently, so a late match in one file must not
-                // suppress early matches in the next.
-                std::vector<std::uint64_t> last_end(ir.entries.size(), 0);
-                std::vector<bool> started(ir.entries.size(), false);
-                const bool file_binary = fid < I.infos.size() && I.infos[fid].binary;
-                const std::string_view content = I.loaded[fid].view();
-                for (const auto& [pi, end] : ac.search_all(content)) {
-                    const auto& e = ir.entries[pi];
-                    if (file_binary && !e.include_binary) continue;
-                    if (!e.eligible_file_ids.empty() &&
-                        !std::binary_search(e.eligible_file_ids.begin(),
-                                            e.eligible_file_ids.end(), fid))
-                        continue;
-                    const std::uint64_t start = end - e.expression.size();
-                    if (!e.overlapping) {
-                        if (started[pi] && start < last_end[pi]) continue;
-                        started[pi] = true;
-                        last_end[pi] = end;
-                    }
-                    out[e.source_id].push_back(Match{fid, start, end, {}});
-                    ++total_matches;
-                }
-            }
-            finish("AhoCorasickShared");
-            return out;
-        }
-        // Automaton refused (node/memory budget): grouped sharing may still win.
-        shared = false;
-        admit_reason = "multi: automaton budget exceeded";
-    }
-    // M7.3 grouped fallback: regex entries sharing a mandatory literal reuse one
-    // prefilter probe; each member searches the files containing shared chunks
-    // (intersected with its own scope). Mandatory literals are necessary per
-    // pattern, so scoping preserves exact results; groups that prune nothing
-    // run unscoped (setup cost never paid without benefit).
-    std::vector<std::vector<std::uint32_t>> file_scope(ir.entries.size());
-    std::vector<bool> grouped(ir.entries.size(), false);
-    bool any_grouped = false;
-    bool any_common = false;
-    bool any_regex_candidate = false;
-    {
-        // Literal -> member indices (regex entries with mandatory literals only;
-        // fixed literals travel the AC path or run independent; icase yields no
-        // mandatory literals and stays independent automatically).
-        std::vector<std::pair<std::string, std::vector<std::size_t>>> by_literal;
-        for (std::size_t i = 0; i < ir.entries.size(); ++i) {
-            const auto& e = ir.entries[i];
-            if (e.pattern_options.kind == PatternKind::Fixed) continue;
-            for (const auto& lit :
-                 detail::parse_regex(e.expression, e.pattern_options).query_ir.mandatory) {
-                any_regex_candidate = true;
-                auto it = std::find_if(by_literal.begin(), by_literal.end(),
-                    [&](const auto& kv) { return kv.first == lit; });
-                if (it == by_literal.end()) by_literal.push_back({lit, {i}});
-                else it->second.push_back(i);
-            }
-        }
-        std::vector<std::uint32_t> all_files(I.loaded.size());
-        for (std::uint32_t f = 0; f < all_files.size(); ++f) all_files[f] = f;
-        for (const auto& [lit, members] : by_literal) {
-            if (members.size() < 2) continue;
-            any_common = true;
-            // Skip members already grouped (first longest-shared wins by order).
-            std::vector<std::size_t> fresh;
-            for (auto i : members) if (!grouped[i]) fresh.push_back(i);
-            if (fresh.size() < 2) continue;
-            auto cv = chunk_candidates(I, lit, nullptr);
-            std::vector<std::uint8_t> group_union(I.loaded.size(), 0);
-            for (auto i : fresh) {
-                const auto& sc = ir.entries[i].eligible_file_ids;
-                if (sc.empty()) {
-                    group_union.assign(group_union.size(), 1);
-                    break;
-                }
-                for (auto fid : sc)
-                    if (fid < group_union.size()) group_union[fid] = 1;
-            }
-            std::vector<std::uint32_t> files;
-            for (auto ci : cv) {
-                const auto fid = I.chunks[ci].file_id;
-                if (fid >= group_union.size() || !group_union[fid]) continue;
-                if (files.empty() || files.back() != fid) files.push_back(fid);
-            }
-            if (files.size() >= all_files.size()) continue; // prunes nothing
-            for (auto i : fresh) {
-                file_scope[i] = files;
-                grouped[i] = true;
-            }
-            any_grouped = true;
-        }
-    }
-    // Independent execution with optional shared scopes: full per-pattern
-    // semantics by construction (scope narrowing is sound by literal necessity).
-    for (std::size_t i = 0; i < ir.entries.size(); ++i) {
-        const auto& e = ir.entries[i];
-        SearchOptions so;
-        so.overlapping = e.overlapping;
-        so.invert_match = e.invert_match;
-        so.files_with_matches = e.files_with_matches;
-        so.files_without_match = e.files_without_match;
-        so.include_binary = e.include_binary;
-        so.max_matches = e.max_matches;
-        so.record_separator = e.record_separator;
-        so.objective = e.objective;
-        so.threads = e.threads;
-        std::vector<std::uint32_t> scoped;
-        if (grouped[i]) {
-            if (e.eligible_file_ids.empty()) {
-                scoped = file_scope[i];
-            } else {
-                std::set_intersection(e.eligible_file_ids.begin(), e.eligible_file_ids.end(),
-                    file_scope[i].begin(), file_scope[i].end(), std::back_inserter(scoped));
-            }
-            so.eligible_file_ids = std::span<const std::uint32_t>(scoped);
-        } else if (!e.eligible_file_ids.empty()) {
-            so.eligible_file_ids = std::span<const std::uint32_t>(e.eligible_file_ids);
-        }
-        Searcher worker(*index_);
-        out[e.source_id] = worker.find(e.pattern, so, nullptr);
-        total_matches += out[e.source_id].size();
-    }
-    if (any_grouped) {
-        admit_reason = "none";
-        finish("SharedPrefilterGroups");
-    } else {
-        if (any_regex_candidate)
-            admit_reason = any_common ? "multi: shared literals prune no files"
-                                      : "multi: no literal shared by 2+ patterns";
-        if (stats) stats->qgram_fallback_reason = admit_reason;
-        finish("IndependentFallback");
-    }
-    return out;
 }
 PlanKey make_plan_key(const Pattern& pattern, const SearchOptions& search_options, const Index& index, std::uint64_t transformed_input_identity) {
     return make_plan_key(pattern, search_options, index.options(), transformed_input_identity);
@@ -2177,47 +1752,12 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (!index_ || !index_->impl_) throw std::runtime_error("pergrep: empty index");
     if (stats) *stats = {};
     auto& I = *index_->impl_;
-    detail::VmTelemetry vm_telemetry{};
     std::vector<std::uint32_t> normalized_scope;
     if (!opt.eligible_file_ids.empty()) {
         normalized_scope.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
         std::sort(normalized_scope.begin(), normalized_scope.end());
         normalized_scope.erase(std::unique(normalized_scope.begin(), normalized_scope.end()), normalized_scope.end());
         opt.eligible_file_ids = normalized_scope;
-    }
-    // M5.2: ordered per-file parallel merge. Each eligible file is searched by
-    // an independent per-task Searcher (sharing this Searcher's immutable
-    // Index), and per-file results are concatenated in file-id order — no sort,
-    // so the merged result is byte-identical to the serial traversal whatever
-    // the thread count or completion order. Eligible only for exhaustive,
-    // unlimited, unobserved searches; every other semantic (max_matches,
-    // non-exhaustive objectives, cooperative cancellation, stats) falls back
-    // to the serial path below. Uneven file sizes are balanced dynamically by
-    // the worker queue's shared atomic cursor.
-    if (opt.threads > 1 && stats == nullptr && opt.objective == SearchObjective::Exhaustive &&
-        opt.max_matches == 0 && !opt.should_cancel) {
-        std::vector<std::uint32_t> fids;
-        if (opt.eligible_file_ids.empty()) {
-            fids.reserve(I.loaded.size());
-            for (std::uint32_t fid = 0; fid < I.loaded.size(); ++fid) fids.push_back(fid);
-        } else {
-            fids.assign(opt.eligible_file_ids.begin(), opt.eligible_file_ids.end());
-        }
-        if (fids.size() > 1) {
-            const Index& idx = *index_;
-            const auto one_file = [&](const std::uint32_t& fid) {
-                Searcher worker(idx);
-                SearchOptions sub = opt;
-                sub.threads = 1;
-                sub.eligible_file_ids = std::span<const std::uint32_t>(&fid, 1);
-                return worker.find(p, sub, nullptr);
-            };
-            auto parts = detail::parallel_map<std::uint32_t>(fids, opt.threads, one_file);
-            std::vector<Match> merged;
-            for (auto& part : parts) for (auto& m : part) merged.push_back(std::move(m));
-            return merged;
-        }
-        // 0/1 files: fall through to serial (identical result, no thread overhead).
     }
     StatsRecorder accounting(stats, I, opt.eligible_file_ids);
     if (stats) {
@@ -2262,7 +1802,6 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->guarded_dispatch_used = guarded_fixed_dispatch;
-        stats->simd_backend = std::string(detail::simd_level_name(detail::get_active_simd_level()));
         if (!p.is_fixed()) {
             stats->physical_operator = stats->verifier;
         } else if (opt.invert_match) {
@@ -2353,7 +1892,6 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
                         false, false, opt.record_separator, p.impl_->opt.crlf};
-                    context.tm = stats ? &vm_telemetry : nullptr;
                     if (detail::regex_search(p.impl_->re, context, p.impl_->opt, &m, fid)) {
                         matched = true;
                     }
@@ -2468,18 +2006,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 stats->selected_qgram_count = 0;
                 stats->selected_qgram_rows = 0;
             }
-            // M6.2: ASCII-only case-insensitive literals probe the folded auxiliary;
-            // every other case keeps the unfiltered fallback. Verification stays ICU.
-            std::vector<uint32_t> cv;
-            const bool use_folded = icase && !p.impl_->opt.word && !p.impl_->opt.line &&
-                !opt.files_with_matches && !opt.files_without_match &&
-                detail::is_ascii(q) && folded_groups_present(I);
-            if (use_folded) {
-                if (stats) stats->qgram_fallback_reason = "case-insensitive-folded";
-                cv = folded_chunk_candidates(I, q, &accounting);
-            } else {
-                cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
-            }
+            auto cv = chunk_candidates(I, icase ? std::string_view{} : q, &accounting);
             accounting.note_candidates(cv);
             std::unordered_set<uint32_t> done_chunks;
             size_t a = choose_rare_byte(I, q);
@@ -2778,7 +2305,6 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
                             record_begin, record_end, bounded.candidate_begin, bounded.candidate_end,
                             false, false, opt.record_separator, p.impl_->opt.crlf};
-                        context.tm = stats ? &vm_telemetry : nullptr;
                         context.region_begin = bounded.region_begin;
                         context.region_end = bounded.region_end;
                         context.bounded_region = true;
@@ -2871,7 +2397,6 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                 detail::VerifierContext context{data, 0, static_cast<std::uint64_t>(data.size()),
                     0, static_cast<std::uint64_t>(data.size()), 0, static_cast<std::uint64_t>(data.size() + 1),
                     false, false, opt.record_separator, p.impl_->opt.crlf};
-                context.tm = stats ? &vm_telemetry : nullptr;
                 auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                 out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
@@ -2896,7 +2421,6 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e),
                         static_cast<std::uint64_t>(b), static_cast<std::uint64_t>(logical_e + 1),
                         false, false, opt.record_separator, p.impl_->opt.crlf};
-                    context.tm = stats ? &vm_telemetry : nullptr;
                     auto ms = detail::regex_find_all(p.impl_->re, context, p.impl_->opt, opt.overlapping, fid, remain());
                     out.insert(out.end(), ms.begin(), ms.end());
                 record_first_hit();
@@ -2924,13 +2448,6 @@ done:
     if (stats) {
         accounting.finish();
         stats->matches = out.size();
-        stats->vm_max_depth = vm_telemetry.max_depth;
-        stats->vm_repeat_iterations = vm_telemetry.repeat_iterations;
-        stats->vm_repeat_capped = vm_telemetry.repeat_capped;
-        stats->vm_lookbehind_evals = vm_telemetry.lookbehind_evals;
-        stats->vm_max_lookbehind_window = vm_telemetry.max_lookbehind_window;
-        stats->vm_lookbehind_capped = vm_telemetry.lookbehind_capped;
-        stats->vm_state_expansions = vm_telemetry.state_expansions;
         const auto elapsed = std::clock() - verifier_start;
         if (elapsed > 0) {
             stats->verifier_cpu_ns =

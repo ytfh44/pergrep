@@ -1,6 +1,5 @@
 #pragma once
 #include "pergrep/pergrep.hpp"
-#include "simd_bitmap.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -23,21 +22,6 @@
 
 namespace pergrep::detail {
 
-// M6.2: ASCII fold for the folded auxiliary filter. Identity except A-Z -> a-z,
-// exactly matching u_foldCase (U_FOLD_CASE_DEFAULT) on ASCII bytes 0-127 —
-// proven by test, never assumed. Bytes >= 128 pass through untouched.
-inline unsigned char ascii_fold_byte(unsigned char c) noexcept {
-    return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
-}
-inline bool is_ascii(std::string_view s) noexcept {
-    for (unsigned char c : s) if (c >= 128) return false;
-    return true;
-}
-inline std::string ascii_fold_string(std::string_view s) {
-    std::string out(s);
-    for (auto& ch : out) ch = static_cast<char>(ascii_fold_byte(static_cast<unsigned char>(ch)));
-    return out;
-}
 inline std::uint32_t hash4(const unsigned char* p) noexcept {
     std::uint32_t x = std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
                       (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
@@ -232,20 +216,6 @@ struct QueryIR {
 // bound visible bytes to a proven execution region; otherwise bytes visible to an
 // attempted match are the full source. Source/record bounds, context-availability flags, separator
 // and CRLF policy are authoritative; derived views are convenience helpers.
-// M6.7: extended-VM resource telemetry. Aggregated per search when attached via
-// VerifierContext::tm; untouched otherwise (null default keeps hot paths clean).
-// Counters are monotonic within a search; limit_reason points to a static string
-// set at the throw site (null = no limit hit).
-struct VmTelemetry {
-    std::uint64_t max_depth = 0;
-    std::uint64_t repeat_iterations = 0;
-    std::uint64_t repeat_capped = 0;
-    std::uint64_t lookbehind_evals = 0;
-    std::uint64_t max_lookbehind_window = 0;
-    std::uint64_t lookbehind_capped = 0;
-    std::uint64_t state_expansions = 0;
-    const char* limit_reason = nullptr;
-};
 struct VerifierContext {
     std::string_view source;
     std::uint64_t source_begin = 0;
@@ -264,7 +234,6 @@ struct VerifierContext {
     std::uint64_t region_begin = 0;
     std::uint64_t region_end = 0;
     bool bounded_region = false;
-    VmTelemetry* tm = nullptr;
 
     bool validate() const noexcept {
         if (source_end < source_begin || source_end - source_begin != source.size()) return false;
@@ -391,18 +360,6 @@ struct IndexData {
         std::vector<std::uint32_t> gids;
         std::vector<std::uint64_t> bits;
     };
-
-    // M8.2: sparse q-gram postings for high-frequency hash rows.
-    // When a row's chunk count exceeds ~64, bitmap is wasteful; postings
-    // store only present chunk indices. Probing intersects sorted lists.
-    struct SparseGroup {
-        std::uint8_t lg = 9;
-        std::uint32_t m = 512;
-        // postings[row] = sorted chunk indices (li) for that hash row.
-        std::vector<std::vector<std::uint32_t>> postings;
-        // gids mirrors dense layout for fallback compatibility.
-        std::vector<std::uint32_t> gids;
-    };
 using PosDesc = detail::PosDesc;
 
     // Planner statistics are deliberately separate from qgram_freq. qgram_freq
@@ -429,41 +386,6 @@ using PosDesc = detail::PosDesc;
     std::vector<LoadedFile> loaded;
     std::vector<Chunk> chunks;
     std::array<Group,8> groups;
-    // M6.2: ASCII-folded auxiliary Bloom twin of groups, built from ASCII-lowercased
-    // chunk bytes (A-Z -> a-z, all other bytes untouched). Queried only for fixed,
-    // case-insensitive, all-ASCII literals without word/line/files scoping, using the
-    // lowercased literal. Transient: never serialized; empty on loaded snapshots,
-    // which safely fall back to the unfiltered path.
-    std::array<Group,8> folded_groups;
-    // M8.3: Roaring-style compressed bitmap containers (transient, rebuilt on load).
-    // Three container types: array (sparse), bitset (dense), run (run-length encoded).
-    // Selection is dynamic based on chunk frequency and run-length analysis.
-    struct RoaringGroup {
-        enum class Type : std::uint8_t { Array = 0, Bitset = 1, Run = 2 };
-        Type type = Type::Array;
-        std::uint8_t lg = 9;
-        std::uint32_t m = 512;  // number of hash rows
-        
-        // Array container (sorted chunk indices, for very sparse rows)
-        std::vector<std::uint32_t> array_ids;
-        
-        // Bitset container (dense bitmap, for dense rows)
-        std::vector<std::uint64_t> bitset_bits;
-        std::uint32_t bitset_words = 0;
-        
-        // Run container (run-length encoded, for moderate density with runs)
-        // Each run: {start_id, length} - consecutive chunk IDs
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
-        std::vector<std::uint32_t> run_gids;  // mirrors gids for fallback
-        
-        // For fallback compatibility with dense path
-        std::vector<std::uint32_t> gids;
-    };
-    // M8.3: Roaring-style groups for each of the 8 q-gram groups
-    std::array<RoaringGroup,8> roaring_groups;
-    // M8.2: sparse variant for high-frequency groups (transient, rebuilt on load).
-    std::array<SparseGroup,8> sparse_groups;
-    std::array<SparseGroup,8> folded_sparse_groups;
     std::vector<PosDesc> pos_desc;
     std::vector<std::uint8_t> pos;
     std::array<std::uint64_t,256> byte_freq{};
@@ -481,36 +403,18 @@ using PosDesc = detail::PosDesc;
     std::size_t segment_count = 0;
     std::uint64_t appended_bytes = 0;
 
-    // M8.1: single-source ledger assembly. bytes() reconciles with
-    // ledger().index_structures() by construction (see test_m81_memory_ledger).
-    IndexMemoryLedger ledger() const noexcept {
-        IndexMemoryLedger l;
-        l.corpus_bytes = corp_bytes;
-        for (const auto& g : groups) {
-            l.group_bits += g.bits.size() * sizeof(std::uint64_t);
-            l.group_gids += g.gids.size() * sizeof(std::uint32_t);
-        }
-        for (const auto& g : folded_groups) {
-            l.folded_bits += g.bits.size() * sizeof(std::uint64_t);
-            l.folded_gids += g.gids.size() * sizeof(std::uint32_t);
-        }
-        l.positional = pos.size();
-        l.pos_descriptors = pos_desc.size() * sizeof(PosDesc);
-        l.chunks = chunks.size() * sizeof(Chunk);
-        l.file_meta = infos.size() * sizeof(FileInfo);
-        for (const auto& info : infos) l.paths += info.path.size();
-        l.freq_tables = byte_freq.size() * sizeof(std::uint64_t) +
-                        qgram_freq.size() * sizeof(std::uint32_t) +
-                        hash_chunk_freq.size() * sizeof(std::uint64_t);
+    std::uint64_t bytes() const noexcept {
+        std::uint64_t n = pos.size() + pos_desc.size()*sizeof(PosDesc) + chunks.size()*sizeof(Chunk);
+        for (const auto& g : groups) n += g.bits.size()*sizeof(std::uint64_t) + g.gids.size()*sizeof(std::uint32_t);
+        n += infos.size()*sizeof(FileInfo) + byte_freq.size()*sizeof(std::uint64_t) + qgram_freq.size()*sizeof(std::uint32_t);
+        n += hash_chunk_freq.size() * sizeof(std::uint64_t);
         for (const auto& [key, q] : exact_qgrams)
-            l.qgram_stats += sizeof(key) + sizeof(QgramStats) +
-                             q.chunk_ids.size() * sizeof(std::uint32_t) +
-                             q.document_ids.size() * sizeof(std::uint32_t);
+            n += sizeof(key) + sizeof(QgramStats) + q.chunk_ids.size()*sizeof(std::uint32_t) +
+                 q.document_ids.size()*sizeof(std::uint32_t);
         for (const auto& ids : hash_chunk_ids)
-            l.hash_postings += ids.size() * sizeof(std::uint32_t);
-        return l;
+            n += ids.size() * sizeof(std::uint32_t);
+        return n;
     }
-    std::uint64_t bytes() const noexcept { return ledger().index_structures(); }
 };
 
 // QO-4/M1.5 cost model & scheduler: estimates selectivity via exact q-gram

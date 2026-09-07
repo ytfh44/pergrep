@@ -29,6 +29,24 @@ jobs:
       - name: Bench smoke
         run: ./build/unix/pergrep_bench || true
 
+  linux-arm64:
+    name: Linux ARM64 (unix preset)
+    runs-on: ubuntu-latest-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev libarchive-dev ninja-build
+      - name: Configure
+        run: cmake --preset unix
+      - name: Build
+        run: cmake --build --preset unix -j
+      - name: Test
+        run: ctest --preset unix --output-on-failure
+      - name: Bench smoke
+        run: ./build/unix/pergrep_bench || true
+
   windows-msvc:
     name: Windows MSVC (windows-vcpkg)
     runs-on: windows-latest
@@ -72,6 +90,24 @@ jobs:
       - name: Bench smoke
         shell: bash
         run: ./build/windows-clang/pergrep_bench.exe || ./build/windows/pergrep_bench.exe || true
+
+  windows-arm64:
+    name: Windows ARM64 (windows-vcpkg)
+    runs-on: windows-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set VCPKG_ROOT from VCPKG_INSTALLATION_ROOT
+        shell: pwsh
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        run: cmake --preset windows-vcpkg
+      - name: Build
+        run: cmake --build --preset windows-vcpkg -j
+      - name: Test
+        run: ctest --preset windows-vcpkg --output-on-failure
 
   # Fast lint: ensure bench respects IndexOptions bounds
   bench-bounds:

@@ -326,53 +326,19 @@ static void materialize_index_filters(detail::IndexData& I) {
         g.words = (cnt[k] + 63) / 64;
         g.gids.reserve(cnt[k]);
         g.bits.assign((size_t)g.m * g.words, 0);
-        // M6.2: folded twin mirrors the raw shape; same chunk mapping, clear bits.
-        auto& f = I.folded_groups[k];
-        f.lg = g.lg; f.m = g.m; f.words = g.words;
-        f.gids.reserve(cnt[k]);
-        f.bits.assign(g.bits.size(), 0);
-    }
-    // M8.2: sparse groups - initialize with empty postings
-    for (int k = 0; k < 8; ++k) {
-        auto& sg = I.sparse_groups[k];
-        sg.lg = k + 9;
-        sg.m = 1u << sg.lg;
-        sg.postings.assign(sg.m, {});
-        sg.gids.reserve(cnt[k]);
-        // M6.2: folded sparse twin
-        auto& fsg = I.folded_sparse_groups[k];
-        fsg.lg = sg.lg; fsg.m = sg.m;
-        fsg.postings.assign(sg.m, {});
-        fsg.gids.reserve(cnt[k]);
-    }
-    // M8.3: Roaring groups - initialize
-    for (int k = 0; k < 8; ++k) {
-        auto& rg = I.roaring_groups[k];
-        rg.lg = k + 9;
-        rg.m = 1u << rg.lg;
-        rg.array_ids.reserve(cnt[k] > 0 ? cnt[k] : 0);
-        rg.gids.reserve(cnt[k]);
     }
     std::array<uint32_t, 8> local{};
     for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
         auto c = I.chunks[ci];
         auto& g = I.groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
-        auto& f = I.folded_groups[detail::lg_for(size_t(c.ext_end - c.core_begin)) - 9];
         const uint32_t li = local[g.lg - 9]++;
         g.gids.push_back(ci);
-        f.gids.push_back(ci);
         auto v = std::string_view(I.loaded[c.file_id].view()).substr(c.core_begin, c.ext_end - c.core_begin);
         const uint32_t mask = g.m - 1;
         if (v.size() >= 4) {
             for (size_t j = 0; j + 4 <= v.size(); ++j) {
                 const uint32_t b = detail::hash4((const unsigned char*)v.data() + j) & mask;
                 g.bits[(size_t)b * g.words + (li >> 6)] |= 1ull << (li & 63);
-            }
-            // M6.2: same windows over ASCII-lowercased bytes (same li: identical order).
-            const std::string fv = detail::ascii_fold_string(v);
-            for (size_t j = 0; j + 4 <= fv.size(); ++j) {
-                const uint32_t b = detail::hash4((const unsigned char*)fv.data() + j) & mask;
-                f.bits[(size_t)b * f.words + (li >> 6)] |= 1ull << (li & 63);
             }
         }
     }
@@ -609,10 +575,6 @@ uint64_t Index::corpus_bytes() const noexcept {
 uint64_t Index::index_bytes() const noexcept {
     return impl_ ? impl_->bytes() : 0;
 }
-IndexMemoryLedger Index::memory_ledger() const noexcept {
-    return impl_ ? impl_->ledger() : IndexMemoryLedger{};
-}
-
 bool Index::is_snapshot() const noexcept {
     return impl_ ? impl_->opt.persist_corpus : false;
 }
