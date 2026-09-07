@@ -31,7 +31,7 @@ jobs:
 
   linux-arm64:
     name: Linux ARM64 (unix preset)
-    runs-on: ubuntu-latest-arm64
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -93,7 +93,7 @@ jobs:
 
   windows-arm64:
     name: Windows ARM64 (windows-vcpkg)
-    runs-on: windows-arm64
+    runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
       - name: Set VCPKG_ROOT from VCPKG_INSTALLATION_ROOT
