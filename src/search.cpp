@@ -1,5 +1,6 @@
 #include "aho_corasick.hpp"
 #include "internal.hpp"
+#include "simd_bitmap.hpp"
 #include "worker_queue.hpp"
 #include <algorithm>
 #include <array>
@@ -433,12 +434,10 @@ void group_candidates(const detail::IndexData::Group& g, const QueryDesc& q,
             uint32_t row = uint32_t(ww) * 64 + bit;
             auto p = g.bits.data() + (size_t)row * g.words;
             if (rec) rec->note_probe(static_cast<std::size_t>(g.words) * sizeof(std::uint64_t), ProbeKind::Chunk);
-            for (uint32_t j = 0; j < g.words; ++j) c[j] &= p[j];
+            // M8.4: SIMD bitmap intersection with fused non-zero check & early exit
+            if (!detail::bitmap_intersect(c.data(), p, g.words)) return;
             mask64 &= mask64 - 1;
         }
-        bool any = false;
-        for (auto v : c) any |= v != 0;
-        if (!any) return;
     }
     for (uint32_t w = 0; w < g.words; ++w) {
         uint64_t z = c[w];
@@ -1156,6 +1155,7 @@ std::vector<std::vector<Match>> Searcher::find_multi(const MultiQueryIR& ir, Sea
         if (stats) {
             stats->matches = total_matches;
             stats->physical_operator = op;
+            stats->simd_backend = std::string(detail::simd_level_name(detail::get_active_simd_level()));
         }
     };
     // Shared path gate (M7.7 admission: deterministic predicate over the IR
@@ -2225,6 +2225,7 @@ std::vector<Match> Searcher::find(const Pattern& p, SearchOptions opt, SearchSta
     if (stats) {
         stats->verifier = std::string(detail::to_string(qc.verifier));
         stats->guarded_dispatch_used = guarded_fixed_dispatch;
+        stats->simd_backend = std::string(detail::simd_level_name(detail::get_active_simd_level()));
         if (!p.is_fixed()) {
             stats->physical_operator = stats->verifier;
         } else if (opt.invert_match) {

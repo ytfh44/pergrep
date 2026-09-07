@@ -472,6 +472,8 @@ struct SearchStats {
     std::uint64_t vm_max_lookbehind_window = 0;
     std::uint64_t vm_lookbehind_capped = 0;
     std::uint64_t vm_state_expansions = 0;
+    // M8.4 bitmap SIMD dispatch telemetry. C++ only.
+    std::string simd_backend = "scalar";
 };
 
 // QO-4: verifier kinds for the cost-based scheduler. Mirrors detail::VerifierKind
