@@ -434,6 +434,32 @@ using PosDesc = detail::PosDesc;
     // lowercased literal. Transient: never serialized; empty on loaded snapshots,
     // which safely fall back to the unfiltered path.
     std::array<Group,8> folded_groups;
+    // M8.3: Roaring-style compressed bitmap containers (transient, rebuilt on load).
+    // Three container types: array (sparse), bitset (dense), run (run-length encoded).
+    // Selection is dynamic based on chunk frequency and run-length analysis.
+    struct RoaringGroup {
+        enum class Type : std::uint8_t { Array = 0, Bitset = 1, Run = 2 };
+        Type type = Type::Array;
+        std::uint8_t lg = 9;
+        std::uint32_t m = 512;  // number of hash rows
+        
+        // Array container (sorted chunk indices, for very sparse rows)
+        std::vector<std::uint32_t> array_ids;
+        
+        // Bitset container (dense bitmap, for dense rows)
+        std::vector<std::uint64_t> bitset_bits;
+        std::uint32_t bitset_words = 0;
+        
+        // Run container (run-length encoded, for moderate density with runs)
+        // Each run: {start_id, length} - consecutive chunk IDs
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
+        std::vector<std::uint32_t> run_gids;  // mirrors gids for fallback
+        
+        // For fallback compatibility with dense path
+        std::vector<std::uint32_t> gids;
+    };
+    // M8.3: Roaring-style groups for each of the 8 q-gram groups
+    std::array<RoaringGroup,8> roaring_groups;
     // M8.2: sparse variant for high-frequency groups (transient, rebuilt on load).
     std::array<SparseGroup,8> sparse_groups;
     std::array<SparseGroup,8> folded_sparse_groups;

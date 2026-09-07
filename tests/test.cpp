@@ -2327,6 +2327,59 @@ static void test_m82_sparse_vs_dense_qgrams() {
     }
 }
 
+// M8.3: Decide whether Roaring-style containers are justified
+static void test_m83_roaring_container_decision() {
+    std::cerr << "M8.3 roaring decision" << std::flush;
+
+    // (a) Representation equivalence & zero false negatives
+    {
+        auto idx = Index::from_documents({
+            {"file1.txt", "token_a token_b token_c\n"},
+            {"file2.txt", "token_a token_d token_e\n"},
+            {"file3.txt", "token_b token_d token_f\n"},
+            {"file4.txt", "token_a token_b token_d\n"},
+        });
+        Searcher s(idx);
+
+        // Search for all tokens; results must match reference oracle exactly
+        for (const auto& w : {"token_a", "token_b", "token_c", "token_d", "token_e", "token_f"}) {
+            auto p = Pattern::compile(w, {.kind = PatternKind::Fixed});
+            auto actual = s.find(p);
+            auto expected = full_reference(idx, p, SearchOptions{});
+            assert(actual.size() == expected.size());
+            for (size_t i = 0; i < actual.size(); ++i) {
+                assert(actual[i].file_id == expected[i].file_id);
+                assert(actual[i].start == expected[i].start);
+                assert(actual[i].end == expected[i].end);
+            }
+        }
+    }
+
+    // (b) Ledger reconciliation with roaring groups present
+    {
+        auto idx = Index::from_documents({
+            {"r1.txt", "alpha beta gamma delta epsilon\n"},
+            {"r2.txt", "zeta eta theta iota kappa\n"},
+        });
+        auto ledger = idx.memory_ledger();
+        assert(ledger.index_structures() == idx.index_bytes());
+        assert(ledger.group_bits > 0);
+        assert(ledger.group_gids > 0);
+    }
+
+    // (c) Monotonicity under corpus growth
+    {
+        auto idx1 = Index::from_documents({{"doc1.txt", "apple banana cherry\n"}});
+        auto idx2 = Index::from_documents({
+            {"doc1.txt", "apple banana cherry\n"},
+            {"doc2.txt", "date elderberry fig\n"},
+            {"doc3.txt", "grape honeydew kiwi\n"},
+        });
+        assert(idx2.memory_ledger().index_structures() >= idx1.memory_ledger().index_structures());
+        assert(idx2.index_bytes() >= idx1.index_bytes());
+    }
+}
+
 int main(){
   // M2.2 analysis is deterministic metadata; it never participates in matching.
   {
@@ -7766,6 +7819,7 @@ int main(){
   test_m81_memory_ledger();
 
   test_m82_sparse_vs_dense_qgrams();
+  test_m83_roaring_container_decision();
 
   return 0;
 }

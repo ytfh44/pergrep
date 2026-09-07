@@ -345,6 +345,14 @@ static void materialize_index_filters(detail::IndexData& I) {
         fsg.postings.assign(sg.m, {});
         fsg.gids.reserve(cnt[k]);
     }
+    // M8.3: Roaring groups - initialize
+    for (int k = 0; k < 8; ++k) {
+        auto& rg = I.roaring_groups[k];
+        rg.lg = k + 9;
+        rg.m = 1u << rg.lg;
+        rg.array_ids.reserve(cnt[k] > 0 ? cnt[k] : 0);
+        rg.gids.reserve(cnt[k]);
+    }
     std::array<uint32_t, 8> local{};
     for (uint32_t ci = 0; ci < I.chunks.size(); ++ci) {
         auto c = I.chunks[ci];
