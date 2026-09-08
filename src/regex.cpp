@@ -32,6 +32,14 @@ Rune rune_before(std::string_view s, std::size_t pos) {
     return {cp, static_cast<std::size_t>(i), true};
 }
 UChar32 fold(UChar32 cp) { return u_foldCase(cp, U_FOLD_CASE_DEFAULT); }
+bool folded_cp_eq(UChar32 cp, UChar32 folded_expected) {
+    if (cp < 0x80) {
+        if (folded_expected >= 0x80) return false;
+        if (cp >= 'A' && cp <= 'Z') cp += 'a' - 'A';
+        return cp == folded_expected;
+    }
+    return fold(cp) == folded_expected;
+}
 bool cp_eq(UChar32 a, UChar32 b, bool icase) { return icase ? fold(a) == fold(b) : a == b; }
 bool unicode_word(UChar32 cp) {
     return u_isalnum(cp) ||
@@ -600,7 +608,7 @@ bool context_literal_at_validated(const VerifierContext& c, std::size_t pos,
     std::size_t lp = 0;
     while (lp < lit.size()) {
         auto a = context_rune_at_validated(c, tp);
-        if (!a.ok || fold(a.cp) != static_cast<UChar32>(lit[lp])) return false;
+        if (!a.ok || !folded_cp_eq(a.cp, static_cast<UChar32>(lit[lp]))) return false;
         tp = a.next;
         ++lp;
     }
