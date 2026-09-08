@@ -576,11 +576,12 @@ void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternO
 }
 
 bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptions&){
-    bool icase=i.icase;
-    if(i.op==NfaInst::Op::Rune)return cp_eq(cp,static_cast<UChar32>(i.rune),icase);
-    if(i.op==NfaInst::Op::Any)return i.dotall||cp!=sep;
-    if(i.op==NfaInst::Op::Class)return i.char_class&&class_match(*i.char_class,cp,icase);
-    return false;
+    switch (i.op) {
+        case NfaInst::Op::Rune: return cp_eq(cp, static_cast<UChar32>(i.rune), i.icase);
+        case NfaInst::Op::Any: return i.dotall || cp != sep;
+        case NfaInst::Op::Class: return i.char_class && class_match(*i.char_class, cp, i.icase);
+        default: return false;
+    }
 }
 
 bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end);
