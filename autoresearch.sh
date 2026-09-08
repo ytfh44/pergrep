@@ -18,7 +18,9 @@ tmp_output="$(mktemp "${TMPDIR:-/tmp}/pergrep-bench.XXXXXX")"
 build_output="$(mktemp "${TMPDIR:-/tmp}/pergrep-build.XXXXXX")"
 
 cd -- "$repo_root"
-if command -v powershell.exe >/dev/null 2>&1; then
+if command -v pwsh.exe >/dev/null 2>&1; then
+    bridge=pwsh
+elif command -v powershell.exe >/dev/null 2>&1; then
     bridge=powershell
 elif command -v cmd.exe >/dev/null 2>&1; then
     bridge=cmd
@@ -28,6 +30,9 @@ fi
 
 run_build() {
     case "$bridge" in
+        pwsh)
+            pwsh.exe -NoProfile -NonInteractive -Command '& cmake --build --preset windows-clang --target pergrep_bench'
+            ;;
         powershell)
             powershell.exe -NoProfile -NonInteractive -Command '& cmake --build --preset windows-clang --target pergrep_bench'
             ;;
@@ -42,6 +47,9 @@ run_build() {
 
 run_benchmark() {
     case "$bridge" in
+        pwsh)
+            pwsh.exe -NoProfile -NonInteractive -Command '& .\build\windows-clang\pergrep_bench.exe'
+            ;;
         powershell)
             powershell.exe -NoProfile -NonInteractive -Command '& .\build\windows-clang\pergrep_bench.exe'
             ;;
