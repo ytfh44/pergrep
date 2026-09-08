@@ -692,7 +692,7 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
         }
         if (best && cur.empty()) break;
         if (pos >= c.record_end) break;
-        auto r = context_rune_at(c, pos);
+        auto r = context_rune_at_validated(c, pos);
         if (!r.ok) break;
         next.clear();
         for (auto& t : cur) {
