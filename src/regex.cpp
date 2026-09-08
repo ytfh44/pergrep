@@ -698,9 +698,8 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
         for (auto& t : cur) {
             const auto& i = p.nfa[t.pc];
             if (nfa_consume(i, r.cp, c.separator, o)) {
-                auto z = t;
-                z.pc = i.x;
-                add_nfa_thread(p, c, o, c.separator, r.next, std::move(z), next, seen, next_generation, expand_stack);
+                t.pc = i.x;
+                add_nfa_thread(p, c, o, c.separator, r.next, std::move(t), next, seen, next_generation, expand_stack);
             }
         }
         cur.swap(next);
