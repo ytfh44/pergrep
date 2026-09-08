@@ -552,7 +552,74 @@ bool assert_word(const NfaInst&i,const VerifierContext& c,std::size_t pos){auto 
 bool assert_word_start_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_before(c,pos));}
 bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_right(c,pos));}
 
+void build_nfa_closures(RegexProgram& p) {
+    constexpr std::size_t max_pcs = 256;
+    constexpr std::size_t max_entries = 16384;
+    if (p.groups != 0 || p.nfa.empty() || p.nfa.size() > max_pcs) return;
+    for (const auto& i : p.nfa) {
+        switch (i.op) {
+            case NfaInst::Op::Rune:
+            case NfaInst::Op::Any:
+            case NfaInst::Op::Class:
+            case NfaInst::Op::Split:
+            case NfaInst::Op::Jmp:
+            case NfaInst::Op::Match:
+                break;
+            default:
+                return;
+        }
+    }
+    std::vector<std::uint8_t> visited(p.nfa.size());
+    std::vector<std::int32_t> stack;
+    p.nfa_closure_offsets.assign(p.nfa.size() + 1, 0);
+    p.nfa_closure_pcs.reserve(std::min(max_entries, p.nfa.size()));
+    for (std::size_t source = 0; source < p.nfa.size(); ++source) {
+        std::fill(visited.begin(), visited.end(), 0);
+        stack.clear();
+        stack.push_back(static_cast<std::int32_t>(source));
+        while (!stack.empty()) {
+            const auto pc = stack.back();
+            stack.pop_back();
+            if (pc < 0 || static_cast<std::size_t>(pc) >= p.nfa.size() || visited[pc]) continue;
+            visited[pc] = 1;
+            const auto& i = p.nfa[pc];
+            switch (i.op) {
+                case NfaInst::Op::Split:
+                    stack.push_back(i.y);
+                    stack.push_back(i.x);
+                    break;
+                case NfaInst::Op::Jmp:
+                    stack.push_back(i.x);
+                    break;
+                default:
+                    if (p.nfa_closure_pcs.size() == max_entries) {
+                        p.nfa_closure_offsets.clear();
+                        p.nfa_closure_pcs.clear();
+                        return;
+                    }
+                    p.nfa_closure_pcs.push_back(pc);
+                    break;
+            }
+        }
+        p.nfa_closure_offsets[source + 1] = static_cast<std::uint32_t>(p.nfa_closure_pcs.size());
+    }
+}
 void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint32_t>&seen,std::uint32_t generation,std::vector<NfaThread>&stack){
+    if (seed.pc >= 0 && static_cast<std::size_t>(seed.pc) < p.nfa.size() &&
+        p.nfa_closure_offsets.size() == p.nfa.size() + 1 && seed.caps.empty()) {
+        const auto begin = p.nfa_closure_offsets[static_cast<std::size_t>(seed.pc)];
+        const auto end = p.nfa_closure_offsets[static_cast<std::size_t>(seed.pc) + 1];
+        for (auto it = begin; it < end; ++it) {
+            const auto pc = p.nfa_closure_pcs[it];
+            if (seen[pc] == generation) continue;
+            seen[pc] = generation;
+            NfaThread t;
+            t.pc = pc;
+            t.start = seed.start;
+            list.push_back(std::move(t));
+        }
+        return;
+    }
     stack.clear();stack.push_back(std::move(seed));
     while(!stack.empty()){
         auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc]==generation)continue;seen[t.pc]=generation;const auto&i=p.nfa[t.pc];
@@ -1111,6 +1178,7 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     if(opt.line){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::Begin,true),p.ast,mk(RegexNode::Kind::End,true)};p.ast=std::move(c);}
     else if(opt.word){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::WordStartHalf),p.ast,mk(RegexNode::Kind::WordEndHalf)};p.ast=std::move(c);}
     if(!p.extended){NfaCompiler c(p);c.compile(p.ast);}
+        build_nfa_closures(p);
     // M2.2 observes the final AST, including line/word wrappers.
     return p;
 }
