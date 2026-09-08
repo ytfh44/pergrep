@@ -568,13 +568,34 @@ bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptio
 }
 
 bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end);
+Rune context_rune_at_validated(const VerifierContext& c, std::size_t pos) {
+    if (pos < c.record_begin || pos >= c.record_end) return {};
+    auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
+    if (!r.ok || (c.bounded_region && c.source_begin + r.next > c.region_end)) return {};
+    r.next += static_cast<std::size_t>(c.source_begin);
+    return r;
+}
+bool context_literal_at_validated(const VerifierContext& c, std::size_t pos, std::string_view lit,
+                                  bool icase, std::size_t* end) {
+    std::size_t tp = pos;
+    std::size_t lp = 0;
+    while (lp < lit.size()) {
+        auto a = context_rune_at_validated(c, tp);
+        auto b = rune_at(lit, lp);
+        if (!a.ok || !b.ok || !cp_eq(a.cp, b.cp, icase)) return false;
+        tp = a.next;
+        lp = b.next;
+    }
+    if (end) *end = tp;
+    return true;
+}
 bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
     if(!c.validate() || p.nfa_start<0) return false;
     if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty()) {
         std::size_t pos = c.candidate_begin;
         while (pos < c.candidate_end && pos < c.record_end) {
             std::size_t end = 0;
-            if (context_literal_at(c, pos, p.ast->literal, true, &end)) {
+            if (context_literal_at_validated(c, pos, p.ast->literal, true, &end)) {
                 if (out) {
                     out->file_id = file_id;
                     out->start = pos;
@@ -584,7 +605,7 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
                 }
                 return true;
             }
-            auto r = context_rune_at(c, pos);
+            auto r = context_rune_at_validated(c, pos);
             if (!r.ok) break;
             pos = r.next;
         }
