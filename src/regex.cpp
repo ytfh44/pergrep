@@ -578,7 +578,18 @@ bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptio
 bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end);
 Rune context_rune_at_validated(const VerifierContext& c, std::size_t pos) {
     if (pos < c.record_begin || pos >= c.record_end) return {};
-    auto r = rune_at(c.source, pos - static_cast<std::size_t>(c.source_begin));
+    const auto offset = pos - static_cast<std::size_t>(c.source_begin);
+    if (offset < c.source.size()) {
+        const auto byte = static_cast<unsigned char>(c.source[offset]);
+        if (byte < 0x80) {
+            const auto next = pos + 1;
+            if (!c.bounded_region || next <= c.region_end) {
+                return {static_cast<UChar32>(byte), next, true};
+            }
+            return {};
+        }
+    }
+    auto r = rune_at(c.source, offset);
     if (!r.ok || (c.bounded_region && c.source_begin + r.next > c.region_end)) return {};
     r.next += static_cast<std::size_t>(c.source_begin);
     return r;
