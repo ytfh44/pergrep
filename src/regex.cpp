@@ -619,7 +619,18 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
     if(!c.validate() || p.nfa_start<0) return false;
     if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty() && !p.icase_literal.empty()) {
         std::size_t pos = c.candidate_begin;
-        while (pos < c.candidate_end && pos < c.record_end) {
+        const auto scan_end = std::min(c.candidate_end, c.record_end);
+        const auto first = static_cast<UChar32>(p.icase_literal.front());
+        while (pos < scan_end) {
+            if (first >= 0x80) {
+                while (pos < scan_end && (!c.bounded_region || pos < c.region_end)) {
+                    const auto offset = pos - static_cast<std::size_t>(c.source_begin);
+                    if (offset >= c.source.size()) break;
+                    if (static_cast<unsigned char>(c.source[offset]) >= 0x80) break;
+                    ++pos;
+                }
+                if (pos >= scan_end || (c.bounded_region && pos >= c.region_end)) break;
+            }
             std::size_t end = 0;
             if (context_literal_at_validated(c, pos, p.icase_literal, &end)) {
                 if (out) {
