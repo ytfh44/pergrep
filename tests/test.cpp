@@ -3,6 +3,7 @@
 #include <pergrep/profile.hpp>
 #include <pergrep/tuned_cache.hpp>
 #include <pergrep/pareto.hpp>
+#include <pergrep/platform_gate.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -585,6 +586,119 @@ static void test_m94_pareto_selection() {
         assert(res_embedded.rejected_hard_limits.size() == 1);
         assert(res_embedded.rejected_hard_limits[0].candidate_id == "fast");
         assert(res_embedded.rationale_report.find("REJECTED: index_size_bytes") != std::string::npos);
+    }
+}
+
+
+static void test_m95_platform_reproducibility_gates() {
+    std::cerr << "M9.5 platform reproducibility gates" << std::flush;
+    using namespace pergrep::platform_gate;
+    using namespace pergrep::autotune;
+
+    // (a) Current environment inspection and validation
+    {
+        auto env = current_environment_info();
+        assert(!env.os_name.empty());
+        assert(!env.compiler_name.empty());
+        assert(!env.architecture.empty());
+        assert(env.hardware_concurrency >= 1);
+
+        // Host environment safety
+        std::string err;
+        assert(validate_environment_safety(env, &err));
+
+        // Disallowed environment checks
+        auto env_mac = env;
+        env_mac.is_untested_macos = true;
+        assert(!validate_environment_safety(env_mac, &err));
+        assert(err.find("untested macOS") != std::string::npos);
+
+        auto env_net = env;
+        env_net.is_network_filesystem = true;
+        assert(!validate_environment_safety(env_net, &err));
+        assert(err.find("network / remote filesystems") != std::string::npos);
+
+        auto env_rem = env;
+        env_rem.is_removable_media = true;
+        assert(!validate_environment_safety(env_rem, &err));
+        assert(err.find("removable media") != std::string::npos);
+
+        auto env_bad_th = env;
+        env_bad_th.hardware_concurrency = 0;
+        assert(!validate_environment_safety(env_bad_th, &err));
+        assert(err.find("invalid hardware concurrency") != std::string::npos);
+    }
+
+    // (b) Platform comparison gate: identical runs pass with 0 delta
+    {
+        SearchResult run1;
+        run1.toolchain_info = "clang-19-x86_64-linux";
+        TunedCandidate c1;
+        c1.options.chunk_bytes = 8192;
+        c1.options.chunk_overlap = 128;
+        c1.score = 100.0;
+        run1.evaluated.push_back(c1);
+        run1.best = c1;
+
+        SearchResult run2 = run1;
+        run2.toolchain_info = "clang-19-x86_64-windows";
+
+        auto rep = evaluate_platform_reproducibility(run1, run2);
+        assert(rep.passed);
+        assert(rep.config_sequence_matched);
+        assert(rep.best_config_matched);
+        assert(std::abs(rep.best_score_delta_pct) < 1e-6);
+        assert(!rep.detailed_log.empty());
+        assert(rep.detailed_log.find("Gate Result: PASS") != std::string::npos);
+    }
+
+    // (c) Platform comparison gate: score delta within tolerance
+    {
+        SearchResult run_lin;
+        run_lin.toolchain_info = "gcc-14-x86_64-linux";
+        TunedCandidate c1;
+        c1.options.chunk_bytes = 16384;
+        c1.options.chunk_overlap = 256;
+        c1.score = 100.0;
+        run_lin.evaluated.push_back(c1);
+        run_lin.best = c1;
+
+        SearchResult run_win = run_lin;
+        run_win.toolchain_info = "msvc-1940-x86_64-windows";
+        run_win.evaluated[0].score = 105.0; // 5% delta within 10% tolerance
+        run_win.best->score = 105.0;
+
+        PlatformTolerances tol;
+        tol.score_relative_tolerance = 0.10;
+        auto rep = evaluate_platform_reproducibility(run_lin, run_win, tol);
+        assert(rep.passed);
+        assert(rep.config_sequence_matched);
+        assert(rep.best_config_matched);
+        assert(rep.best_score_delta_pct > 0.04 && rep.best_score_delta_pct < 0.06);
+    }
+
+    // (d) Platform comparison gate: candidate order divergence triggers failure
+    {
+        SearchResult run_a;
+        run_a.toolchain_info = "platform-a";
+        TunedCandidate ca; ca.options.chunk_bytes = 8192;
+        run_a.evaluated.push_back(ca);
+        run_a.best = ca;
+
+        SearchResult run_b;
+        run_b.toolchain_info = "platform-b";
+        TunedCandidate cb; cb.options.chunk_bytes = 16384;
+        run_b.evaluated.push_back(cb);
+        run_b.best = cb;
+
+        PlatformTolerances tol;
+        tol.require_exact_config_order = true;
+        auto rep = evaluate_platform_reproducibility(run_a, run_b, tol);
+        assert(!rep.passed);
+        assert(!rep.config_sequence_matched);
+        assert(!rep.errors.empty());
+        assert(rep.errors[0].find("Candidate sequence diverged") != std::string::npos);
+        assert(rep.detailed_log.find("Gate Result: FAIL") != std::string::npos);
     }
 }
 
@@ -5810,5 +5924,6 @@ int main(){
   test_m92_corpus_profiles();
   test_m93_tuned_cache_identity();
   test_m94_pareto_selection();
+  test_m95_platform_reproducibility_gates();
   return 0;
 }
