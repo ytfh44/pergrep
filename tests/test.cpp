@@ -4,6 +4,7 @@
 #include <pergrep/tuned_cache.hpp>
 #include <pergrep/pareto.hpp>
 #include <pergrep/platform_gate.hpp>
+#include <pergrep/report.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -699,6 +700,110 @@ static void test_m95_platform_reproducibility_gates() {
         assert(!rep.errors.empty());
         assert(rep.errors[0].find("Candidate sequence diverged") != std::string::npos);
         assert(rep.detailed_log.find("Gate Result: FAIL") != std::string::npos);
+    }
+}
+
+
+static void test_m96_benchmark_reports() {
+    std::cerr << "M9.6 benchmark reports and provenance" << std::flush;
+    using namespace pergrep::report;
+
+    // (a) JSON serialization round-trip
+    {
+        BenchmarkReport rep;
+        rep.report_id = "test-report-001";
+        rep.profile_id = "pergrep-profile-v1-code";
+        rep.corpus_seed = 0xDEADBEEF;
+        rep.corpus_files = 16;
+        rep.corpus_bytes = 256 * 1024;
+        rep.cache_state = "cold";
+        rep.iteration_count = 1;
+        rep.os_name = "linux";
+        rep.compiler_name = "gcc-13.2";
+        rep.architecture = "x86_64";
+        rep.hardware_concurrency = 8;
+        rep.build_time_ms = 1500.0;
+        rep.load_time_ms = 45.0;
+        rep.index_bytes = 64 * 1024 * 1024;
+        rep.peak_rss_bytes = 128 * 1024 * 1024;
+        rep.aggregate_search_p50_ms = 2.5;
+        rep.aggregate_search_p95_ms = 8.0;
+        rep.fallback_rate = 0.02;
+        rep.correctness_status = true;
+        rep.evidence_kind = EvidenceKind::PerformanceEvidence;
+        rep.queries = {
+            QueryExecutionRecord{"RARE_TOKEN", "rare-literal", 1.2, 3.5, 5, 1024*1024, 200, 50},
+            QueryExecutionRecord{"error|warn", "alternation", 2.8, 6.2, 120, 512*1024, 800, 200}
+        };
+
+        // JSON round-trip
+        std::string json = rep.to_json();
+        assert(!json.empty());
+        assert(json.find("test-report-001") != std::string::npos);
+        assert(json.find("pergrep-profile-v1-code") != std::string::npos);
+        assert(json.find("linux") != std::string::npos);
+
+        BenchmarkReport restored = BenchmarkReport::from_json(json);
+        assert(restored.report_id == rep.report_id);
+        assert(restored.profile_id == rep.profile_id);
+        assert(restored.corpus_seed == rep.corpus_seed);
+        assert(restored.os_name == rep.os_name);
+        assert(std::abs(restored.build_time_ms - rep.build_time_ms) < 1e-6);
+    }
+
+    // (b) Provenance validation
+    {
+        BenchmarkReport incomplete;
+        incomplete.report_id = "incomplete";
+        std::string err;
+        assert(!incomplete.validate_provenance(&err));
+        assert(err.find("missing profile_id") != std::string::npos);
+
+        BenchmarkReport valid = create_report_from_measurements(
+            "pergrep-profile-v1-code",
+            0xC0DE2026ULL,
+            16,
+            256 * 1024,
+            1500.0,
+            64 * 1024 * 1024,
+            {
+                QueryExecutionRecord{"RARE_TOKEN", "rare-literal", 1.2, 3.5, 5, 1024*1024, 200, 50}
+            },
+            EvidenceKind::PerformanceEvidence
+        );
+        assert(valid.validate_provenance());
+    }
+
+    // (c) Markdown output
+    {
+        BenchmarkReport rep = create_report_from_measurements(
+            "pergrep-profile-v1-logs",
+            0x10652026ULL,
+            8,
+            512 * 1024,
+            2000.0,
+            128 * 1024 * 1024,
+            {
+                QueryExecutionRecord{"ERROR", "error-literal", 5.0, 12.0, 200, 10*1024*1024, 1000, 300}
+            },
+            EvidenceKind::CorrectnessSmoke
+        );
+        std::string md = rep.to_markdown();
+        assert(!md.empty());
+        assert(md.find("pergrep-profile-v1-logs") != std::string::npos);
+        assert(md.find("correctness_smoke") != std::string::npos);
+        assert(md.find("p50") != std::string::npos);
+        assert(md.find("RSS") != std::string::npos);
+    }
+
+    // (d) EvidenceKind distinction
+    {
+        auto perf = create_report_from_measurements("test", 1, 1, 1024, 100.0, 1024, {}, EvidenceKind::PerformanceEvidence);
+        auto smoke = create_report_from_measurements("test", 1, 1, 1024, 100.0, 1024, {}, EvidenceKind::CorrectnessSmoke);
+        assert(perf.evidence_kind == EvidenceKind::PerformanceEvidence);
+        assert(smoke.evidence_kind == EvidenceKind::CorrectnessSmoke);
+        assert(perf.to_json().find("performance_evidence") != std::string::npos);
+        assert(smoke.to_json().find("correctness_smoke") != std::string::npos);
     }
 }
 
@@ -5925,5 +6030,6 @@ int main(){
   test_m93_tuned_cache_identity();
   test_m94_pareto_selection();
   test_m95_platform_reproducibility_gates();
+  test_m96_benchmark_reports();
   return 0;
 }
