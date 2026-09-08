@@ -552,10 +552,10 @@ bool assert_word(const NfaInst&i,const VerifierContext& c,std::size_t pos){auto 
 bool assert_word_start_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_before(c,pos));}
 bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_right(c,pos));}
 
-void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint8_t>&seen,std::vector<NfaThread>&stack){
+void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint32_t>&seen,std::uint32_t generation,std::vector<NfaThread>&stack){
     stack.clear();stack.push_back(std::move(seed));
     while(!stack.empty()){
-        auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc])continue;seen[t.pc]=1;const auto&i=p.nfa[t.pc];
+        auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc]==generation)continue;seen[t.pc]=generation;const auto&i=p.nfa[t.pc];
         auto push=[&](int pc,NfaThread z){z.pc=pc;stack.push_back(std::move(z));};
         switch(i.op){
             case NfaInst::Op::Jmp:push(i.x,std::move(t));break;
@@ -649,7 +649,9 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
         return false;
     }
     std::vector<NfaThread> cur, next;
-    std::vector<std::uint8_t> seen(p.nfa.size()), seen_next(p.nfa.size());
+    std::vector<std::uint32_t> seen(p.nfa.size());
+    std::uint32_t current_generation = 1;
+    std::uint32_t next_generation = 2;
     std::optional<NfaThread> best;
     std::vector<NfaThread> expand_stack;
     std::size_t best_end = 0;
@@ -678,7 +680,7 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
             start.pc = p.nfa_start;
             start.start = pos;
             if (p.groups > 0) start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
-            add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen, expand_stack);
+            add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen, current_generation, expand_stack);
         }
         for (std::size_t k = 0; k < cur.size(); ++k) {
             if (p.nfa[cur[k].pc].op == NfaInst::Op::Match) {
@@ -693,17 +695,22 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
         auto r = context_rune_at(c, pos);
         if (!r.ok) break;
         next.clear();
-        std::fill(seen_next.begin(), seen_next.end(), 0);
         for (auto& t : cur) {
             const auto& i = p.nfa[t.pc];
             if (nfa_consume(i, r.cp, c.separator, o)) {
                 auto z = t;
                 z.pc = i.x;
-                add_nfa_thread(p, c, o, c.separator, r.next, std::move(z), next, seen_next, expand_stack);
+                add_nfa_thread(p, c, o, c.separator, r.next, std::move(z), next, seen, next_generation, expand_stack);
             }
         }
         cur.swap(next);
-        seen.swap(seen_next);
+        current_generation = next_generation;
+        ++next_generation;
+        if (next_generation == 0) {
+            std::fill(seen.begin(), seen.end(), 0);
+            current_generation = 1;
+            next_generation = 2;
+        }
         pos = r.next;
         if (cur.empty() && best) break;
     }
