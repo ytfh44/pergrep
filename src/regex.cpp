@@ -567,8 +567,29 @@ bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptio
     return false;
 }
 
+bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end);
 bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
     if(!c.validate() || p.nfa_start<0) return false;
+    if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty()) {
+        std::size_t pos = c.candidate_begin;
+        while (pos < c.candidate_end && pos < c.record_end) {
+            std::size_t end = 0;
+            if (context_literal_at(c, pos, p.ast->literal, true, &end)) {
+                if (out) {
+                    out->file_id = file_id;
+                    out->start = pos;
+                    out->end = end;
+                    out->captures.assign(static_cast<std::size_t>(p.groups) + 1, {});
+                    out->captures[0] = {pos, end, true, ""};
+                }
+                return true;
+            }
+            auto r = context_rune_at(c, pos);
+            if (!r.ok) break;
+            pos = r.next;
+        }
+        return false;
+    }
     std::vector<NfaThread> cur, next;
     std::vector<std::uint8_t> seen(p.nfa.size()), seen_next(p.nfa.size());
     std::optional<NfaThread> best;
