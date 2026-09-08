@@ -43,4 +43,4 @@ for f in "${vals[@]}"; do "$PG" --help "$f" >/dev/null; done
 # Short options, with values where required.
 shorts=(-a -b -c -F -h -H -I -i -l -L -n -N -o -p -P -q -s -S -u -U -v -V -w -x -z -0)
 for f in "${shorts[@]}"; do "$PG" --help "$f" >/dev/null; done
-"$PG" --help -A1 -B1 -C1 -d1 -Eutf-8 -ex -f/dev/null '-g*.cpp' -j1 -m1 -M100 -rx -trust -Trust >/dev/null
+"$PG" --help -A1 -B1 -C1 -d1 -Eutf-8 -ex -f/dev/null '-g*.cpp' -j1 -m1 -M100 -rx -trust -Trust >/dev/null

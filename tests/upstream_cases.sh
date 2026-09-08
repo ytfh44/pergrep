@@ -69,4 +69,4 @@ out="$($PG --count-matches x "$T/count")"; eq "$out" '3' count-matches
 out="$($PG -m1 x "$T/count")"; eq "$out" 'x x' max-count-lines
 
 # Invert is line complement, not file complement.
-out="$($PG -v x "$T/count")"; eq "$out" 'none' invert-lines
+out="$($PG -v x "$T/count")"; eq "$out" 'none' invert-lines
