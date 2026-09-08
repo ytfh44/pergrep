@@ -313,6 +313,7 @@ struct RegexProgram {
     int groups = 0;
     std::vector<std::string> group_names;
     bool extended = false;
+    std::vector<std::int32_t> icase_literal;
 
     // M2.2 canonical context/width metadata, computed after parse wrappers are attached.
     // This is advisory only: exact matching remains owned by the AST/NFA/VM.
@@ -341,6 +342,8 @@ struct RegexProgram {
     std::string exact_literal;    // == query_ir.exact_literal
     std::vector<NfaInst> nfa;
     std::int32_t nfa_start = -1;
+    std::vector<std::uint32_t> nfa_closure_offsets;
+    std::vector<std::int32_t> nfa_closure_pcs;
 };
 RegexProgram parse_regex(std::string_view pattern, const PatternOptions& opt);
 bool regex_search(const RegexProgram&, const VerifierContext&, const PatternOptions&, Match*, std::uint32_t);

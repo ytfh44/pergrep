@@ -32,6 +32,14 @@ Rune rune_before(std::string_view s, std::size_t pos) {
     return {cp, static_cast<std::size_t>(i), true};
 }
 UChar32 fold(UChar32 cp) { return u_foldCase(cp, U_FOLD_CASE_DEFAULT); }
+bool folded_cp_eq(UChar32 cp, UChar32 folded_expected) {
+    if (cp < 0x80) {
+        if (folded_expected >= 0x80) return false;
+        if (cp >= 'A' && cp <= 'Z') cp += 'a' - 'A';
+        return cp == folded_expected;
+    }
+    return fold(cp) == folded_expected;
+}
 bool cp_eq(UChar32 a, UChar32 b, bool icase) { return icase ? fold(a) == fold(b) : a == b; }
 bool unicode_word(UChar32 cp) {
     return u_isalnum(cp) ||
@@ -219,6 +227,14 @@ public:
     RegexProgram parse() {
         auto n = alt(); if (i_ != s_.size()) fail("unexpected trailing input");
         RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_;
+        if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty()) {
+            for (std::size_t lp = 0; lp < p.ast->literal.size();) {
+                auto b = rune_at(p.ast->literal, lp);
+                if (!b.ok) break;
+                p.icase_literal.push_back(static_cast<std::int32_t>(fold(b.cp)));
+                lp = b.next;
+            }
+        }
         p.install_query_ir(analyze_query(p.ast, p.extended));
         return p;
     }
@@ -536,10 +552,77 @@ bool assert_word(const NfaInst&i,const VerifierContext& c,std::size_t pos){auto 
 bool assert_word_start_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_before(c,pos));}
 bool assert_word_end_half(const NfaInst&i,const VerifierContext& c,std::size_t pos){return !is_word_at(i,context_rune_right(c,pos));}
 
-void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint8_t>&seen){
-    std::vector<NfaThread> stack;stack.push_back(std::move(seed));
+void build_nfa_closures(RegexProgram& p) {
+    constexpr std::size_t max_pcs = 256;
+    constexpr std::size_t max_entries = 16384;
+    if (p.groups != 0 || p.nfa.empty() || p.nfa.size() > max_pcs) return;
+    for (const auto& i : p.nfa) {
+        switch (i.op) {
+            case NfaInst::Op::Rune:
+            case NfaInst::Op::Any:
+            case NfaInst::Op::Class:
+            case NfaInst::Op::Split:
+            case NfaInst::Op::Jmp:
+            case NfaInst::Op::Match:
+                break;
+            default:
+                return;
+        }
+    }
+    std::vector<std::uint8_t> visited(p.nfa.size());
+    std::vector<std::int32_t> stack;
+    p.nfa_closure_offsets.assign(p.nfa.size() + 1, 0);
+    p.nfa_closure_pcs.reserve(std::min(max_entries, p.nfa.size()));
+    for (std::size_t source = 0; source < p.nfa.size(); ++source) {
+        std::fill(visited.begin(), visited.end(), 0);
+        stack.clear();
+        stack.push_back(static_cast<std::int32_t>(source));
+        while (!stack.empty()) {
+            const auto pc = stack.back();
+            stack.pop_back();
+            if (pc < 0 || static_cast<std::size_t>(pc) >= p.nfa.size() || visited[pc]) continue;
+            visited[pc] = 1;
+            const auto& i = p.nfa[pc];
+            switch (i.op) {
+                case NfaInst::Op::Split:
+                    stack.push_back(i.y);
+                    stack.push_back(i.x);
+                    break;
+                case NfaInst::Op::Jmp:
+                    stack.push_back(i.x);
+                    break;
+                default:
+                    if (p.nfa_closure_pcs.size() == max_entries) {
+                        p.nfa_closure_offsets.clear();
+                        p.nfa_closure_pcs.clear();
+                        return;
+                    }
+                    p.nfa_closure_pcs.push_back(pc);
+                    break;
+            }
+        }
+        p.nfa_closure_offsets[source + 1] = static_cast<std::uint32_t>(p.nfa_closure_pcs.size());
+    }
+}
+void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternOptions&,unsigned char sep,std::size_t pos,NfaThread seed,std::vector<NfaThread>&list,std::vector<std::uint32_t>&seen,std::uint32_t generation,std::vector<NfaThread>&stack){
+    if (seed.pc >= 0 && static_cast<std::size_t>(seed.pc) < p.nfa.size() &&
+        p.nfa_closure_offsets.size() == p.nfa.size() + 1 && seed.caps.empty()) {
+        const auto begin = p.nfa_closure_offsets[static_cast<std::size_t>(seed.pc)];
+        const auto end = p.nfa_closure_offsets[static_cast<std::size_t>(seed.pc) + 1];
+        for (auto it = begin; it < end; ++it) {
+            const auto pc = p.nfa_closure_pcs[it];
+            if (seen[pc] == generation) continue;
+            seen[pc] = generation;
+            NfaThread t;
+            t.pc = pc;
+            t.start = seed.start;
+            list.push_back(std::move(t));
+        }
+        return;
+    }
+    stack.clear();stack.push_back(std::move(seed));
     while(!stack.empty()){
-        auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc])continue;seen[t.pc]=1;const auto&i=p.nfa[t.pc];
+        auto t=std::move(stack.back());stack.pop_back();if(t.pc<0||static_cast<std::size_t>(t.pc)>=p.nfa.size())continue;if(seen[t.pc]==generation)continue;seen[t.pc]=generation;const auto&i=p.nfa[t.pc];
         auto push=[&](int pc,NfaThread z){z.pc=pc;stack.push_back(std::move(z));};
         switch(i.op){
             case NfaInst::Op::Jmp:push(i.x,std::move(t));break;
@@ -560,18 +643,85 @@ void add_nfa_thread(const RegexProgram&p,const VerifierContext& c,const PatternO
 }
 
 bool nfa_consume(const NfaInst&i,UChar32 cp,unsigned char sep,const PatternOptions&){
-    bool icase=i.icase;
-    if(i.op==NfaInst::Op::Rune)return cp_eq(cp,static_cast<UChar32>(i.rune),icase);
-    if(i.op==NfaInst::Op::Any)return i.dotall||cp!=sep;
-    if(i.op==NfaInst::Op::Class)return i.char_class&&class_match(*i.char_class,cp,icase);
-    return false;
+    switch (i.op) {
+        case NfaInst::Op::Rune: return cp_eq(cp, static_cast<UChar32>(i.rune), i.icase);
+        case NfaInst::Op::Any: return i.dotall || cp != sep;
+        case NfaInst::Op::Class: return i.char_class && class_match(*i.char_class, cp, i.icase);
+        default: return false;
+    }
 }
 
+bool context_literal_at(const VerifierContext& c,std::size_t pos,std::string_view lit,bool icase,std::size_t* end);
+Rune context_rune_at_validated(const VerifierContext& c, std::size_t pos) {
+    if (pos < c.record_begin || pos >= c.record_end) return {};
+    const auto offset = pos - static_cast<std::size_t>(c.source_begin);
+    if (offset < c.source.size()) {
+        const auto byte = static_cast<unsigned char>(c.source[offset]);
+        if (byte < 0x80) {
+            const auto next = pos + 1;
+            if (!c.bounded_region || next <= c.region_end) {
+                return {static_cast<UChar32>(byte), next, true};
+            }
+            return {};
+        }
+    }
+    auto r = rune_at(c.source, offset);
+    if (!r.ok || (c.bounded_region && c.source_begin + r.next > c.region_end)) return {};
+    r.next += static_cast<std::size_t>(c.source_begin);
+    return r;
+}
+bool context_literal_at_validated(const VerifierContext& c, std::size_t pos,
+                                  const std::vector<std::int32_t>& lit, std::size_t* end) {
+    std::size_t tp = pos;
+    std::size_t lp = 0;
+    while (lp < lit.size()) {
+        auto a = context_rune_at_validated(c, tp);
+        if (!a.ok || !folded_cp_eq(a.cp, static_cast<UChar32>(lit[lp]))) return false;
+        tp = a.next;
+        ++lp;
+    }
+    if (end) *end = tp;
+    return true;
+}
 bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
     if(!c.validate() || p.nfa_start<0) return false;
+    if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty() && !p.icase_literal.empty()) {
+        std::size_t pos = c.candidate_begin;
+        const auto scan_end = std::min(c.candidate_end, c.record_end);
+        const auto first = static_cast<UChar32>(p.icase_literal.front());
+        while (pos < scan_end) {
+            if (first >= 0x80) {
+                while (pos < scan_end && (!c.bounded_region || pos < c.region_end)) {
+                    const auto offset = pos - static_cast<std::size_t>(c.source_begin);
+                    if (offset >= c.source.size()) break;
+                    if (static_cast<unsigned char>(c.source[offset]) >= 0x80) break;
+                    ++pos;
+                }
+                if (pos >= scan_end || (c.bounded_region && pos >= c.region_end)) break;
+            }
+            std::size_t end = 0;
+            if (context_literal_at_validated(c, pos, p.icase_literal, &end)) {
+                if (out) {
+                    out->file_id = file_id;
+                    out->start = pos;
+                    out->end = end;
+                    out->captures.assign(static_cast<std::size_t>(p.groups) + 1, {});
+                    out->captures[0] = {pos, end, true, ""};
+                }
+                return true;
+            }
+            auto r = context_rune_at_validated(c, pos);
+            if (!r.ok) break;
+            pos = r.next;
+        }
+        return false;
+    }
     std::vector<NfaThread> cur, next;
-    std::vector<std::uint8_t> seen(p.nfa.size()), seen_next(p.nfa.size());
+    std::vector<std::uint32_t> seen(p.nfa.size());
+    std::uint32_t current_generation = 1;
+    std::uint32_t next_generation = 2;
     std::optional<NfaThread> best;
+    std::vector<NfaThread> expand_stack;
     std::size_t best_end = 0;
     std::size_t pos = c.candidate_begin;
     for (;;) {
@@ -597,8 +747,8 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
             NfaThread start;
             start.pc = p.nfa_start;
             start.start = pos;
-            start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
-            add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen);
+            if (p.groups > 0) start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
+            add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen, current_generation, expand_stack);
         }
         for (std::size_t k = 0; k < cur.size(); ++k) {
             if (p.nfa[cur[k].pc].op == NfaInst::Op::Match) {
@@ -610,20 +760,24 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
         }
         if (best && cur.empty()) break;
         if (pos >= c.record_end) break;
-        auto r = context_rune_at(c, pos);
+        auto r = context_rune_at_validated(c, pos);
         if (!r.ok) break;
         next.clear();
-        std::fill(seen_next.begin(), seen_next.end(), 0);
         for (auto& t : cur) {
             const auto& i = p.nfa[t.pc];
             if (nfa_consume(i, r.cp, c.separator, o)) {
-                auto z = t;
-                z.pc = i.x;
-                add_nfa_thread(p, c, o, c.separator, r.next, std::move(z), next, seen_next);
+                t.pc = i.x;
+                add_nfa_thread(p, c, o, c.separator, r.next, std::move(t), next, seen, next_generation, expand_stack);
             }
         }
         cur.swap(next);
-        seen.swap(seen_next);
+        current_generation = next_generation;
+        ++next_generation;
+        if (next_generation == 0) {
+            std::fill(seen.begin(), seen.end(), 0);
+            current_generation = 1;
+            next_generation = 2;
+        }
         pos = r.next;
         if (cur.empty() && best) break;
     }
@@ -1024,6 +1178,7 @@ RegexProgram parse_regex(std::string_view pattern,const PatternOptions&opt){
     if(opt.line){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::Begin,true),p.ast,mk(RegexNode::Kind::End,true)};p.ast=std::move(c);}
     else if(opt.word){auto c=mk(RegexNode::Kind::Concat);c->children={mk(RegexNode::Kind::WordStartHalf),p.ast,mk(RegexNode::Kind::WordEndHalf)};p.ast=std::move(c);}
     if(!p.extended){NfaCompiler c(p);c.compile(p.ast);}
+        build_nfa_closures(p);
     // M2.2 observes the final AST, including line/word wrappers.
     return p;
 }
