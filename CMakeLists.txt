@@ -8,7 +8,7 @@ option(PERGREP_BUILD_TESTS "Build tests" ON)
 find_package(ICU REQUIRED COMPONENTS uc)
 find_package(LibArchive REQUIRED)
 
-add_library(libpergrep src/index.cpp src/regex.cpp src/search.cpp src/c_api.cpp src/autotune.cpp src/profile.cpp src/tuned_cache.cpp src/pareto.cpp src/platform_gate.cpp)
+add_library(libpergrep src/index.cpp src/regex.cpp src/search.cpp src/c_api.cpp src/autotune.cpp src/profile.cpp src/tuned_cache.cpp src/pareto.cpp src/platform_gate.cpp src/report.cpp)
 target_include_directories(libpergrep PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(libpergrep PUBLIC ICU::uc)
 if(WIN32)
