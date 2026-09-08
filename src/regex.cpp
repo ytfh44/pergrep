@@ -676,7 +676,7 @@ bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptio
             NfaThread start;
             start.pc = p.nfa_start;
             start.start = pos;
-            start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
+            if (p.groups > 0) start.caps.assign(static_cast<std::size_t>(p.groups) + 1, {SIZE_MAX, SIZE_MAX});
             add_nfa_thread(p, c, o, c.separator, pos, std::move(start), cur, seen);
         }
         for (std::size_t k = 0; k < cur.size(); ++k) {
