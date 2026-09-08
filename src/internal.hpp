@@ -313,6 +313,7 @@ struct RegexProgram {
     int groups = 0;
     std::vector<std::string> group_names;
     bool extended = false;
+    std::vector<std::int32_t> icase_literal;
 
     // M2.2 canonical context/width metadata, computed after parse wrappers are attached.
     // This is advisory only: exact matching remains owned by the AST/NFA/VM.

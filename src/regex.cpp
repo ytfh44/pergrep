@@ -219,6 +219,14 @@ public:
     RegexProgram parse() {
         auto n = alt(); if (i_ != s_.size()) fail("unexpected trailing input");
         RegexProgram p; p.ast = std::move(n); p.groups = groups_; p.extended = extended_; p.group_names = group_names_;
+        if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty()) {
+            for (std::size_t lp = 0; lp < p.ast->literal.size();) {
+                auto b = rune_at(p.ast->literal, lp);
+                if (!b.ok) break;
+                p.icase_literal.push_back(static_cast<std::int32_t>(fold(b.cp)));
+                lp = b.next;
+            }
+        }
         p.install_query_ir(analyze_query(p.ast, p.extended));
         return p;
     }
@@ -575,27 +583,26 @@ Rune context_rune_at_validated(const VerifierContext& c, std::size_t pos) {
     r.next += static_cast<std::size_t>(c.source_begin);
     return r;
 }
-bool context_literal_at_validated(const VerifierContext& c, std::size_t pos, std::string_view lit,
-                                  bool icase, std::size_t* end) {
+bool context_literal_at_validated(const VerifierContext& c, std::size_t pos,
+                                  const std::vector<std::int32_t>& lit, std::size_t* end) {
     std::size_t tp = pos;
     std::size_t lp = 0;
     while (lp < lit.size()) {
         auto a = context_rune_at_validated(c, tp);
-        auto b = rune_at(lit, lp);
-        if (!a.ok || !b.ok || !cp_eq(a.cp, b.cp, icase)) return false;
+        if (!a.ok || fold(a.cp) != static_cast<UChar32>(lit[lp])) return false;
         tp = a.next;
-        lp = b.next;
+        ++lp;
     }
     if (end) *end = tp;
     return true;
 }
 bool nfa_search(const RegexProgram&p,const VerifierContext& c,const PatternOptions&o,Match*out,std::uint32_t file_id){
     if(!c.validate() || p.nfa_start<0) return false;
-    if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty()) {
+    if (p.ast && !p.extended && p.ast->kind == RegexNode::Kind::Literal && p.ast->icase && !p.ast->literal.empty() && !p.icase_literal.empty()) {
         std::size_t pos = c.candidate_begin;
         while (pos < c.candidate_end && pos < c.record_end) {
             std::size_t end = 0;
-            if (context_literal_at_validated(c, pos, p.ast->literal, true, &end)) {
+            if (context_literal_at_validated(c, pos, p.icase_literal, &end)) {
                 if (out) {
                     out->file_id = file_id;
                     out->start = pos;
