@@ -5,6 +5,7 @@
 #include <pergrep/pareto.hpp>
 #include <pergrep/platform_gate.hpp>
 #include <pergrep/report.hpp>
+#include <pergrep/rollout.hpp>
 using namespace pergrep::autotune;
 #include <algorithm>
 #include <array>
@@ -804,6 +805,121 @@ static void test_m96_benchmark_reports() {
         assert(smoke.evidence_kind == EvidenceKind::CorrectnessSmoke);
         assert(perf.to_json().find("performance_evidence") != std::string::npos);
         assert(smoke.to_json().find("correctness_smoke") != std::string::npos);
+    }
+}
+
+
+static void test_m97_rollout_and_rollback() {
+    std::cerr << "M9.7 rollout, rollback, and fallback profiles" << std::flush;
+    using namespace pergrep::rollout;
+
+    // (a) Feature flags toggling
+    {
+        RolloutFeatureFlags flags;
+        assert(flags.enable_simd_bitmaps);
+        assert(flags.enable_positional_encoding);
+        assert(flags.enable_sparse_postings);
+
+        flags.disable_all_experimental();
+        assert(!flags.enable_simd_bitmaps);
+        assert(!flags.enable_positional_encoding);
+        assert(!flags.enable_sparse_postings);
+        assert(!flags.enable_aho_corasick_prefilter);
+        assert(!flags.enable_autotuned_layout);
+        assert(!flags.enable_parallel_build);
+        assert(!flags.enable_lazy_dfa);
+    }
+
+    // (b) Telemetry and automated safety guard
+    {
+        RolloutTelemetry telem(5, 0.10); // max 5 fallbacks or 10% ratio
+        for (int i = 0; i < 25; ++i) {
+            telem.record_query(false);
+        }
+        assert(telem.total_queries() == 25);
+        assert(telem.total_fallbacks() == 0);
+        assert(!telem.should_trigger_rollback());
+
+        // Trigger fallbacks exceeding 10% ratio
+        for (int i = 0; i < 5; ++i) {
+            telem.record_query(true, "aho_corasick", "pattern_too_complex");
+        }
+        assert(telem.total_queries() == 30);
+        assert(telem.total_fallbacks() == 5);
+        assert(telem.fallback_ratio() > 0.10);
+        assert(telem.should_trigger_rollback());
+        assert(telem.events().size() == 5);
+    }
+
+    // (c) Controller state transitions and automated circuit-breaker
+    {
+        RolloutPolicyController ctrl;
+        assert(ctrl.state == RolloutState::DefaultBaseline);
+
+        ctrl.promote_to_rollout();
+        assert(ctrl.state == RolloutState::RolloutActive);
+
+        // Record normal queries
+        for (int i = 0; i < 20; ++i) {
+            ctrl.telemetry.record_query(false);
+        }
+        assert(!ctrl.evaluate_safety_guard());
+        assert(ctrl.state == RolloutState::RolloutActive);
+
+        // Induce high fallback surge
+        for (int i = 0; i < 15; ++i) {
+            ctrl.telemetry.record_query(true, "simd_bitmap", "illegal_instruction_trap");
+        }
+        // Automated safety guard fires!
+        assert(ctrl.evaluate_safety_guard());
+        assert(ctrl.state == RolloutState::RollbackEnforced);
+        assert(!ctrl.rollback_reason.empty());
+        assert(ctrl.rollback_reason.find("Automated safety rollback") != std::string::npos);
+        // Experimental flags disabled
+        assert(!ctrl.flags.enable_simd_bitmaps);
+        assert(!ctrl.flags.enable_positional_encoding);
+
+        // In RollbackEnforced, promote_to_rollout is blocked
+        ctrl.promote_to_rollout();
+        assert(ctrl.state == RolloutState::RollbackEnforced);
+
+        // Manual rollback test
+        RolloutPolicyController ctrl2;
+        ctrl2.state = RolloutState::RolloutActive;
+        ctrl2.enforce_rollback("emergency CVE mitigation");
+        assert(ctrl2.state == RolloutState::RollbackEnforced);
+        assert(ctrl2.rollback_reason == "emergency CVE mitigation");
+    }
+
+    // (d) Release notes generation
+    {
+        RolloutPolicyController ctrl;
+        ctrl.promote_to_rollout();
+        std::string notes = ctrl.generate_release_notes();
+        assert(!notes.empty());
+        assert(notes.find("Release Notes") != std::string::npos);
+        assert(notes.find("SIMD Bitmaps") != std::string::npos);
+        assert(notes.find("Rollback Runbook") != std::string::npos);
+    }
+
+    // (e) Functional search remains intact under fallback/rollback
+    {
+        auto idx = Index::from_documents({
+            {"file1.txt", "alpha beta gamma\n"},
+            {"file2.txt", "delta epsilon zeta\n"}
+        });
+        Searcher s(idx);
+
+        // Normal search
+        auto m1 = s.find(Pattern::compile("beta"));
+        assert(m1.size() == 1);
+
+        // Conservative baseline execution (simulated rollback)
+        RolloutPolicyController ctrl;
+        ctrl.enforce_rollback("test regression");
+        auto m2 = s.find(Pattern::compile("beta"));
+        assert(m2.size() == 1);
+        assert(m2[0].file_id == m1[0].file_id);
     }
 }
 
@@ -6031,5 +6147,6 @@ int main(){
   test_m94_pareto_selection();
   test_m95_platform_reproducibility_gates();
   test_m96_benchmark_reports();
+  test_m97_rollout_and_rollback();
   return 0;
 }
